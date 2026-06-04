@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: praxis-operator
+  namespace: praxis-system
+  labels:
+    app.kubernetes.io/name: praxis-operator
+    app.kubernetes.io/managed-by: praxis-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-operator
+    spec:
+      serviceAccountName: praxis-operator
+      containers:
+        - name: operator
+          image: __OPERATOR_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PRAXIS_IMAGE
+              value: "__PRAXIS_IMAGE__"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
