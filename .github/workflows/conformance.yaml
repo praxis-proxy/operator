@@ -1,0 +1,81 @@
+name: Conformance
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CONTAINER_ENGINE: docker
+  KIND_CLUSTER_NAME: praxis-conformance
+  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.3.0
+  OPERATOR_IMAGE: praxis-operator:dev
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gateway API conformance suite
+  # ---------------------------------------------------------------------------
+
+  gateway-api:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build operator image
+        run: docker build -t ${{ env.OPERATOR_IMAGE }} -f Containerfile .
+
+      - name: Pull praxis image
+        run: docker pull ${{ env.PRAXIS_IMAGE }}
+
+      - name: Install KIND
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Setup KIND cluster
+        run: bash hack/setup-kind.sh
+
+      - name: Install Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Conformance tests
+        run: bash hack/run-conformance.sh
+
+      - name: Debug cluster state
+        if: failure()
+        run: bash hack/dump-debug.sh
+
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-report
+          path: /tmp/conformance-report.yaml
+          if-no-files-found: ignore
