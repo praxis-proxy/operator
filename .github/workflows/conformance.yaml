@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   CONTAINER_ENGINE: docker
   KIND_CLUSTER_NAME: praxis-conformance
-  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.3.0
+  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.3.1
   OPERATOR_IMAGE: praxis-operator:dev
 
 jobs:

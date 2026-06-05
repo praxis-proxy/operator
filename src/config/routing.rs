@@ -212,18 +212,21 @@ fn process_rule(
     let all_refs: Vec<_> = raw_backends.iter().collect();
     let cluster_name = merged_cluster_name_from_refs(&all_refs, route_ns);
     create_routes_for_backend(&cluster_name, matches, route_hostnames, section_names, praxis_routes);
-    for backend in raw_backends {
-        if !is_backend_authorized(backend, route_ns, grants) {
-            tracing::debug!(
-                backend = backend.name,
-                "skipping unauthorized cross-namespace backend"
-            );
-            continue;
-        }
-        if let Some(br) = process_backend_ref(backend, route_ns, &cluster_name, seen_clusters) {
-            backend_refs.push(br);
-        }
+    backend_refs.extend(
+        raw_backends
+            .iter()
+            .filter(|b| check_backend_authorized(b, route_ns, grants))
+            .filter_map(|b| process_backend_ref(b, route_ns, &cluster_name, seen_clusters)),
+    );
+}
+
+/// Returns `true` if authorized; logs and returns `false` otherwise.
+fn check_backend_authorized(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    if is_backend_authorized(backend, route_ns, grants) {
+        return true;
     }
+    tracing::debug!(backend = backend.name, "skipping unauthorized cross-namespace backend");
+    false
 }
 
 /// Checks if a backend ref is authorized (same namespace or [`ReferenceGrant`]).

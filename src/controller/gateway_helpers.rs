@@ -312,20 +312,20 @@ fn distribute_service_weights(service_data: &[(i32, Vec<String>)]) -> (Vec<Strin
         }
     }
 
-    let weight_gcd = all_weights
-        .iter()
-        .copied()
-        .filter(|w| *w > 0)
-        .fold(0, gcd);
-    if weight_gcd > 1 {
-        for w in &mut all_weights {
+    reduce_weights_by_gcd(&mut all_weights);
+    (all_endpoints, all_weights)
+}
+
+/// Divides all positive weights by their GCD to minimise cycle length.
+fn reduce_weights_by_gcd(weights: &mut [i32]) {
+    let g = weights.iter().copied().filter(|w| *w > 0).fold(0, gcd);
+    if g > 1 {
+        for w in weights.iter_mut() {
             if *w > 0 {
-                *w /= weight_gcd;
+                *w /= g;
             }
         }
     }
-
-    (all_endpoints, all_weights)
 }
 
 /// Greatest common divisor (Euclidean algorithm).

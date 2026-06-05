@@ -235,16 +235,10 @@ fn route_sort_key(route: &PraxisRoute) -> (u8, std::cmp::Reverse<usize>, bool, b
 ///
 /// Returns an error if route serialization fails.
 fn build_router_filter(routes: &[&PraxisRoute]) -> serde_yaml::Result<PraxisFilterEntry> {
-    let config = serde_yaml::to_value(serde_yaml::Mapping::from_iter([
-        (
-            serde_yaml::Value::String("routes".to_owned()),
-            serde_yaml::to_value(routes)?,
-        ),
-        (
-            serde_yaml::Value::String("multi_level_subdomain_matching".to_owned()),
-            serde_yaml::Value::Bool(true),
-        ),
-    ]))?;
+    let config = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
+        serde_yaml::Value::String("routes".to_owned()),
+        serde_yaml::to_value(routes)?,
+    )]))?;
 
     Ok(PraxisFilterEntry {
         filter: "router".to_owned(),
