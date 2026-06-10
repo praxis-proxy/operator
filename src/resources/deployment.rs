@@ -10,8 +10,9 @@ use k8s_openapi::{
     api::{
         apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
         core::v1::{
-            Capabilities, ConfigMapVolumeSource, Container, ContainerPort, HTTPGetAction, PodSpec, PodTemplateSpec,
-            Probe, ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
+            Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, HTTPGetAction,
+            PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext,
+            Volume, VolumeMount,
         },
     },
     apimachinery::pkg::{
@@ -88,6 +89,10 @@ pub(crate) fn build_deployment(params: &DeploymentParams<'_>) -> crate::error::R
     volume_mounts.extend(tls_mounts);
     volumes.extend(tls_vols);
 
+    let (tmp_mount, tmp_vol) = tmp_volume();
+    volume_mounts.push(tmp_mount);
+    volumes.push(tmp_vol);
+
     let ports = build_container_ports(params.listener_ports);
     let container = build_praxis_container(ports, volume_mounts);
 
@@ -149,6 +154,24 @@ fn build_tls_volumes(tls_secret_names: &[String]) -> (Vec<VolumeMount>, Vec<Volu
     }
 
     (mounts, volumes)
+}
+
+/// Creates the writable `/tmp` volume and mount pair.
+///
+/// Required because the container uses a read-only root filesystem but
+/// the proxy needs a writable temporary directory.
+fn tmp_volume() -> (VolumeMount, Volume) {
+    let mount = VolumeMount {
+        name: "tmp".to_owned(),
+        mount_path: "/tmp".to_owned(),
+        ..Default::default()
+    };
+    let vol = Volume {
+        name: "tmp".to_owned(),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
+        ..Default::default()
+    };
+    (mount, vol)
 }
 
 // -----------------------------------------------------------------------------
@@ -312,7 +335,7 @@ fn build_deployment_object(
                 ..Default::default()
             },
             strategy: Some(DeploymentStrategy {
-                type_: Some("Recreate".to_owned()),
+                type_: Some("RollingUpdate".to_owned()),
                 ..Default::default()
             }),
             template: pod_template,
@@ -344,9 +367,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_build_deployment_metadata() {
-        let gateway = Gateway {
+    fn test_gateway() -> Gateway {
+        Gateway {
             metadata: ObjectMeta {
                 name: Some("test-gateway".to_owned()),
                 namespace: Some("default".to_owned()),
@@ -355,17 +377,25 @@ mod tests {
             },
             spec: Default::default(),
             status: None,
-        };
+        }
+    }
 
-        let deployment = build_deployment(&DeploymentParams {
+    fn test_params<'a>(gateway: &'a Gateway, ports: &'a [(String, i32)]) -> DeploymentParams<'a> {
+        DeploymentParams {
             config_hash: "abc123",
             name: "praxis-deploy",
             namespace: "default",
-            gateway: &gateway,
+            gateway,
             tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+            listener_ports: ports,
+        }
+    }
+
+    #[test]
+    fn test_build_deployment_metadata() {
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         assert_eq!(
             deployment.metadata.name,
@@ -400,26 +430,9 @@ mod tests {
 
     #[test]
     fn test_build_deployment_spec() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
         assert_eq!(spec.replicas, Some(1), "replicas should be 1");
@@ -434,31 +447,28 @@ mod tests {
     }
 
     #[test]
-    fn test_build_deployment_pod_template() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+    fn test_build_deployment_strategy() {
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
-        let template = spec.template;
-        let pod_spec = template.spec.expect("pod spec should be set");
+        let strategy = spec.strategy.expect("strategy should be set");
+        assert_eq!(
+            strategy.type_,
+            Some("RollingUpdate".to_owned()),
+            "strategy should be RollingUpdate to avoid traffic blackouts"
+        );
+    }
+
+    #[test]
+    fn test_build_deployment_pod_template() {
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
+
+        let spec = deployment.spec.expect("spec should be set");
+        let pod_spec = spec.template.spec.expect("pod spec should be set");
         assert_eq!(pod_spec.containers.len(), 1, "should have one container");
 
         let container = &pod_spec.containers[0];
@@ -472,24 +482,10 @@ mod tests {
 
     #[test]
     fn test_build_deployment_container_ports() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
+        let gateway = test_gateway();
         let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
             listener_ports: &[("http".to_owned(), 80), ("https".to_owned(), 443)],
+            ..test_params(&gateway, &[])
         })
         .unwrap();
 
@@ -517,34 +513,21 @@ mod tests {
 
     #[test]
     fn test_build_deployment_volume_mounts() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
         let pod_spec = spec.template.spec.expect("pod spec should be set");
         let container = &pod_spec.containers[0];
         let volume_mounts = container.volume_mounts.as_ref().expect("volume mounts should be set");
 
-        assert_eq!(volume_mounts.len(), 1, "should have one volume mount without TLS");
-        assert_eq!(volume_mounts[0].name, "config", "volume mount name should be config");
+        assert_eq!(
+            volume_mounts.len(),
+            2,
+            "should have config and tmp volume mounts without TLS"
+        );
+        assert_eq!(volume_mounts[0].name, "config", "first mount should be config");
         assert_eq!(
             volume_mounts[0].mount_path, "/etc/praxis",
             "config should mount to /etc/praxis"
@@ -554,34 +537,54 @@ mod tests {
             Some(true),
             "config mount should be read-only"
         );
+        assert_eq!(volume_mounts[1].name, "tmp", "second mount should be tmp");
+        assert_eq!(volume_mounts[1].mount_path, "/tmp", "tmp should mount to /tmp");
 
         let volumes = pod_spec.volumes.as_ref().expect("volumes should be set");
-        assert_eq!(volumes.len(), 1, "should have one volume without TLS");
-        assert_eq!(volumes[0].name, "config", "volume name should be config");
-        assert!(volumes[0].config_map.is_some(), "volume should be a ConfigMap volume");
+        assert_eq!(volumes.len(), 2, "should have config and tmp volumes without TLS");
+        assert_eq!(volumes[0].name, "config", "first volume should be config");
+        assert!(volumes[0].config_map.is_some(), "config volume should be a ConfigMap");
+        assert_eq!(volumes[1].name, "tmp", "second volume should be tmp");
+        assert!(volumes[1].empty_dir.is_some(), "tmp volume should be emptyDir");
+    }
+
+    #[test]
+    fn test_build_deployment_tmp_volume() {
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
+
+        let spec = deployment.spec.expect("spec should be set");
+        let pod_spec = spec.template.spec.expect("pod spec should be set");
+        let container = &pod_spec.containers[0];
+        let volume_mounts = container.volume_mounts.as_ref().expect("volume mounts should be set");
+
+        let tmp_mount = volume_mounts
+            .iter()
+            .find(|m| m.name == "tmp")
+            .expect("tmp mount should exist");
+        assert_eq!(tmp_mount.mount_path, "/tmp", "tmp should mount to /tmp");
+        assert!(
+            tmp_mount.read_only.is_none() || tmp_mount.read_only == Some(false),
+            "tmp mount should be writable"
+        );
+
+        let volumes = pod_spec.volumes.as_ref().expect("volumes should be set");
+        let tmp_vol = volumes
+            .iter()
+            .find(|v| v.name == "tmp")
+            .expect("tmp volume should exist");
+        assert!(tmp_vol.empty_dir.is_some(), "tmp volume should be emptyDir");
     }
 
     #[test]
     fn test_build_deployment_tls_volumes() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
+        let gateway = test_gateway();
         let tls_secrets = vec!["my-cert".to_owned(), "other-cert".to_owned()];
         let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
             tls_secret_names: &tls_secrets,
             listener_ports: &[("https".to_owned(), 443)],
+            ..test_params(&gateway, &[])
         })
         .unwrap();
 
@@ -590,7 +593,7 @@ mod tests {
         let container = &pod_spec.containers[0];
         let volume_mounts = container.volume_mounts.as_ref().expect("volume mounts should be set");
 
-        assert_eq!(volume_mounts.len(), 3, "should have config + two TLS mounts");
+        assert_eq!(volume_mounts.len(), 4, "should have config + two TLS + tmp mounts");
         assert_eq!(
             volume_mounts[1].name, "tls-0",
             "first TLS mount name should be index-based"
@@ -607,9 +610,10 @@ mod tests {
             volume_mounts[2].mount_path, "/tls/other-cert",
             "second TLS mount path should use secret name"
         );
+        assert_eq!(volume_mounts[3].name, "tmp", "last mount should be tmp");
 
         let volumes = pod_spec.volumes.as_ref().expect("volumes should be set");
-        assert_eq!(volumes.len(), 3, "should have config + two TLS volumes");
+        assert_eq!(volumes.len(), 4, "should have config + two TLS + tmp volumes");
         assert_eq!(volumes[1].name, "tls-0", "first TLS volume name should be index-based");
         assert!(volumes[1].secret.is_some(), "first TLS volume should be a Secret");
         assert_eq!(
@@ -619,30 +623,15 @@ mod tests {
         );
         assert_eq!(volumes[2].name, "tls-1", "second TLS volume name should be index-based");
         assert!(volumes[2].secret.is_some(), "second TLS volume should be a Secret");
+        assert_eq!(volumes[3].name, "tmp", "last volume should be tmp");
+        assert!(volumes[3].empty_dir.is_some(), "tmp volume should be emptyDir");
     }
 
     #[test]
     fn test_build_deployment_probes() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
         let pod_spec = spec.template.spec.expect("pod spec should be set");
@@ -680,26 +669,9 @@ mod tests {
 
     #[test]
     fn test_build_deployment_security_context() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
         let pod_spec = spec.template.spec.expect("pod spec should be set");
@@ -740,26 +712,9 @@ mod tests {
 
     #[test]
     fn test_build_deployment_pod_hardening() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
         let pod_spec = spec.template.spec.expect("pod spec should be set");
@@ -779,26 +734,9 @@ mod tests {
 
     #[test]
     fn test_build_deployment_resource_requirements() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
-        let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
-            listener_ports: &[("http".to_owned(), 8080)],
-        })
-        .unwrap();
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
         let pod_spec = spec.template.spec.expect("pod spec should be set");
@@ -828,24 +766,10 @@ mod tests {
 
     #[test]
     fn test_build_deployment_admin_port_collision() {
-        let gateway = Gateway {
-            metadata: ObjectMeta {
-                name: Some("test-gateway".to_owned()),
-                namespace: Some("default".to_owned()),
-                uid: Some("test-uid".to_owned()),
-                ..Default::default()
-            },
-            spec: Default::default(),
-            status: None,
-        };
-
+        let gateway = test_gateway();
         let deployment = build_deployment(&DeploymentParams {
-            config_hash: "abc123",
-            name: "praxis-deploy",
-            namespace: "default",
-            gateway: &gateway,
-            tls_secret_names: &[],
             listener_ports: &[("admin-listener".to_owned(), ADMIN_PORT)],
+            ..test_params(&gateway, &[])
         })
         .unwrap();
 

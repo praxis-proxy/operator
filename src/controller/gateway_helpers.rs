@@ -15,7 +15,10 @@ use gateway_api::{
     },
     httproutes::HTTPRoute,
 };
-use k8s_openapi::api::core::v1::{Namespace, Service, ServicePort};
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{Namespace, Service, ServicePort},
+};
 use kube::{Api, ResourceExt, api::PatchParams};
 use serde_json::json;
 use tracing::{debug, info};
@@ -440,6 +443,9 @@ fn sha256_hex(data: &str) -> String {
 // -----------------------------------------------------------------------------
 
 /// Builds and applies the Gateway status (listener statuses + conditions).
+///
+/// Gates the `Programmed` condition on both Deployment readiness and
+/// load-balancer address availability, per the Gateway API spec.
 pub(super) async fn build_and_apply_gateway_status(
     client: &kube::Client,
     gw: &Gateway,
@@ -449,10 +455,24 @@ pub(super) async fn build_and_apply_gateway_status(
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     let generation = gw.metadata.generation.unwrap_or(1);
+    let child = child_name(&name);
 
-    let addresses = resolve_lb_addresses(client, &ns, &child_name(&name)).await;
-    let listener_result = build_listener_statuses(listeners, generation, &ns, client, attached).await;
-    let status = build_gateway_conditions(&name, &ns, &addresses, &listener_result, generation);
+    let addresses = resolve_lb_addresses(client, &ns, &child).await;
+    let deployment_ready = is_deployment_ready(client, &ns, &child).await;
+    let (listener_statuses, any_accepted, any_rejected) =
+        build_listener_statuses(listeners, generation, &ns, client, attached).await;
+
+    let data_plane_ready = deployment_ready && !addresses.is_empty();
+    let accepted = gateway_accepted_condition(generation, any_accepted, any_rejected);
+    let programmed = gateway_programmed_condition(generation, any_accepted, data_plane_ready);
+    let status = gateway_status_json(&GatewayStatusParts {
+        name: &name,
+        ns: &ns,
+        addresses: &addresses,
+        listener_statuses: &listener_statuses,
+        accepted: &accepted,
+        programmed: &programmed,
+    });
 
     apply_gateway_status(client, &ns, &name, &status).await?;
     log_gateway_reconciled(&ns, &name);
@@ -462,28 +482,6 @@ pub(super) async fn build_and_apply_gateway_status(
 /// Logs successful Gateway reconciliation.
 fn log_gateway_reconciled(ns: &str, name: &str) {
     info!("Gateway {ns}/{name} reconciled successfully");
-}
-
-/// Combines listener statuses with gateway-level conditions into a status
-/// JSON payload.
-fn build_gateway_conditions(
-    name: &str,
-    ns: &str,
-    addresses: &[serde_json::Value],
-    listener_result: &(Vec<serde_json::Value>, bool, bool),
-    generation: i64,
-) -> serde_json::Value {
-    let (ref listener_statuses, any_accepted, any_rejected) = *listener_result;
-    let accepted = gateway_accepted_condition(generation, any_accepted, any_rejected);
-    let programmed = gateway_programmed_condition(generation, any_accepted);
-    gateway_status_json(&GatewayStatusParts {
-        name,
-        ns,
-        addresses,
-        listener_statuses,
-        accepted: &accepted,
-        programmed: &programmed,
-    })
 }
 
 /// Components used to build the Gateway status JSON payload.
@@ -550,6 +548,16 @@ async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> V
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Checks whether the child Deployment has at least one ready replica.
+async fn is_deployment_ready(client: &kube::Client, ns: &str, child: &str) -> bool {
+    Api::<Deployment>::namespaced(client.clone(), ns)
+        .get(child)
+        .await
+        .ok()
+        .and_then(|d| d.status)
+        .is_some_and(|s| s.ready_replicas.unwrap_or(0) > 0)
 }
 
 /// Builds per-listener status entries.
@@ -684,15 +692,21 @@ fn gateway_accepted_condition(
 }
 
 /// Returns the `Programmed` condition for the Gateway.
+///
+/// Requires accepted listeners, a ready Deployment, and at least one
+/// load-balancer address before reporting `True`.
 fn gateway_programmed_condition(
     generation: i64,
     any_accepted: bool,
+    data_plane_ready: bool,
 ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
-    if any_accepted {
-        conditions::programmed(generation, "Data plane configured")
-    } else {
-        conditions::not_programmed(generation, "Invalid", "no valid listeners")
+    if !any_accepted {
+        return conditions::not_programmed(generation, "Invalid", "no valid listeners");
     }
+    if !data_plane_ready {
+        return conditions::not_programmed(generation, "Pending", "data plane not ready");
+    }
+    conditions::programmed(generation, "Data plane ready")
 }
 
 // -----------------------------------------------------------------------------
@@ -1073,5 +1087,83 @@ fn evaluate_match_expression(
         "Exists" => has_key,
         "DoesNotExist" => !has_key,
         _ => false,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::default_trait_access,
+    clippy::match_wildcard_for_single_variants,
+    clippy::missing_assert_message,
+    reason = "tests"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gateway_programmed_all_ready() {
+        let cond = gateway_programmed_condition(1, true, true);
+        assert_eq!(cond.type_, "Programmed", "type should be Programmed");
+        assert_eq!(cond.status, "True", "should be True when all ready");
+        assert_eq!(cond.reason, "Programmed", "reason should be Programmed");
+        assert_eq!(cond.observed_generation, Some(1), "generation should match");
+    }
+
+    #[test]
+    fn test_gateway_programmed_no_accepted_listeners() {
+        let cond = gateway_programmed_condition(2, false, false);
+        assert_eq!(cond.status, "False", "should be False without accepted listeners");
+        assert_eq!(cond.reason, "Invalid", "reason should be Invalid");
+    }
+
+    #[test]
+    fn test_gateway_programmed_deployment_not_ready() {
+        let cond = gateway_programmed_condition(3, true, false);
+        assert_eq!(cond.status, "False", "should be False when data plane not ready");
+        assert_eq!(cond.reason, "Pending", "reason should be Pending");
+    }
+
+    #[test]
+    fn test_gateway_programmed_invalid_takes_precedence() {
+        let cond = gateway_programmed_condition(4, false, true);
+        assert_eq!(cond.status, "False", "should be False without accepted listeners");
+        assert_eq!(
+            cond.reason, "Invalid",
+            "Invalid should take precedence over data plane readiness"
+        );
+    }
+
+    #[test]
+    fn test_gateway_accepted_all_valid() {
+        let cond = gateway_accepted_condition(1, true, false);
+        assert_eq!(cond.type_, "Accepted", "type should be Accepted");
+        assert_eq!(cond.status, "True", "should be True when all accepted");
+        assert_eq!(cond.reason, "Accepted", "reason should be Accepted");
+    }
+
+    #[test]
+    fn test_gateway_accepted_none_valid() {
+        let cond = gateway_accepted_condition(1, false, true);
+        assert_eq!(cond.status, "False", "should be False with no accepted listeners");
+    }
+
+    #[test]
+    fn test_gateway_accepted_mixed_listeners() {
+        let cond = gateway_accepted_condition(1, true, true);
+        assert_eq!(cond.status, "True", "should be True when some listeners are accepted");
+        assert_eq!(
+            cond.reason, "ListenersNotValid",
+            "reason should indicate some listeners are invalid"
+        );
     }
 }
