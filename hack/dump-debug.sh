@@ -14,7 +14,7 @@ ${KUBECTL} -n praxis-system describe pods \
 echo ''
 echo '==> DEBUG: Operator logs'
 ${KUBECTL} -n praxis-system logs deployment/praxis-operator \
-    --tail=100 2>/dev/null || true
+    --tail=500 2>/dev/null || true
 echo ''
 echo '==> DEBUG: All pods (all namespaces)'
 ${KUBECTL} get pods -A -o wide 2>/dev/null || true
@@ -32,6 +32,16 @@ for ns in $(${KUBECTL} get ns -o jsonpath='{.items[*].metadata.name}' \
         ${KUBECTL} -n "${ns}" logs "${pod}" -c praxis \
             --tail=100 2>/dev/null || true
     done
+done
+echo ''
+echo '==> DEBUG: ConfigMaps (gateway-conformance-infra)'
+for cm in $(${KUBECTL} -n gateway-conformance-infra get configmaps \
+    -l app.kubernetes.io/managed-by=praxis-operator -o name 2>/dev/null); do
+    echo ""
+    echo "==> DEBUG: ${cm} data"
+    ${KUBECTL} -n gateway-conformance-infra get "${cm}" \
+        -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true
+    echo ""
 done
 echo ''
 echo '==> DEBUG: Events (all namespaces)'
