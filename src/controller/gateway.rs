@@ -75,7 +75,12 @@ pub(crate) fn error_policy(_gw: Arc<Gateway>, error: &Error, _ctx: Arc<Context>)
 // -----------------------------------------------------------------------------
 
 /// Full apply path: validate, generate config, apply child resources,
-/// update status.
+/// update Gateway and route statuses.
+///
+/// Route parent statuses are set **after** child resources are applied
+/// and the Deployment rollout is verified, preventing the conformance
+/// test from sending traffic before the data plane has the latest
+/// configuration.
 async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
     if !gateway_helpers::validate_gateway_class(&ctx.client, &gw).await?
         || reject_if_parameters_ref(&ctx.client, &gw).await?
@@ -86,20 +91,70 @@ async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
     let routes = list_all_routes(&ctx.client).await?;
     let attached = gateway_helpers::collect_routes(&ctx.client, &gw, &routes).await;
     let ns = gw.namespace().unwrap_or_default();
+    let config_changed = apply_config_if_supported(&ctx.client, &gw, &attached, &ns).await?;
 
+    gateway_helpers::build_and_apply_gateway_status(&ctx.client, &gw, &gw.spec.listeners, &attached).await?;
+
+    let can_accept = check_route_acceptance(&ctx.client, &gw, &attached, &ns, config_changed).await?;
+    let requeue_secs = if can_accept { 15 } else { 2 };
+    Ok(Action::requeue(Duration::from_secs(requeue_secs)))
+}
+
+/// Generates and applies Praxis config for supported listeners.
+///
+/// Returns `true` when the config hash changed (new Deployment rollout
+/// was triggered).
+async fn apply_config_if_supported(
+    client: &kube::Client,
+    gw: &Gateway,
+    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    ns: &str,
+) -> Result<bool> {
     let has_supported = gw
         .spec
         .listeners
         .iter()
         .any(|l| l.protocol == "HTTP" || l.protocol == "HTTPS");
-
-    if has_supported {
-        let config = gateway_helpers::build_praxis_config(&ctx.client, &gw.spec.listeners, &attached, &ns).await?;
-        Box::pin(gateway_helpers::apply_child_resources(&ctx.client, &gw, &config)).await?;
+    if !has_supported {
+        return Ok(false);
     }
 
-    gateway_helpers::build_and_apply_gateway_status(&ctx.client, &gw, &gw.spec.listeners, &attached).await?;
-    Ok(Action::requeue(Duration::from_secs(15)))
+    let child = crate::resources::labels::child_name(&gw.name_any());
+    let prev_hash = gateway_helpers::current_deployment_hash(client, ns, &child).await;
+    let config = gateway_helpers::build_praxis_config(client, &gw.spec.listeners, attached, ns).await?;
+    let new_hash = Box::pin(gateway_helpers::apply_child_resources(client, gw, &config)).await?;
+    let changed = prev_hash.as_deref() != Some(&new_hash);
+    log_config_apply(&gw.name_any(), changed, attached.len());
+    Ok(changed)
+}
+
+/// Accepts routes when the config is stable and the Deployment is
+/// fully rolled out.
+async fn check_route_acceptance(
+    client: &kube::Client,
+    gw: &Gateway,
+    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    ns: &str,
+    config_changed: bool,
+) -> Result<bool> {
+    let child = crate::resources::labels::child_name(&gw.name_any());
+    let rolled_out = gateway_helpers::is_deployment_rolled_out(client, ns, &child).await;
+    let can_accept = !config_changed && rolled_out;
+    log_acceptance_decision(&gw.name_any(), can_accept);
+    if can_accept {
+        gateway_helpers::update_route_parent_statuses(client, gw, attached).await?;
+    }
+    Ok(can_accept)
+}
+
+/// Logs the result of a config apply cycle.
+fn log_config_apply(gateway: &str, config_changed: bool, routes: usize) {
+    debug!(gateway, config_changed, routes, "config apply result");
+}
+
+/// Logs the route acceptance decision.
+fn log_acceptance_decision(gateway: &str, can_accept: bool) {
+    debug!(gateway, can_accept, "route acceptance decision");
 }
 
 /// Lists all `HTTPRoute` resources across all namespaces.

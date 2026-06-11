@@ -2,6 +2,11 @@
 // Copyright (c) 2026 Shane Utt
 
 //! `HTTPRoute` reconciler.
+//!
+//! Handles rejection statuses (`Accepted = False`) for routes that fail
+//! listener validation (wrong section name, namespace policy, hostname
+//! mismatch). Acceptance (`Accepted = True`) is set by the Gateway
+//! controller after the data-plane Deployment rollout completes.
 
 use std::{sync::Arc, time::Duration};
 
@@ -29,25 +34,45 @@ use crate::{
 // Reconciler
 // -----------------------------------------------------------------------------
 
-/// Reconciles an [`HTTPRoute`] by updating its parent status entries.
+/// Reconciles an [`HTTPRoute`] by setting rejection statuses.
 ///
-/// For each `parentRef` that targets a `Gateway` managed by this controller,
-/// sets `Accepted` and `ResolvedRefs` conditions to `True`.
+/// Only sets `Accepted = False` for routes that fail listener
+/// validation. `Accepted = True` is set by the Gateway controller
+/// after the data-plane Deployment rollout completes, preventing the
+/// conformance test from sending traffic to a stale configuration.
 pub(crate) async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Result<Action> {
     let ns = route_namespace(&route);
     let name = route.name_any();
-    log_reconcile_start(ns, &name);
+    info!("reconciling HTTPRoute {ns}/{name}");
 
-    let Some(parent_refs) = &route.spec.parent_refs else {
-        log_no_parent_refs(ns, &name);
-        return Ok(Action::await_change());
-    };
+    if let Some(refs) = &route.spec.parent_refs {
+        return apply_rejections(&route, refs, ns, &name, &ctx).await;
+    }
+    log_no_parent_refs(ns, &name);
+    Ok(Action::await_change())
+}
 
+/// Logs that an `HTTPRoute` has no parent refs and will be skipped.
+fn log_no_parent_refs(ns: &str, name: &str) {
+    debug!("HTTPRoute {ns}/{name} has no parentRefs, skipping");
+}
+
+/// Collects and applies rejection statuses for a route's parent refs.
+async fn apply_rejections(
+    route: &HTTPRoute,
+    parent_refs: &[HttpRouteParentRefs],
+    ns: &str,
+    name: &str,
+    ctx: &Context,
+) -> Result<Action> {
     let generation = route.metadata.generation.unwrap_or(0);
-    let parent_statuses = collect_parent_statuses(&route, parent_refs, ns, generation, &ctx).await;
-    log_empty_parents(&parent_statuses, ns, &name);
-    apply_route_status(&ctx.client, ns, &name, parent_statuses).await?;
-    log_reconcile_done(ns, &name);
+    let statuses = collect_rejection_statuses(route, parent_refs, ns, generation, ctx).await;
+    if statuses.is_empty() {
+        return Ok(Action::await_change());
+    }
+
+    apply_route_status(&ctx.client, ns, name, statuses).await?;
+    info!("HTTPRoute {ns}/{name} rejection status applied");
     Ok(Action::await_change())
 }
 
@@ -56,32 +81,10 @@ fn route_namespace(route: &HTTPRoute) -> &str {
     route.metadata.namespace.as_deref().unwrap_or("default")
 }
 
-/// Logs reconcile start.
-fn log_reconcile_start(ns: &str, name: &str) {
-    info!("reconciling HTTPRoute {ns}/{name}");
-}
-
-/// Logs when no parent refs are present.
-fn log_no_parent_refs(ns: &str, name: &str) {
-    debug!("HTTPRoute {ns}/{name} has no parentRefs, skipping");
-}
-
-/// Logs when no matching parent Gateways were found.
-fn log_empty_parents(statuses: &[serde_json::Value], ns: &str, name: &str) {
-    if statuses.is_empty() {
-        debug!("HTTPRoute {ns}/{name} has no matching parent Gateways");
-    }
-}
-
-/// Logs reconcile completion.
-fn log_reconcile_done(ns: &str, name: &str) {
-    info!("HTTPRoute {ns}/{name} status updated");
-}
-
-/// Collects parent status entries for all matching `parentRefs`.
+/// Collects rejection-only parent status entries.
 ///
-/// Skips refs that do not target a `Gateway` managed by this controller.
-async fn collect_parent_statuses(
+/// Only returns entries where the route should NOT be accepted.
+async fn collect_rejection_statuses(
     route: &HTTPRoute,
     parent_refs: &[HttpRouteParentRefs],
     route_ns: &str,
@@ -90,51 +93,20 @@ async fn collect_parent_statuses(
 ) -> Vec<serde_json::Value> {
     let mut statuses = Vec::new();
     for parent_ref in parent_refs {
-        if let Some(status) = build_parent_status(route, parent_ref, route_ns, generation, ctx).await {
+        if let Some(status) = build_rejection_status(route, parent_ref, route_ns, generation, ctx).await {
             statuses.push(status);
         }
     }
     statuses
 }
 
-/// Patches the [`HTTPRoute`] status with the given parent status entries.
+/// Builds a rejection status for a single `parentRef`.
 ///
-/// Uses server-side apply to merge the status update.
-async fn apply_route_status(
-    client: &kube::Client,
-    ns: &str,
-    name: &str,
-    parent_statuses: Vec<serde_json::Value>,
-) -> Result<()> {
-    let status = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "HTTPRoute",
-        "metadata": { "name": name, "namespace": ns },
-        "status": { "parents": parent_statuses },
-    });
-
-    let route_api = Api::<HTTPRoute>::namespaced(client.clone(), ns);
-    route_api
-        .patch_status(
-            name,
-            &PatchParams::apply("praxis-operator").force(),
-            &Patch::Apply(&status),
-        )
-        .await?;
-
-    Ok(())
-}
-
-// -----------------------------------------------------------------------------
-// Status Builders
-// -----------------------------------------------------------------------------
-
-/// Builds a parent status entry for a single `parentRef`.
-///
-/// Returns `None` when the parent is not a `Gateway` managed by this
-/// controller, or when the referenced `Gateway` or `GatewayClass` cannot
-/// be found.
-async fn build_parent_status(
+/// Returns `None` when the route should be accepted (the Gateway
+/// controller handles acceptance). Returns `Some` only for rejection
+/// cases: invalid section name, namespace not allowed, hostname
+/// mismatch, or unresolved backend refs.
+async fn build_rejection_status(
     route: &HTTPRoute,
     parent_ref: &HttpRouteParentRefs,
     route_ns: &str,
@@ -152,18 +124,25 @@ async fn build_parent_status(
         return None;
     }
 
+    let rejection = validate_listener_attachment(route, &gw, parent_ref, generation, &ctx.client).await;
     let grants = list_reference_grants(ctx).await;
     let resolve_result = check_backend_refs(route, route_ns, &ctx.client, &grants).await;
-
-    let accepted = build_accepted_condition(route, &gw, parent_ref, generation, &ctx.client).await;
     let resolved = build_resolved_condition(&resolve_result, generation);
 
-    Some(parent_status_json(parent_ref, gw_ns, &accepted, &resolved))
+    match rejection {
+        Some(not_accepted) => Some(parent_status_json(parent_ref, gw_ns, &not_accepted, &resolved)),
+        None => {
+            if resolve_result.is_err() {
+                let accepted = conditions::accepted(generation, "route accepted");
+                Some(parent_status_json(parent_ref, gw_ns, &accepted, &resolved))
+            } else {
+                None
+            }
+        },
+    }
 }
 
 /// Checks whether a `parentRef` targets a `Gateway` resource.
-///
-/// Returns `false` for non-Gateway parent refs.
 fn is_gateway_parent_ref(parent_ref: &HttpRouteParentRefs) -> bool {
     let group = parent_ref.group.as_deref().unwrap_or("gateway.networking.k8s.io");
     let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
@@ -172,9 +151,6 @@ fn is_gateway_parent_ref(parent_ref: &HttpRouteParentRefs) -> bool {
 
 /// Checks whether the `Gateway`'s `GatewayClass` is managed by this
 /// controller.
-///
-/// Returns `false` when the class cannot be found or has a different
-/// controller name.
 async fn is_managed_gateway_class(gw: &Gateway, ctx: &Context) -> bool {
     let gc_name = &gw.spec.gateway_class_name;
     let gc_api = Api::<GatewayClass>::all(ctx.client.clone());
@@ -185,8 +161,6 @@ async fn is_managed_gateway_class(gw: &Gateway, ctx: &Context) -> bool {
 }
 
 /// Builds the parent status JSON value for a single parent ref.
-///
-/// Combines the `parentRef` identity with the evaluated conditions.
 fn parent_status_json(
     parent_ref: &HttpRouteParentRefs,
     gw_ns: &str,
@@ -213,8 +187,6 @@ fn parent_status_json(
 }
 
 /// Looks up the parent `Gateway` for a `parentRef`.
-///
-/// Returns `None` with a debug log when the `Gateway` is not found.
 async fn lookup_parent_gateway(gw_name: &str, gw_ns: &str, route_ns: &str, ctx: &Context) -> Option<Gateway> {
     let gw_api = Api::<Gateway>::namespaced(ctx.client.clone(), gw_ns);
     if let Ok(gw) = gw_api.get(gw_name).await {
@@ -225,8 +197,6 @@ async fn lookup_parent_gateway(gw_name: &str, gw_ns: &str, route_ns: &str, ctx: 
 }
 
 /// Lists all [`ReferenceGrant`] resources in the cluster.
-///
-/// Returns an empty vec when the listing fails.
 async fn list_reference_grants(ctx: &Context) -> Vec<ReferenceGrant> {
     let grant_api = Api::<ReferenceGrant>::all(ctx.client.clone());
     match grant_api.list(&kube::api::ListParams::default()).await {
@@ -238,26 +208,60 @@ async fn list_reference_grants(ctx: &Context) -> Vec<ReferenceGrant> {
     }
 }
 
-/// Builds the `Accepted` condition based on listener matching.
-///
-/// Checks section name validity, namespace allowance, and hostname
-/// intersection. Returns the first failing condition found.
-async fn build_accepted_condition(
+// -----------------------------------------------------------------------------
+// Validation
+// -----------------------------------------------------------------------------
+
+/// Returns a rejection condition if the route fails listener validation.
+async fn validate_listener_attachment(
     route: &HTTPRoute,
     gw: &Gateway,
     parent_ref: &HttpRouteParentRefs,
     generation: i64,
     client: &kube::Client,
-) -> Condition {
-    if let Some(section) = &parent_ref.section_name
-        && !gw.spec.listeners.iter().any(|l| l.name == *section)
-    {
-        return conditions::not_accepted(generation, "NoMatchingParent", "no listener matches sectionName");
+) -> Option<Condition> {
+    if !section_name_valid(gw, parent_ref) {
+        return Some(conditions::not_accepted(
+            generation,
+            "NoMatchingParent",
+            "no listener matches sectionName",
+        ));
     }
+    if !namespace_allowed(route, gw, parent_ref, client).await {
+        return Some(conditions::not_accepted(
+            generation,
+            "NotAllowedByListeners",
+            "route namespace not allowed",
+        ));
+    }
+    if !hostnames_intersect(route, gw, parent_ref.section_name.as_deref()) {
+        return Some(conditions::not_accepted(
+            generation,
+            "NoMatchingListenerHostname",
+            "no matching listener hostname",
+        ));
+    }
+    None
+}
 
+/// Returns `true` when the `parentRef` section name matches a listener.
+fn section_name_valid(gw: &Gateway, parent_ref: &HttpRouteParentRefs) -> bool {
+    parent_ref
+        .section_name
+        .as_ref()
+        .is_none_or(|s| gw.spec.listeners.iter().any(|l| l.name == *s))
+}
+
+/// Returns `true` when the route's namespace is allowed by listeners.
+async fn namespace_allowed(
+    route: &HTTPRoute,
+    gw: &Gateway,
+    parent_ref: &HttpRouteParentRefs,
+    client: &kube::Client,
+) -> bool {
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("default");
-    if !route_allowed_by_listeners(
+    route_allowed_by_listeners(
         route_ns,
         gw_ns,
         &gw.spec.listeners,
@@ -265,23 +269,10 @@ async fn build_accepted_condition(
         client,
     )
     .await
-    {
-        return conditions::not_accepted(generation, "NotAllowedByListeners", "route namespace not allowed");
-    }
-
-    if !hostnames_intersect(route, gw, parent_ref.section_name.as_deref()) {
-        return conditions::not_accepted(
-            generation,
-            "NoMatchingListenerHostname",
-            "no matching listener hostname",
-        );
-    }
-
-    conditions::accepted(generation, "route accepted")
 }
 
 /// Checks whether a route's namespace is allowed by at least one
-/// targeted listener's `allowedRoutes.namespaces` policy.
+/// targeted listener.
 async fn route_allowed_by_listeners(
     route_ns: &str,
     gw_ns: &str,
@@ -289,35 +280,53 @@ async fn route_allowed_by_listeners(
     section_name: Option<&str>,
     client: &kube::Client,
 ) -> bool {
-    let matching: Vec<_> = match section_name {
-        Some(name) => listeners.iter().filter(|l| l.name == name).collect(),
-        None => listeners.iter().collect(),
-    };
-
+    let matching = targeted_listeners(listeners, section_name);
     for listener in &matching {
-        let from = listener
-            .allowed_routes
-            .as_ref()
-            .and_then(|ar| ar.namespaces.as_ref())
-            .and_then(|ns| ns.from.as_ref());
-
-        let allowed = match from {
-            None | Some(gateway_api::gateways::GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == gw_ns,
-            Some(gateway_api::gateways::GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
-            Some(gateway_api::gateways::GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
-                let selector = listener
-                    .allowed_routes
-                    .as_ref()
-                    .and_then(|ar| ar.namespaces.as_ref())
-                    .and_then(|ns| ns.selector.as_ref());
-                namespace_matches_label_selector(client, route_ns, selector).await
-            },
-        };
-        if allowed {
+        if listener_allows_namespace(listener, route_ns, gw_ns, client).await {
             return true;
         }
     }
     false
+}
+
+/// Returns listeners targeted by a section name (or all if `None`).
+fn targeted_listeners<'a>(
+    listeners: &'a [gateway_api::gateways::GatewayListeners],
+    section_name: Option<&str>,
+) -> Vec<&'a gateway_api::gateways::GatewayListeners> {
+    match section_name {
+        Some(name) => listeners.iter().filter(|l| l.name == name).collect(),
+        None => listeners.iter().collect(),
+    }
+}
+
+/// Checks whether a single listener allows the given route namespace.
+async fn listener_allows_namespace(
+    listener: &gateway_api::gateways::GatewayListeners,
+    route_ns: &str,
+    gw_ns: &str,
+    client: &kube::Client,
+) -> bool {
+    use gateway_api::gateways::GatewayListenersAllowedRoutesNamespacesFrom;
+
+    let from = listener
+        .allowed_routes
+        .as_ref()
+        .and_then(|ar| ar.namespaces.as_ref())
+        .and_then(|ns| ns.from.as_ref());
+
+    match from {
+        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == gw_ns,
+        Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
+        Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
+            let selector = listener
+                .allowed_routes
+                .as_ref()
+                .and_then(|ar| ar.namespaces.as_ref())
+                .and_then(|ns| ns.selector.as_ref());
+            namespace_matches_label_selector(client, route_ns, selector).await
+        },
+    }
 }
 
 /// Checks whether a namespace's labels match a label selector.
@@ -348,9 +357,40 @@ async fn namespace_matches_label_selector(
     true
 }
 
+/// Checks if any route hostname intersects with a matching listener.
+fn hostnames_intersect(route: &HTTPRoute, gw: &Gateway, section_name: Option<&str>) -> bool {
+    let route_hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]);
+    if route_hostnames.is_empty() {
+        return true;
+    }
+
+    let matching_listeners: Vec<_> = match section_name {
+        Some(name) => gw.spec.listeners.iter().filter(|l| l.name == name).collect(),
+        None => gw.spec.listeners.iter().collect(),
+    };
+
+    for listener in &matching_listeners {
+        let listener_hostname = match &listener.hostname {
+            Some(h) => h.as_str(),
+            None => return true,
+        };
+        for route_hostname in route_hostnames {
+            if crate::gateway_api::hostname::hostname_matches(route_hostname, listener_hostname) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+// -----------------------------------------------------------------------------
+// Backend Validation
+// -----------------------------------------------------------------------------
+
 /// Reason a backend ref could not be resolved.
 enum ResolveFailure {
-    /// Backend ref has an unsupported group or kind.
+    /// Unsupported group or kind.
     InvalidKind,
 
     /// Cross-namespace ref denied by `ReferenceGrant`.
@@ -381,44 +421,7 @@ fn build_resolved_condition(result: &ResolveResult, generation: i64) -> Conditio
     }
 }
 
-// -----------------------------------------------------------------------------
-// Validation
-// -----------------------------------------------------------------------------
-
-/// Checks if any route hostname intersects with a matching listener hostname.
-///
-/// Returns `true` when the route has no hostnames (wildcard), or when at
-/// least one route hostname matches at least one targeted listener hostname.
-fn hostnames_intersect(route: &HTTPRoute, gw: &Gateway, section_name: Option<&str>) -> bool {
-    let route_hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]);
-    if route_hostnames.is_empty() {
-        return true;
-    }
-
-    let matching_listeners: Vec<_> = match section_name {
-        Some(name) => gw.spec.listeners.iter().filter(|l| l.name == name).collect(),
-        None => gw.spec.listeners.iter().collect(),
-    };
-
-    for listener in &matching_listeners {
-        let listener_hostname = match &listener.hostname {
-            Some(h) => h.as_str(),
-            None => return true,
-        };
-        for route_hostname in route_hostnames {
-            if crate::gateway_api::hostname::hostname_matches(route_hostname, listener_hostname) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 /// Checks all backend refs in the route for validity.
-///
-/// Validates group/kind, cross-namespace `ReferenceGrant` authorization,
-/// and Service existence.
 async fn check_backend_refs(
     route: &HTTPRoute,
     route_ns: &str,
@@ -435,23 +438,65 @@ async fn check_backend_refs(
     Ok(())
 }
 
-/// Validates a single backend ref for group/kind, cross-namespace
-/// authorization, and Service existence.
+/// Validates a single backend ref.
 async fn validate_single_backend(
     backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs,
     route_ns: &str,
     client: &kube::Client,
     grants: &[ReferenceGrant],
 ) -> ResolveResult {
-    if !is_core_service_backend(backend) {
+    validate_backend_kind(backend)?;
+    validate_cross_namespace(backend, route_ns, grants)?;
+    validate_service_exists(backend, route_ns, client).await
+}
+
+/// Rejects backend refs that are not `core/Service`.
+fn validate_backend_kind(backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs) -> ResolveResult {
+    let group = backend.group.as_deref().unwrap_or("");
+    let kind = backend.kind.as_deref().unwrap_or("Service");
+    if !group.is_empty() || kind != "Service" {
+        debug!(group, kind, "unsupported backend ref kind");
         return Err(ResolveFailure::InvalidKind);
     }
+    Ok(())
+}
 
+/// Rejects cross-namespace refs not covered by a [`ReferenceGrant`].
+fn validate_cross_namespace(
+    backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs,
+    route_ns: &str,
+    grants: &[ReferenceGrant],
+) -> ResolveResult {
     let backend_ns = backend.namespace.as_deref().unwrap_or(route_ns);
-    if !is_cross_ns_backend_allowed(backend, route_ns, backend_ns, grants) {
+    if backend_ns != route_ns
+        && !reference_grant::is_reference_allowed(
+            route_ns,
+            "gateway.networking.k8s.io",
+            "HTTPRoute",
+            backend_ns,
+            "",
+            "Service",
+            Some(&backend.name),
+            grants,
+        )
+    {
+        debug!(
+            backend_ns,
+            service = %backend.name,
+            "cross-namespace backend ref not permitted by ReferenceGrant"
+        );
         return Err(ResolveFailure::RefNotPermitted);
     }
+    Ok(())
+}
 
+/// Verifies the referenced `Service` exists in the cluster.
+async fn validate_service_exists(
+    backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs,
+    route_ns: &str,
+    client: &kube::Client,
+) -> ResolveResult {
+    let backend_ns = backend.namespace.as_deref().unwrap_or(route_ns);
     let svc_api = Api::<Service>::namespaced(client.clone(), backend_ns);
     if svc_api.get(&backend.name).await.is_ok() {
         Ok(())
@@ -460,48 +505,34 @@ async fn validate_single_backend(
     }
 }
 
-/// Returns `true` when the backend ref targets a core `Service`.
-fn is_core_service_backend(backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs) -> bool {
-    let group = backend.group.as_deref().unwrap_or("");
-    let kind = backend.kind.as_deref().unwrap_or("Service");
-    if !group.is_empty() || kind != "Service" {
-        debug!(group, kind, "unsupported backend ref kind");
-        return false;
-    }
-    true
-}
+// -----------------------------------------------------------------------------
+// Route Status
+// -----------------------------------------------------------------------------
 
-/// Checks whether a cross-namespace backend ref is authorized by a
-/// [`ReferenceGrant`].
-///
-/// Same-namespace refs are always allowed.
-fn is_cross_ns_backend_allowed(
-    backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs,
-    route_ns: &str,
-    backend_ns: &str,
-    grants: &[ReferenceGrant],
-) -> bool {
-    if backend_ns == route_ns {
-        return true;
-    }
-    if reference_grant::is_reference_allowed(
-        route_ns,
-        "gateway.networking.k8s.io",
-        "HTTPRoute",
-        backend_ns,
-        "",
-        "Service",
-        Some(&backend.name),
-        grants,
-    ) {
-        return true;
-    }
-    debug!(
-        backend_ns,
-        service = %backend.name,
-        "cross-namespace backend ref not permitted by ReferenceGrant"
-    );
-    false
+/// Patches the [`HTTPRoute`] status via server-side apply.
+async fn apply_route_status(
+    client: &kube::Client,
+    ns: &str,
+    name: &str,
+    parent_statuses: Vec<serde_json::Value>,
+) -> Result<()> {
+    let status = serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": { "name": name, "namespace": ns },
+        "status": { "parents": parent_statuses },
+    });
+
+    let route_api = Api::<HTTPRoute>::namespaced(client.clone(), ns);
+    route_api
+        .patch_status(
+            name,
+            &PatchParams::apply("praxis-operator").force(),
+            &Patch::Apply(&status),
+        )
+        .await?;
+
+    Ok(())
 }
 
 /// Error policy for `HTTPRoute` reconciliation failures.

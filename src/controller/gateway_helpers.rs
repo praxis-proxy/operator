@@ -273,17 +273,49 @@ async fn resolve_clusters(
             .push((weight, eps));
     }
 
-    let mut clusters = Vec::new();
-    for (name, service_data) in cluster_data {
-        let (all_eps, all_weights) = distribute_service_weights(&service_data);
-        let weights = if all_weights.is_empty() {
-            None
-        } else {
-            Some(all_weights)
-        };
-        clusters.push(build_cluster(&name, all_eps, weights));
-    }
+    let clusters = cluster_data
+        .into_iter()
+        .map(|(name, mut svc)| build_resolved_cluster(&name, &mut svc))
+        .collect();
     Ok(clusters)
+}
+
+/// Builds a single cluster from resolved service endpoint data.
+fn build_resolved_cluster(
+    name: &str,
+    service_data: &mut [(i32, Vec<String>)],
+) -> crate::config::cluster::PraxisCluster {
+    sort_service_endpoints(service_data);
+    log_cluster_resolution(name, service_data);
+    let (eps, weights) = distribute_service_weights(service_data);
+    debug!(cluster = %name, endpoints = eps.len(), weights = ?weights, "distributed weights");
+    let w = if weights.is_empty() { None } else { Some(weights) };
+    build_cluster(name, eps, w)
+}
+
+/// Sorts endpoints within each service for deterministic config output.
+///
+/// Without sorting, endpoint IPs from `EndpointSlice` listings may
+/// arrive in arbitrary order across reconciliations. This changes the
+/// config YAML (and its SHA-256 hash), triggering unnecessary
+/// Deployment rollouts and pod restarts.
+fn sort_service_endpoints(service_data: &mut [(i32, Vec<String>)]) {
+    for (_, eps) in service_data.iter_mut() {
+        eps.sort();
+    }
+}
+
+/// Logs per-service endpoint data for a cluster being resolved.
+fn log_cluster_resolution(name: &str, service_data: &[(i32, Vec<String>)]) {
+    debug!(cluster = %name, services = service_data.len(), "resolving cluster");
+    log_service_entries(name, service_data);
+}
+
+/// Logs individual service entries within a cluster.
+fn log_service_entries(name: &str, service_data: &[(i32, Vec<String>)]) {
+    for (i, (w, eps)) in service_data.iter().enumerate() {
+        debug!(cluster = %name, svc = i, weight = w, eps = eps.len(), "service data");
+    }
 }
 
 /// Distributes service-level weights across endpoints.
@@ -378,11 +410,13 @@ fn collect_listener_ports(listeners: &[&GatewayListeners]) -> Vec<(String, i32)>
 
 /// Applies the `ConfigMap`, `Deployment`, and `Service` child resources
 /// via SSA.
+///
+/// Returns the SHA-256 config hash used in the pod template annotation.
 pub(super) async fn apply_child_resources(
     client: &kube::Client,
     gw: &Gateway,
     config_output: &PraxisConfigOutput,
-) -> Result<()> {
+) -> Result<String> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     let child = child_name(&name);
@@ -405,7 +439,7 @@ pub(super) async fn apply_child_resources(
     let svc = build_service(&child, &ns, gw, ports)?;
     super::gateway::apply_resource(client, &ns, &svc).await?;
 
-    Ok(())
+    Ok(config_hash)
 }
 
 /// Converts `(name, port)` pairs into Kubernetes `ServicePort` entries.
@@ -484,6 +518,230 @@ fn log_gateway_reconciled(ns: &str, name: &str) {
     info!("Gateway {ns}/{name} reconciled successfully");
 }
 
+// -----------------------------------------------------------------------------
+// Route Parent Status
+// -----------------------------------------------------------------------------
+
+/// Updates parent status on attached `HTTPRoutes`.
+///
+/// Sets `Accepted = True` and evaluates `ResolvedRefs` for each route
+/// that targets this Gateway. Called by the Gateway controller **after**
+/// child resources are applied and the Deployment rollout is verified,
+/// so the conformance test cannot send traffic before the data plane
+/// is serving the matching configuration.
+pub(super) async fn update_route_parent_statuses(
+    client: &kube::Client,
+    gw: &Gateway,
+    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+) -> Result<()> {
+    let gw_ns = gw.namespace().unwrap_or_default();
+    let gw_name = gw.name_any();
+    let grants = super::gateway::list_all_grants(client).await?;
+
+    for (route, _) in attached {
+        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+        let route_name = route.name_any();
+        let generation = route.metadata.generation.unwrap_or(0);
+        let Some(parent_refs) = &route.spec.parent_refs else {
+            continue;
+        };
+
+        let statuses = build_route_statuses(
+            route,
+            parent_refs,
+            route_ns,
+            &gw_name,
+            &gw_ns,
+            generation,
+            client,
+            &grants,
+        )
+        .await;
+
+        if !statuses.is_empty() {
+            apply_route_status(client, route_ns, &route_name, statuses).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds parent status entries for refs targeting this Gateway.
+#[allow(clippy::too_many_arguments, reason = "route status needs full context")]
+async fn build_route_statuses(
+    route: &HTTPRoute,
+    parent_refs: &[gateway_api::httproutes::HttpRouteParentRefs],
+    route_ns: &str,
+    gw_name: &str,
+    gw_ns: &str,
+    generation: i64,
+    client: &kube::Client,
+    grants: &[gateway_api::referencegrants::ReferenceGrant],
+) -> Vec<serde_json::Value> {
+    let mut statuses = Vec::new();
+    for parent_ref in parent_refs {
+        if !is_ref_targeting_gateway(parent_ref, gw_name, gw_ns, route_ns) {
+            continue;
+        }
+        let resolved = resolve_route_backends(route, route_ns, client, grants).await;
+        let accepted_cond = conditions::accepted(generation, "route accepted");
+        let resolved_cond = resolved_refs_condition(&resolved, generation);
+        statuses.push(route_parent_json(parent_ref, gw_ns, &accepted_cond, &resolved_cond));
+    }
+    statuses
+}
+
+/// Returns `true` when `parent_ref` targets the named Gateway.
+fn is_ref_targeting_gateway(
+    parent_ref: &gateway_api::httproutes::HttpRouteParentRefs,
+    gw_name: &str,
+    gw_ns: &str,
+    route_ns: &str,
+) -> bool {
+    let group = parent_ref.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+    let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
+    if group != "gateway.networking.k8s.io" || kind != "Gateway" {
+        return false;
+    }
+    let ref_ns = parent_ref.namespace.as_deref().unwrap_or(route_ns);
+    parent_ref.name == gw_name && ref_ns == gw_ns
+}
+
+/// Checks all backend refs in a route for validity.
+async fn resolve_route_backends(
+    route: &HTTPRoute,
+    route_ns: &str,
+    client: &kube::Client,
+    grants: &[gateway_api::referencegrants::ReferenceGrant],
+) -> std::result::Result<(), RouteResolveFailure> {
+    let Some(rules) = &route.spec.rules else { return Ok(()) };
+    for rule in rules {
+        let Some(backends) = &rule.backend_refs else { continue };
+        for backend in backends {
+            validate_route_backend(backend, route_ns, client, grants).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Reason a backend ref could not be resolved.
+enum RouteResolveFailure {
+    /// Unsupported group or kind.
+    InvalidKind,
+
+    /// Cross-namespace ref denied by `ReferenceGrant`.
+    RefNotPermitted,
+
+    /// Backend `Service` does not exist.
+    BackendNotFound,
+}
+
+/// Validates a single backend ref.
+async fn validate_route_backend(
+    backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs,
+    route_ns: &str,
+    client: &kube::Client,
+    grants: &[gateway_api::referencegrants::ReferenceGrant],
+) -> std::result::Result<(), RouteResolveFailure> {
+    let group = backend.group.as_deref().unwrap_or("");
+    let kind = backend.kind.as_deref().unwrap_or("Service");
+    if !group.is_empty() || kind != "Service" {
+        return Err(RouteResolveFailure::InvalidKind);
+    }
+
+    let backend_ns = backend.namespace.as_deref().unwrap_or(route_ns);
+    if backend_ns != route_ns
+        && !crate::gateway_api::reference_grant::is_reference_allowed(
+            route_ns,
+            "gateway.networking.k8s.io",
+            "HTTPRoute",
+            backend_ns,
+            "",
+            "Service",
+            Some(&backend.name),
+            grants,
+        )
+    {
+        return Err(RouteResolveFailure::RefNotPermitted);
+    }
+
+    let svc_api = Api::<Service>::namespaced(client.clone(), backend_ns);
+    if svc_api.get(&backend.name).await.is_ok() {
+        Ok(())
+    } else {
+        Err(RouteResolveFailure::BackendNotFound)
+    }
+}
+
+/// Builds the `ResolvedRefs` condition from a resolution result.
+fn resolved_refs_condition(
+    result: &std::result::Result<(), RouteResolveFailure>,
+    generation: i64,
+) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+    match result {
+        Ok(()) => conditions::resolved_refs(generation, "all backend refs resolved"),
+        Err(RouteResolveFailure::InvalidKind) => {
+            conditions::unresolved_refs(generation, "InvalidKind", "unsupported backend ref kind")
+        },
+        Err(RouteResolveFailure::RefNotPermitted) => conditions::unresolved_refs(
+            generation,
+            "RefNotPermitted",
+            "cross-namespace backend ref not permitted",
+        ),
+        Err(RouteResolveFailure::BackendNotFound) => {
+            conditions::unresolved_refs(generation, "BackendNotFound", "backend service not found")
+        },
+    }
+}
+
+/// Builds a route parent status JSON entry.
+fn route_parent_json(
+    parent_ref: &gateway_api::httproutes::HttpRouteParentRefs,
+    gw_ns: &str,
+    accepted: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
+    resolved: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
+) -> serde_json::Value {
+    let mut ref_json = json!({
+        "group": "gateway.networking.k8s.io",
+        "kind": "Gateway",
+        "name": parent_ref.name,
+        "namespace": gw_ns,
+    });
+    if let Some(section) = &parent_ref.section_name
+        && let Some(obj) = ref_json.as_object_mut()
+    {
+        obj.insert("sectionName".to_owned(), json!(section));
+    }
+    json!({
+        "parentRef": ref_json,
+        "controllerName": CONTROLLER_NAME,
+        "conditions": [accepted, resolved],
+    })
+}
+
+/// Patches an [`HTTPRoute`]'s status via server-side apply.
+async fn apply_route_status(
+    client: &kube::Client,
+    ns: &str,
+    name: &str,
+    parent_statuses: Vec<serde_json::Value>,
+) -> Result<()> {
+    let status = json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": { "name": name, "namespace": ns },
+        "status": { "parents": parent_statuses },
+    });
+    let route_api = Api::<HTTPRoute>::namespaced(client.clone(), ns);
+    route_api
+        .patch_status(
+            name,
+            &PatchParams::apply("praxis-operator").force(),
+            &kube::api::Patch::Apply(&status),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Components used to build the Gateway status JSON payload.
 struct GatewayStatusParts<'a> {
     /// Gateway name.
@@ -551,6 +809,9 @@ async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> V
 }
 
 /// Checks whether the child Deployment has at least one ready replica.
+///
+/// Used for the Gateway `Programmed` condition, which reflects whether
+/// the data plane can serve traffic at all (even with a stale config).
 async fn is_deployment_ready(client: &kube::Client, ns: &str, child: &str) -> bool {
     Api::<Deployment>::namespaced(client.clone(), ns)
         .get(child)
@@ -558,6 +819,54 @@ async fn is_deployment_ready(client: &kube::Client, ns: &str, child: &str) -> bo
         .ok()
         .and_then(|d| d.status)
         .is_some_and(|s| s.ready_replicas.unwrap_or(0) > 0)
+}
+
+/// Reads the current config hash from the Deployment's pod template.
+///
+/// Returns `None` if the Deployment doesn't exist or has no hash.
+pub(super) async fn current_deployment_hash(client: &kube::Client, ns: &str, child: &str) -> Option<String> {
+    Api::<Deployment>::namespaced(client.clone(), ns)
+        .get(child)
+        .await
+        .ok()
+        .and_then(|d| {
+            d.spec?
+                .template
+                .metadata?
+                .annotations?
+                .get("praxis.sh/config-hash")
+                .cloned()
+        })
+}
+
+/// Returns `true` when the Deployment's rollout is complete.
+///
+/// Uses the `Progressing` condition reason `NewReplicaSetAvailable`,
+/// which the deployment controller sets only after the new
+/// `ReplicaSet` has all desired pods ready. This is immune to
+/// stale-status races in back-to-back reconciliations.
+pub(super) async fn is_deployment_rolled_out(client: &kube::Client, ns: &str, child: &str) -> bool {
+    let Ok(d) = Api::<Deployment>::namespaced(client.clone(), ns).get(child).await else {
+        return false;
+    };
+    let generation = d.metadata.generation.unwrap_or(0);
+    let Some(status) = d.status.as_ref() else {
+        return false;
+    };
+    if status.observed_generation.unwrap_or(0) < generation {
+        return false;
+    }
+    is_new_rs_available(status)
+}
+
+/// Returns `true` when the `Progressing` condition has reason
+/// `NewReplicaSetAvailable`.
+fn is_new_rs_available(status: &k8s_openapi::api::apps::v1::DeploymentStatus) -> bool {
+    status
+        .conditions
+        .as_ref()
+        .and_then(|c| c.iter().find(|c| c.type_ == "Progressing"))
+        .is_some_and(|c| c.status == "True" && c.reason.as_deref() == Some("NewReplicaSetAvailable"))
 }
 
 /// Builds per-listener status entries.
