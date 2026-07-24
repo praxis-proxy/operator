@@ -10,17 +10,17 @@ publish = false
 integration = []
 
 [dependencies]
-chrono = "0.4.44"
-futures = "0.3.32"
+chrono = "0.4.45"
+futures = "0.3.33"
 gateway-api = { version = "0.21.0", features = ["experimental"] }
 k8s-openapi = { version = "0.27.1", features = ["v1_32"] }
 kube = { version = "3.1.0", features = ["client", "derive", "runtime", "rustls-tls"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 serde_yaml = "0.9.34"
 sha2 = "0.10.9"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
