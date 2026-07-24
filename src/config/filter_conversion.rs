@@ -388,6 +388,7 @@ fn inject_conditions(mut config: serde_yaml::Value, condition: &Option<serde_yam
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

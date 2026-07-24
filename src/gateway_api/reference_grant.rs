@@ -14,7 +14,7 @@ use gateway_api::referencegrants::ReferenceGrant;
 /// Returns `true` if the reference is within the same namespace or if a
 /// `ReferenceGrant` permits the reference. The grant must match the `from`
 /// (namespace, group, kind) and `to` (group, kind, optional name).
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "params map 1:1 to Gateway API fields"
@@ -75,6 +75,7 @@ pub(crate) fn is_reference_allowed(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

@@ -64,6 +64,7 @@ pub(crate) fn attached_routes<'a>(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

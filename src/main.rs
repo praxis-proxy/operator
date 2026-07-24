@@ -18,7 +18,7 @@ use std::{future::Future, sync::Arc};
 use ::gateway_api::{
     gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HTTPRoute, referencegrants::ReferenceGrant,
 };
-use futures::StreamExt;
+use futures::StreamExt as _;
 use k8s_openapi::api::{
     apps::v1::Deployment,
     core::v1::{ConfigMap, Service},

@@ -7,7 +7,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use gateway_api::{gateways::Gateway, httproutes::HTTPRoute, referencegrants::ReferenceGrant};
 use kube::{
-    Api, Resource, ResourceExt,
+    Api, Resource, ResourceExt as _,
     api::{Patch, PatchParams},
     runtime::{
         controller::Action,
@@ -21,7 +21,7 @@ use tracing::{debug, error, info};
 use super::gateway_helpers;
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
-    error::{Error, Result},
+    error::{OperatorError, Result},
     gateway_api::conditions,
 };
 
@@ -52,16 +52,16 @@ pub(crate) async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Act
         })
     })
     .await
-    .map_err(|e| Error::Finalizer(Box::new(e)))
+    .map_err(|e| OperatorError::Finalizer(Box::new(e)))
 }
 
 /// Error policy for Gateway reconciliation failures.
 ///
 /// Uses differentiated backoff: shorter for transient API errors,
 /// longer for configuration or logic errors.
-pub(crate) fn error_policy(_gw: Arc<Gateway>, error: &Error, _ctx: Arc<Context>) -> Action {
+pub(crate) fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     let delay = match error {
-        Error::Kube(_) | Error::Finalizer(_) => Duration::from_secs(15),
+        OperatorError::Kube(_) | OperatorError::Finalizer(_) => Duration::from_secs(15),
         _ => Duration::from_secs(30),
     };
     error!(
@@ -232,7 +232,7 @@ where
         .meta()
         .name
         .as_deref()
-        .ok_or(Error::MissingObjectKey(".metadata.name"))?;
+        .ok_or(OperatorError::MissingObjectKey(".metadata.name"))?;
     api.patch(
         name,
         &PatchParams::apply("praxis-operator").force(),
@@ -343,6 +343,7 @@ fn find_gateway_parent_ref(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

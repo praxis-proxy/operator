@@ -19,7 +19,7 @@ use k8s_openapi::api::{
     apps::v1::Deployment,
     core::v1::{Namespace, Service, ServicePort},
 };
-use kube::{Api, ResourceExt, api::PatchParams};
+use kube::{Api, ResourceExt as _, api::PatchParams};
 use serde_json::json;
 use tracing::{debug, info};
 
@@ -30,7 +30,7 @@ use crate::{
     },
     context::CONTROLLER_NAME,
     endpoints,
-    error::{Error, Result},
+    error::{OperatorError, Result},
     gateway_api::{attachment, conditions},
     resources::{configmap::build_configmap, deployment::build_deployment, labels::child_name, service::build_service},
 };
@@ -70,13 +70,13 @@ async fn fetch_gateway_class(
 }
 
 /// Maps a `GatewayClass` lookup error to an operator error.
-fn map_gc_error(e: kube::Error, gc_name: &str) -> Error {
+fn map_gc_error(e: kube::Error, gc_name: &str) -> OperatorError {
     if is_api_not_found(&e) {
         log_gc_not_found(gc_name);
-        return Error::GatewayClassNotFound(gc_name.to_owned());
+        return OperatorError::GatewayClassNotFound(gc_name.to_owned());
     }
     log_gc_lookup_failure(&e);
-    Error::Kube(e)
+    OperatorError::Kube(e)
 }
 
 /// Returns `true` when the error is a 404 API response.
@@ -463,11 +463,11 @@ fn build_service_ports(listener_ports: &[(String, i32)]) -> Vec<ServicePort> {
 
 /// Returns a hex-encoded SHA-256 digest of `data`.
 fn sha256_hex(data: &str) -> String {
-    use std::fmt::Write;
+    use std::fmt::Write as _;
     let digest = <sha2::Sha256 as sha2::Digest>::digest(data.as_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
+        _ = write!(hex, "{byte:02x}");
     }
     hex
 }
@@ -566,7 +566,7 @@ pub(super) async fn update_route_parent_statuses(
 }
 
 /// Builds parent status entries for refs targeting this Gateway.
-#[allow(clippy::too_many_arguments, reason = "route status needs full context")]
+#[expect(clippy::too_many_arguments, reason = "route status needs full context")]
 async fn build_route_statuses(
     route: &HTTPRoute,
     parent_refs: &[gateway_api::httproutes::HttpRouteParentRefs],
@@ -1405,6 +1405,7 @@ fn evaluate_match_expression(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

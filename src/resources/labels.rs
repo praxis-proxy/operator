@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::ResourceExt;
+use kube::ResourceExt as _;
 
 // -----------------------------------------------------------------------------
 // Labels and Naming
@@ -39,9 +39,9 @@ pub(crate) fn child_name(gateway_name: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`Error::MissingObjectKey`] when the Gateway has no UID.
+/// Returns [`OperatorError::MissingObjectKey`] when the Gateway has no UID.
 ///
-/// [`Error::MissingObjectKey`]: crate::error::Error::MissingObjectKey
+/// [`OperatorError::MissingObjectKey`]: crate::error::OperatorError::MissingObjectKey
 pub(crate) fn owner_reference(gateway: &gateway_api::gateways::Gateway) -> crate::error::Result<OwnerReference> {
     Ok(OwnerReference {
         api_version: "gateway.networking.k8s.io/v1".to_owned(),
@@ -51,7 +51,7 @@ pub(crate) fn owner_reference(gateway: &gateway_api::gateways::Gateway) -> crate
         name: gateway.name_any(),
         uid: gateway
             .uid()
-            .ok_or(crate::error::Error::MissingObjectKey(".metadata.uid"))?,
+            .ok_or(crate::error::OperatorError::MissingObjectKey(".metadata.uid"))?,
     })
 }
 
@@ -61,6 +61,7 @@ pub(crate) fn owner_reference(gateway: &gateway_api::gateways::Gateway) -> crate
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

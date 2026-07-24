@@ -8,7 +8,7 @@ use k8s_openapi::{
     api::core::v1::{Service, ServicePort, ServiceSpec},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
-use kube::ResourceExt;
+use kube::ResourceExt as _;
 
 use super::labels::{owner_reference, standard_labels};
 
@@ -55,6 +55,7 @@ pub(crate) fn build_service(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

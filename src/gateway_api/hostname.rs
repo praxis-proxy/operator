@@ -97,6 +97,7 @@ pub(crate) fn intersect_hostnames(route_hostnames: &[String], listener_hostnames
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

@@ -188,7 +188,7 @@ fn collect_listener_hosts(
 }
 
 /// Processes a single rule: creates routes and collects backend refs.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "rule processing needs access to shared accumulators"
 )]
@@ -472,6 +472,7 @@ fn is_regex_header(h: &gateway_api::httproutes::HttpRouteRulesMatchesHeaders) ->
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

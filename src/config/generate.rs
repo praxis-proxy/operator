@@ -271,6 +271,7 @@ fn build_lb_filter(clusters: &[PraxisCluster]) -> serde_yaml::Result<PraxisFilte
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

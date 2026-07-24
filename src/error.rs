@@ -7,9 +7,9 @@
 // Error
 // -----------------------------------------------------------------------------
 
-/// Errors produced during reconciliation.
+/// Errors produced during operator reconciliation.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
+pub(crate) enum OperatorError {
     /// Kubernetes API call failed.
     #[error("kubernetes api: {0}")]
     Kube(#[from] kube::Error),
@@ -20,7 +20,7 @@ pub(crate) enum Error {
 
     /// The `finalizer` helper returned an error.
     #[error("finalizer: {0}")]
-    Finalizer(#[source] Box<kube::runtime::finalizer::Error<Error>>),
+    Finalizer(#[source] Box<kube::runtime::finalizer::Error<OperatorError>>),
 
     /// The `Gateway` references a `GatewayClass` this controller does not manage.
     #[error("gatewayclass not found: {0}")]
@@ -28,7 +28,7 @@ pub(crate) enum Error {
 
     /// A referenced Kubernetes Secret was not found.
     #[error("secret not found: {namespace}/{name}")]
-    #[allow(dead_code, reason = "reserved for TLS secret resolution")]
+    #[expect(dead_code, reason = "reserved for TLS secret resolution")]
     SecretNotFound {
         /// Secret namespace.
         namespace: String,
@@ -38,7 +38,7 @@ pub(crate) enum Error {
 
     /// Generated Praxis config is invalid.
     #[error("config generation: {0}")]
-    #[allow(dead_code, reason = "reserved for config validation")]
+    #[expect(dead_code, reason = "reserved for config validation")]
     ConfigGeneration(String),
 
     /// Serialization failed.
@@ -51,4 +51,4 @@ pub(crate) enum Error {
 }
 
 /// Reconciliation result alias.
-pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = OperatorError> = std::result::Result<T, E>;

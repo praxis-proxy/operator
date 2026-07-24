@@ -66,7 +66,7 @@ pub(crate) fn no_conflicts(generation: i64) -> Condition {
 }
 
 /// Returns a `Conflicted: True` condition.
-#[allow(dead_code, reason = "available for all condition variants")]
+#[cfg_attr(not(test), expect(dead_code, reason = "available for all condition variants"))]
 pub(crate) fn conflicted(generation: i64, reason: &str, message: &str) -> Condition {
     make_condition("Conflicted", "True", reason, message, generation)
 }
@@ -77,6 +77,7 @@ pub(crate) fn conflicted(generation: i64, reason: &str, message: &str) -> Condit
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

@@ -18,7 +18,7 @@ use gateway_api::{
 };
 use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::Condition};
 use kube::{
-    Api, ResourceExt,
+    Api, ResourceExt as _,
     api::{Patch, PatchParams},
     runtime::controller::Action,
 };
@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     context::{CONTROLLER_NAME, Context},
-    error::{Error, Result},
+    error::{OperatorError, Result},
     gateway_api::{conditions, reference_grant},
 };
 
@@ -131,14 +131,10 @@ async fn build_rejection_status(
 
     match rejection {
         Some(not_accepted) => Some(parent_status_json(parent_ref, gw_ns, &not_accepted, &resolved)),
-        None => {
-            if resolve_result.is_err() {
-                let accepted = conditions::accepted(generation, "route accepted");
-                Some(parent_status_json(parent_ref, gw_ns, &accepted, &resolved))
-            } else {
-                None
-            }
-        },
+        None => resolve_result.is_err().then(|| {
+            let accepted = conditions::accepted(generation, "route accepted");
+            parent_status_json(parent_ref, gw_ns, &accepted, &resolved)
+        }),
     }
 }
 
@@ -538,7 +534,7 @@ async fn apply_route_status(
 /// Error policy for `HTTPRoute` reconciliation failures.
 ///
 /// Logs the error and requeues after 30 seconds.
-pub(crate) fn error_policy(_route: Arc<HTTPRoute>, error: &Error, _ctx: Arc<Context>) -> Action {
+pub(crate) fn error_policy(_route: Arc<HTTPRoute>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     error!(%error, "HTTPRoute reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }

@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 
 use gateway_api::gatewayclasses::GatewayClass;
 use kube::{
-    Api, ResourceExt,
+    Api, ResourceExt as _,
     api::{Patch, PatchParams},
     runtime::controller::Action,
 };
@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     context::{CONTROLLER_NAME, Context},
-    error::{Error, Result},
+    error::{OperatorError, Result},
     gateway_api::conditions,
 };
 
@@ -95,7 +95,7 @@ fn build_accepted_status(name: &str, generation: i64) -> serde_json::Value {
 /// Error policy for `GatewayClass` reconciliation failures.
 ///
 /// Logs the error and requeues after 30 seconds.
-pub(crate) fn error_policy(_gc: Arc<GatewayClass>, error: &Error, _ctx: Arc<Context>) -> Action {
+pub(crate) fn error_policy(_gc: Arc<GatewayClass>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     error!(%error, "GatewayClass reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }

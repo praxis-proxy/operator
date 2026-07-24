@@ -21,7 +21,7 @@ use k8s_openapi::{
         util::intstr::IntOrString,
     },
 };
-use kube::ResourceExt;
+use kube::ResourceExt as _;
 
 use super::labels::{owner_reference, standard_labels};
 use crate::context::{ADMIN_PORT, praxis_image};
@@ -351,6 +351,7 @@ fn build_deployment_object(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

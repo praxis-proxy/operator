@@ -52,7 +52,7 @@ pub(crate) enum PraxisEndpoint {
 ///
 /// Uses `~` as separator because it cannot appear in Kubernetes namespace
 /// or service names (DNS subdomain charset), preventing ambiguity.
-#[allow(dead_code, reason = "utility function used in tests and future integration")]
+#[cfg_attr(not(test), expect(dead_code, reason = "utility function used in tests"))]
 pub(crate) fn cluster_name(namespace: &str, service: &str, port: i32) -> String {
     format!("{namespace}~{service}~{port}")
 }
@@ -85,6 +85,7 @@ pub(crate) fn build_cluster(name: &str, endpoints: Vec<String>, weights: Option<
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

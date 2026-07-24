@@ -93,7 +93,7 @@ pub(crate) fn convert_listener(listener: &GatewayListeners, chain_name: &str) ->
     PraxisListener {
         name: listener.name.clone(),
         address,
-        protocol: if is_https { Some("http".to_owned()) } else { None },
+        protocol: is_https.then(|| "http".to_owned()),
         filter_chains: vec![chain_name.to_owned()],
         hostname: listener.hostname.clone(),
         merged_section_names: vec![listener.name.clone()],
@@ -147,6 +147,7 @@ fn build_certificate(
 
 #[cfg(test)]
 #[allow(
+    clippy::allow_attributes,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

@@ -116,7 +116,7 @@ where
 
 /// Converts a 404 API error to `Ok(None)`, propagating all other errors.
 fn not_found_to_none<T>(e: kube::Error, kind: &str, ns: &str, name: &str) -> Result<Option<T>> {
-    if let kube::Error::Api(ref resp) = e
+    if let kube::Error::Api(resp) = &e
         && resp.code == 404
     {
         debug!("{kind} {ns}/{name} not found");
