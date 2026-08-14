@@ -36,7 +36,7 @@ pub(crate) enum OperatorError {
 
     /// YAML serialization failed.
     #[error("yaml serialization: {0}")]
-    YamlSerialization(#[from] serde_yaml::Error),
+    YamlSerialization(#[from] yaml_serde::Error),
 }
 
 /// Reconciliation result alias.

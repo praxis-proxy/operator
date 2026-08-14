@@ -197,7 +197,7 @@ pub(super) async fn build_praxis_config(
     )?;
 
     Ok(PraxisConfigOutput {
-        config_yaml: serde_yaml::to_string(&config)?,
+        config_yaml: yaml_serde::to_string(&config)?,
         listener_ports: collect_listener_ports(&supported),
         tls_secret_names: collect_tls_secret_names(&supported),
     })

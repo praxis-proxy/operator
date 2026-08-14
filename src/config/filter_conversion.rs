@@ -139,7 +139,7 @@ fn convert_rule_filters(rule: &HttpRouteRules, filters: &mut Vec<PraxisFilterEnt
 /// Returns `true` if header config was modified.
 fn dispatch_filter(
     filter: &HttpRouteRulesFilters,
-    condition: &Option<serde_yaml::Value>,
+    condition: &Option<yaml_serde::Value>,
     header_config: &mut HeaderFilterConfig,
     filters: &mut Vec<PraxisFilterEntry>,
 ) -> bool {
@@ -171,10 +171,10 @@ fn dispatch_filter(
 /// sharing a listener and a path but differing only in hostname still
 /// share their filters. Narrowing that further needs host matching in
 /// the Praxis condition schema.
-fn extract_rule_condition(rule: &HttpRouteRules) -> Option<serde_yaml::Value> {
+fn extract_rule_condition(rule: &HttpRouteRules) -> Option<yaml_serde::Value> {
     let first = rule.matches.as_ref()?.first()?;
 
-    let mut predicate = serde_yaml::Mapping::new();
+    let mut predicate = yaml_serde::Mapping::new();
     insert_path_predicate(first, &mut predicate);
     insert_header_predicate(first, &mut predicate);
 
@@ -182,12 +182,12 @@ fn extract_rule_condition(rule: &HttpRouteRules) -> Option<serde_yaml::Value> {
         return None;
     }
 
-    let entry = serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String("when".to_owned()),
-        serde_yaml::Value::Mapping(predicate),
+    let entry = yaml_serde::Mapping::from_iter([(
+        yaml_serde::Value::String("when".to_owned()),
+        yaml_serde::Value::Mapping(predicate),
     )]);
 
-    Some(serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(entry)]))
+    Some(yaml_serde::Value::Sequence(vec![yaml_serde::Value::Mapping(entry)]))
 }
 
 /// Adds the path constraint to a filter predicate.
@@ -196,7 +196,7 @@ fn extract_rule_condition(rule: &HttpRouteRules) -> Option<serde_yaml::Value> {
 /// match uses `path_prefix`. Collapsing both onto `path_prefix`, as this
 /// did before, made a filter scoped to exactly `/foo` fire on `/foo/bar`
 /// as well.
-fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut serde_yaml::Mapping) {
+fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut yaml_serde::Mapping) {
     let Some(path) = m.path.as_ref() else { return };
     let Some(value) = path.value.as_deref() else { return };
 
@@ -207,8 +207,8 @@ fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut serde_yaml::
     };
 
     predicate.insert(
-        serde_yaml::Value::String(field.to_owned()),
-        serde_yaml::Value::String(value.to_owned()),
+        yaml_serde::Value::String(field.to_owned()),
+        yaml_serde::Value::String(value.to_owned()),
     );
 }
 
@@ -217,22 +217,22 @@ fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut serde_yaml::
 /// Narrows the filter to the traffic its own rule matches. Without it a
 /// header modifier written for one route also fires for any other route
 /// sharing its path on the same listener.
-fn insert_header_predicate(m: &HttpRouteRulesMatches, predicate: &mut serde_yaml::Mapping) {
+fn insert_header_predicate(m: &HttpRouteRulesMatches, predicate: &mut yaml_serde::Mapping) {
     let Some(headers) = m.headers.as_deref().filter(|h| !h.is_empty()) else {
         return;
     };
 
-    let mut mapping = serde_yaml::Mapping::new();
+    let mut mapping = yaml_serde::Mapping::new();
     for header in headers {
         mapping.insert(
-            serde_yaml::Value::String(header.name.clone()),
-            serde_yaml::Value::String(header.value.clone()),
+            yaml_serde::Value::String(header.name.clone()),
+            yaml_serde::Value::String(header.value.clone()),
         );
     }
 
     predicate.insert(
-        serde_yaml::Value::String("headers".to_owned()),
-        serde_yaml::Value::Mapping(mapping),
+        yaml_serde::Value::String("headers".to_owned()),
+        yaml_serde::Value::Mapping(mapping),
     );
 }
 
@@ -351,7 +351,7 @@ fn to_header_entries<'a>(pairs: impl Iterator<Item = (&'a String, &'a String)>) 
 /// fields (scheme, hostname, port) with `${path}${query}` placeholders.
 fn emit_conditional_redirect(
     redirect: &gateway_api::httproutes::HttpRouteRulesFiltersRequestRedirect,
-    condition: &Option<serde_yaml::Value>,
+    condition: &Option<yaml_serde::Value>,
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
     let location = build_redirect_location(redirect);
@@ -359,7 +359,7 @@ fn emit_conditional_redirect(
 
     let redirect_config = RedirectFilterConfig { status, location };
 
-    match serde_yaml::to_value(&redirect_config) {
+    match yaml_serde::to_value(&redirect_config) {
         Ok(config) => {
             let config = inject_conditions(config, condition);
             filters.push(PraxisFilterEntry {
@@ -390,10 +390,10 @@ fn build_redirect_location(redirect: &gateway_api::httproutes::HttpRouteRulesFil
 /// Emits a conditional header filter entry.
 fn emit_conditional_header_filter(
     config: &HeaderFilterConfig,
-    condition: &Option<serde_yaml::Value>,
+    condition: &Option<yaml_serde::Value>,
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
-    match serde_yaml::to_value(config) {
+    match yaml_serde::to_value(config) {
         Ok(config) => {
             let config = inject_conditions(config, condition);
             filters.push(PraxisFilterEntry {
@@ -408,16 +408,16 @@ fn emit_conditional_header_filter(
 /// Emits a `static_response` filter returning 500 for rules with no backends.
 fn emit_no_backend_response(rule: &HttpRouteRules, filters: &mut Vec<PraxisFilterEntry>) {
     let condition = extract_rule_condition(rule);
-    let mut config = serde_yaml::Mapping::new();
+    let mut config = yaml_serde::Mapping::new();
     config.insert(
-        serde_yaml::Value::String("status".to_owned()),
-        serde_yaml::Value::Number(500.into()),
+        yaml_serde::Value::String("status".to_owned()),
+        yaml_serde::Value::Number(500.into()),
     );
     config.insert(
-        serde_yaml::Value::String("body".to_owned()),
-        serde_yaml::Value::String("no backends available".to_owned()),
+        yaml_serde::Value::String("body".to_owned()),
+        yaml_serde::Value::String("no backends available".to_owned()),
     );
-    let config = inject_conditions(serde_yaml::Value::Mapping(config), &condition);
+    let config = inject_conditions(yaml_serde::Value::Mapping(config), &condition);
     filters.push(PraxisFilterEntry {
         filter: "static_response".to_owned(),
         config,
@@ -425,9 +425,9 @@ fn emit_no_backend_response(rule: &HttpRouteRules, filters: &mut Vec<PraxisFilte
 }
 
 /// Injects `conditions` into a filter config mapping.
-fn inject_conditions(mut config: serde_yaml::Value, condition: &Option<serde_yaml::Value>) -> serde_yaml::Value {
+fn inject_conditions(mut config: yaml_serde::Value, condition: &Option<yaml_serde::Value>) -> yaml_serde::Value {
     if let (Some(cond), Some(map)) = (condition, config.as_mapping_mut()) {
-        map.insert(serde_yaml::Value::String("conditions".to_owned()), cond.clone());
+        map.insert(yaml_serde::Value::String("conditions".to_owned()), cond.clone());
     }
     config
 }
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(filters.len(), 1, "should produce one header filter");
         assert_eq!(filters[0].filter, "headers", "filter name should be headers");
 
-        let config_str = serde_yaml::to_string(&filters[0].config).unwrap();
+        let config_str = yaml_serde::to_string(&filters[0].config).unwrap();
         assert!(
             config_str.contains("request_add"),
             "should have request_add for added headers"
@@ -540,7 +540,7 @@ mod tests {
         let filters = convert_filters(&rules);
 
         assert_eq!(filters.len(), 1, "should produce one header filter");
-        let config_str = serde_yaml::to_string(&filters[0].config).unwrap();
+        let config_str = yaml_serde::to_string(&filters[0].config).unwrap();
         assert!(config_str.contains("X-Response"), "should contain response header");
         assert!(
             config_str.contains("X-Remove-Response"),
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(filters.len(), 1, "should produce one redirect filter");
         assert_eq!(filters[0].filter, "redirect", "filter name should be redirect");
 
-        let config_str = serde_yaml::to_string(&filters[0].config).unwrap();
+        let config_str = yaml_serde::to_string(&filters[0].config).unwrap();
         assert!(config_str.contains("302"), "should contain status code");
         assert!(
             config_str.contains("https://example.com:443"),
@@ -687,7 +687,7 @@ mod tests {
 
         assert_eq!(filters.len(), 2, "should produce one filter per rule");
 
-        let first_yaml = serde_yaml::to_string(&filters[0].config).unwrap();
+        let first_yaml = yaml_serde::to_string(&filters[0].config).unwrap();
         assert!(
             first_yaml.contains("X-First"),
             "first filter should have X-First header"
@@ -701,7 +701,7 @@ mod tests {
             "first filter should be conditioned on /set"
         );
 
-        let second_yaml = serde_yaml::to_string(&filters[1].config).unwrap();
+        let second_yaml = yaml_serde::to_string(&filters[1].config).unwrap();
         assert!(
             second_yaml.contains("X-Second"),
             "second filter should have X-Second header"
@@ -724,7 +724,7 @@ mod tests {
 
         assert_eq!(
             when["path"],
-            serde_yaml::Value::String("/foo".to_owned()),
+            yaml_serde::Value::String("/foo".to_owned()),
             "an Exact match must scope on the Praxis path field"
         );
         assert!(
@@ -740,7 +740,7 @@ mod tests {
 
         assert_eq!(
             cond[0]["when"]["path_prefix"],
-            serde_yaml::Value::String("/api".to_owned()),
+            yaml_serde::Value::String("/api".to_owned()),
             "a PathPrefix match must scope on path_prefix"
         );
     }
@@ -762,7 +762,7 @@ mod tests {
 
         assert_eq!(
             cond[0]["when"]["headers"]["x-tenant"],
-            serde_yaml::Value::String("acme".to_owned()),
+            yaml_serde::Value::String("acme".to_owned()),
             "a rule's header match must scope its filters, or the filter fires for other routes \
              sharing the same path on this listener"
         );

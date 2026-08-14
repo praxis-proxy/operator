@@ -67,7 +67,7 @@ pub(crate) struct PraxisFilterEntry {
 
     /// Filter configuration (flattened into parent).
     #[serde(flatten)]
-    pub(crate) config: serde_yaml::Value,
+    pub(crate) config: yaml_serde::Value,
 }
 
 // -----------------------------------------------------------------------------
@@ -1363,7 +1363,7 @@ mod tests {
 
             let routes = vec![(&route, vec![None])];
             let (praxis_routes, _) = convert_routes(&routes, &listener_hostnames, &[]);
-            yamls.insert(serde_yaml::to_string(&praxis_routes).expect("serializes"));
+            yamls.insert(yaml_serde::to_string(&praxis_routes).expect("serializes"));
         }
 
         assert_eq!(

@@ -79,11 +79,11 @@ pub(crate) fn assemble_config(
     clusters: &[PraxisCluster],
     extra_filters: &[PraxisFilterEntry],
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
-) -> serde_yaml::Result<PraxisConfig> {
+) -> yaml_serde::Result<PraxisConfig> {
     let filter_chains: Vec<_> = listeners
         .iter()
         .map(|l| build_filter_chain(l, routes, clusters, extra_filters, listener_hostnames))
-        .collect::<serde_yaml::Result<Vec<_>>>()?;
+        .collect::<yaml_serde::Result<Vec<_>>>()?;
 
     Ok(PraxisConfig {
         admin: PraxisAdmin {
@@ -111,7 +111,7 @@ fn build_filter_chain(
     clusters: &[PraxisCluster],
     extra_filters: &[PraxisFilterEntry],
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
-) -> serde_yaml::Result<PraxisFilterChain> {
+) -> yaml_serde::Result<PraxisFilterChain> {
     let name = &listener.name;
 
     let section_names = &listener.merged_section_names;
@@ -131,7 +131,7 @@ fn build_filter_chain(
 
     let mut filters = vec![PraxisFilterEntry {
         filter: "request_id".to_owned(),
-        config: serde_yaml::Value::Null,
+        config: yaml_serde::Value::Null,
     }];
     filters.extend_from_slice(extra_filters);
     filters.push(build_router_filter(&scoped_refs)?);
@@ -249,10 +249,10 @@ fn extra_constraints(route: &PraxisRoute) -> usize {
 /// # Errors
 ///
 /// Returns an error if route serialization fails.
-fn build_router_filter(routes: &[&PraxisRoute]) -> serde_yaml::Result<PraxisFilterEntry> {
-    let config = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String("routes".to_owned()),
-        serde_yaml::to_value(routes)?,
+fn build_router_filter(routes: &[&PraxisRoute]) -> yaml_serde::Result<PraxisFilterEntry> {
+    let config = yaml_serde::to_value(yaml_serde::Mapping::from_iter([(
+        yaml_serde::Value::String("routes".to_owned()),
+        yaml_serde::to_value(routes)?,
     )]))?;
 
     Ok(PraxisFilterEntry {
@@ -268,10 +268,10 @@ fn build_router_filter(routes: &[&PraxisRoute]) -> serde_yaml::Result<PraxisFilt
 /// # Errors
 ///
 /// Returns an error if cluster serialization fails.
-fn build_lb_filter(clusters: &[PraxisCluster]) -> serde_yaml::Result<PraxisFilterEntry> {
-    let config = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String("clusters".to_owned()),
-        serde_yaml::to_value(clusters)?,
+fn build_lb_filter(clusters: &[PraxisCluster]) -> yaml_serde::Result<PraxisFilterEntry> {
+    let config = yaml_serde::to_value(yaml_serde::Mapping::from_iter([(
+        yaml_serde::Value::String("clusters".to_owned()),
+        yaml_serde::to_value(clusters)?,
     )]))?;
 
     Ok(PraxisFilterEntry {
@@ -380,7 +380,7 @@ mod tests {
 
         let config = assemble_config(vec![listener], &[route], &[cluster], &[], &Default::default()).unwrap();
 
-        let yaml = serde_yaml::to_string(&config).expect("config should serialize to YAML");
+        let yaml = yaml_serde::to_string(&config).expect("config should serialize to YAML");
 
         assert!(yaml.contains("admin:"), "YAML should contain admin section");
         assert!(yaml.contains("0.0.0.0:9901"), "YAML should contain admin address");
@@ -623,7 +623,7 @@ mod tests {
 
         let redirect = PraxisFilterEntry {
             filter: "redirect".to_owned(),
-            config: serde_yaml::Value::Null,
+            config: yaml_serde::Value::Null,
         };
 
         let config = assemble_config(vec![listener], &[], &[], &[redirect], &Default::default()).unwrap();
