@@ -397,4 +397,30 @@ mod tests {
             "a changed condition message must be written"
         );
     }
+    #[test]
+    fn test_an_observed_generation_bump_alone_is_still_written() {
+        let observed = json!({
+            "conditions": [{
+                "type": "Accepted", "status": "True", "reason": "Accepted", "message": "ok",
+                "observedGeneration": 1, "lastTransitionTime": "2026-08-09T00:00:00Z"
+            }]
+        });
+        let mut desired = json!({
+            "conditions": [{
+                "type": "Accepted", "status": "True", "reason": "Accepted", "message": "ok",
+                "observedGeneration": 2, "lastTransitionTime": "2026-08-09T01:00:00Z"
+            }]
+        });
+
+        preserve_condition_times(&mut desired, &observed);
+
+        assert!(
+            !is_status_unchanged(&desired, &observed),
+            "a spec change that only bumps observedGeneration must still be patched. \
+             preserve_condition_times deliberately rewinds lastTransitionTime here, since the \
+             condition did not flip, which leaves observedGeneration as the sole difference — \
+             if that were treated as unchanged the status would never catch up to the spec, and \
+             the GatewayObservedGenerationBump conformance case measures exactly that"
+        );
+    }
 }
