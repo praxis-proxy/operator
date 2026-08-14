@@ -277,4 +277,126 @@ mod tests {
             "an unknown operator must not match"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Route Filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_a_route_from_a_disallowed_namespace_is_dropped() {
+        let listeners = vec![same_namespace_listener()];
+        let route = route_in("apps");
+        let attached = vec![attached(&route)];
+        let stores = Stores::fake(vec![], vec![], vec![]);
+
+        assert!(
+            filter_routes_by_allowed_namespaces(&attached, &listeners, "infra", &stores).is_empty(),
+            "a Same-namespace listener must not serve a route from another namespace, and a route \
+             the filter lets through reaches the generated config"
+        );
+    }
+
+    #[test]
+    fn test_a_route_from_the_gateway_namespace_is_kept() {
+        let listeners = vec![same_namespace_listener()];
+        let route = route_in("infra");
+        let attached = vec![attached(&route)];
+        let stores = Stores::fake(vec![], vec![], vec![]);
+
+        assert_eq!(
+            filter_routes_by_allowed_namespaces(&attached, &listeners, "infra", &stores).len(),
+            1,
+            "Same is the default policy and it allows the Gateway's own namespace"
+        );
+    }
+
+    #[test]
+    fn test_one_permissive_listener_is_enough() {
+        let listeners = vec![same_namespace_listener(), all_namespaces_listener()];
+        let route = route_in("apps");
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+        let stores = Stores::fake(vec![], vec![], vec![]);
+
+        assert_eq!(
+            filter_routes_by_allowed_namespaces(&attached, &listeners, "infra", &stores).len(),
+            1,
+            "a parentRef naming no section targets every listener, so one that allows the route's \
+             namespace admits it even while another refuses"
+        );
+    }
+
+    #[test]
+    fn test_a_section_name_confines_the_check_to_that_listener() {
+        let listeners = vec![same_namespace_listener(), all_namespaces_listener()];
+        let route = route_in("apps");
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![Some("same".to_owned())],
+        }];
+        let stores = Stores::fake(vec![], vec![], vec![]);
+
+        assert!(
+            filter_routes_by_allowed_namespaces(&attached, &listeners, "infra", &stores).is_empty(),
+            "naming a listener means asking that listener, and the permissive one beside it does \
+             not answer for it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Builds a listener refusing every namespace but the Gateway's.
+    fn same_namespace_listener() -> GatewayListeners {
+        GatewayListeners {
+            name: "same".to_owned(),
+            port: 80,
+            protocol: "HTTP".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a listener admitting routes from anywhere.
+    fn all_namespaces_listener() -> GatewayListeners {
+        use gateway_api::gateways::{GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces};
+
+        GatewayListeners {
+            name: "all".to_owned(),
+            port: 80,
+            protocol: "HTTP".to_owned(),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                    from: Some(GatewayListenersAllowedRoutesNamespacesFrom::All),
+                    selector: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a route living in `namespace`.
+    fn route_in(namespace: &str) -> HTTPRoute {
+        HTTPRoute {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("route".to_owned()),
+                namespace: Some(namespace.to_owned()),
+                ..Default::default()
+            },
+            spec: gateway_api::httproutes::HttpRouteSpec::default(),
+            status: None,
+        }
+    }
+
+    /// Attaches a route to every listener, as a `parentRef` with no
+    /// `sectionName` does.
+    fn attached(route: &HTTPRoute) -> AttachedRoute<'_> {
+        AttachedRoute {
+            route,
+            section_names: vec![None],
+        }
+    }
 }
