@@ -60,7 +60,7 @@ clean:
 	cargo clean
 
 coverage-check:
-	cargo llvm-cov --fail-under-lines 80
+	cargo llvm-cov --fail-under-lines 95
 
 # ---------------------------------------------------------------------------
 # Test
