@@ -126,8 +126,11 @@ fn validation_conditions(validation: &route_validation::RouteValidation, generat
 
 #[cfg(test)]
 mod tests {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use serde_json::Value;
+
     use super::*;
-    use crate::{controller::fixtures::regex_route, gateway_api::route_validation};
+    use crate::{controller::fixtures::regex_route, gateway_api::route_validation, testing};
 
     #[test]
     fn test_validation_conditions_accepts_a_supported_route() {
@@ -166,5 +169,188 @@ mod tests {
             "dropped rules must be signalled with PartiallyInvalid"
         );
         assert_eq!(conds[1].status, "True", "PartiallyInvalid should be True");
+    }
+
+    // -----------------------------------------------------------------------
+    // Status Writing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_an_attached_route_is_reported_accepted() {
+        let (client, journal) = testing::fake_client(vec![route_response()]);
+        let route = attached_route();
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        update_route_parent_statuses(&client, &gateway(), &attached, &[])
+            .await
+            .expect("the patch is answered");
+
+        let parent = written_parent(&journal).expect("an attached route should get a status entry");
+        assert_eq!(
+            parent.pointer("/parentRef/name").and_then(Value::as_str),
+            Some("gw"),
+            "the entry has to name the parent it reports on, or it belongs to nobody"
+        );
+        assert_eq!(
+            parent.pointer("/conditions/0/status").and_then(Value::as_str),
+            Some("True"),
+            "the Gateway controller only calls this once the data plane has caught up"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_ref_naming_another_gateway_is_skipped() {
+        let (client, journal) = testing::fake_client(vec![route_response()]);
+        let mut route = attached_route();
+        route.spec.parent_refs = Some(vec![HttpRouteParentRefs {
+            name: "other-gw".to_owned(),
+            ..Default::default()
+        }]);
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        update_route_parent_statuses(&client, &gateway(), &attached, &[])
+            .await
+            .expect("skipping is not a failure");
+
+        assert!(
+            journal.matching("/status").is_empty(),
+            "this Gateway has no business reporting on a ref that names a different one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_route_with_no_parent_refs_is_skipped() {
+        let (client, journal) = testing::fake_client(vec![route_response()]);
+        let mut route = attached_route();
+        route.spec.parent_refs = None;
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        update_route_parent_statuses(&client, &gateway(), &attached, &[])
+            .await
+            .expect("skipping is not a failure");
+
+        assert!(
+            journal.matching("/status").is_empty(),
+            "there is no parent to report on"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_route_this_operator_cannot_express_is_reported_unaccepted() {
+        let (client, journal) = testing::fake_client(vec![route_response()]);
+        let mut route = attached_route();
+        route.spec.rules = regex_route(1).spec.rules;
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        update_route_parent_statuses(&client, &gateway(), &attached, &[])
+            .await
+            .expect("the patch is answered");
+
+        let parent = written_parent(&journal).expect("a rejected route still gets a status entry");
+        assert_eq!(
+            parent.pointer("/conditions/0/reason").and_then(Value::as_str),
+            Some("UnsupportedValue"),
+            "silently dropping a rule the operator cannot express would send traffic the author \
+             never asked for, so the refusal has to be on the route"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_patch_fails_the_update() {
+        let (client, _) = testing::failing_client();
+        let route = attached_route();
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        let error = update_route_parent_statuses(&client, &gateway(), &attached, &[])
+            .await
+            .expect_err("a 500 is not a written status");
+
+        assert!(
+            matches!(error, crate::error::OperatorError::Kube(_)),
+            "the Gateway reconcile has to retry, or the route stays unaccepted with nothing \
+             scheduled to fix it: {error}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Returns the first parent entry of the status that was written.
+    fn written_parent(journal: &testing::Journal) -> Option<Value> {
+        journal
+            .matching("/status")
+            .pop()?
+            .body?
+            .pointer("/status/parents/0")
+            .cloned()
+    }
+
+    /// Builds the Gateway the route attaches to.
+    fn gateway() -> Gateway {
+        use gateway_api::gateways::GatewaySpec;
+
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_owned()),
+                namespace: Some("apps".to_owned()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "praxis".to_owned(),
+                listeners: vec![],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Builds a route naming that Gateway as its parent.
+    fn attached_route() -> HTTPRoute {
+        use gateway_api::httproutes::HttpRouteSpec;
+
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_owned()),
+                namespace: Some("apps".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: Some(vec![HttpRouteParentRefs {
+                    name: "gw".to_owned(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// The object the API server hands back from a status apply.
+    fn route_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/httproutes/route",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "HTTPRoute",
+                "metadata": { "name": "route", "namespace": "apps" },
+                "spec": {},
+            }),
+        )
     }
 }
