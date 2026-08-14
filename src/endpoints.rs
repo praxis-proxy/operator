@@ -3,14 +3,53 @@
 
 //! Kubernetes Service endpoint resolution.
 
-use k8s_openapi::api::{
-    core::v1::{Endpoints, Service},
-    discovery::v1::EndpointSlice,
+use k8s_openapi::{
+    api::{
+        core::v1::{Endpoints, Service},
+        discovery::v1::EndpointSlice,
+    },
+    apimachinery::pkg::util::intstr::IntOrString,
 };
 use kube::{Api, Client, api::ListParams};
 use tracing::debug;
 
 use crate::error::Result;
+
+// -----------------------------------------------------------------------------
+// TargetPort
+// -----------------------------------------------------------------------------
+
+/// Criteria for selecting the endpoint port backing a `Service` port.
+///
+/// Endpoint ports are matched by name first, because that is the only
+/// way to resolve a named `targetPort`, then by number, then by
+/// position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetPort {
+    /// `ServicePort` name, matched against endpoint port names.
+    name: Option<String>,
+
+    /// Numeric `targetPort`, when the `Service` declares one.
+    number: Option<i32>,
+
+    /// Service port, used when nothing else resolves.
+    service_port: i32,
+}
+
+impl TargetPort {
+    /// Returns the port number to use when no endpoint port matches.
+    fn fallback(&self) -> i32 {
+        self.number.unwrap_or(self.service_port)
+    }
+
+    /// Returns `true` when an endpoint port name identifies this port.
+    fn matches_name(&self, candidate: Option<&str>) -> bool {
+        match (self.name.as_deref(), candidate) {
+            (Some(want), Some(got)) => want == got,
+            _ => false,
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Endpoint Resolution
@@ -29,9 +68,9 @@ pub(crate) async fn resolve_endpoints(
     let Some(svc) = get_or_none(client, namespace, service_name, "service").await? else {
         return Ok(Vec::new());
     };
-    let target_port = resolve_target_port(&svc, service_port);
+    let target = resolve_target_port(&svc, service_port);
 
-    match resolve_via_endpoint_slices(client, namespace, service_name, target_port).await {
+    match resolve_via_endpoint_slices(client, namespace, service_name, &target).await {
         Ok(eps) if !eps.is_empty() => return Ok(eps),
         Ok(_) => {},
         Err(e) => debug!("EndpointSlice lookup failed, falling back to Endpoints: {e}"),
@@ -41,7 +80,7 @@ pub(crate) async fn resolve_endpoints(
         return Ok(Vec::new());
     };
 
-    Ok(collect_endpoint_addresses(ep, target_port))
+    Ok(collect_endpoint_addresses(ep, &target))
 }
 
 /// Resolves endpoints via `EndpointSlice` resources.
@@ -49,7 +88,7 @@ async fn resolve_via_endpoint_slices(
     client: &Client,
     namespace: &str,
     service_name: &str,
-    target_port: i32,
+    target: &TargetPort,
 ) -> Result<Vec<String>> {
     let api = Api::<EndpointSlice>::namespaced(client.clone(), namespace);
     let label = format!("kubernetes.io/service-name={service_name}");
@@ -57,14 +96,14 @@ async fn resolve_via_endpoint_slices(
 
     let mut addrs = Vec::new();
     for slice in list.items {
-        collect_slice_addresses(&slice, target_port, &mut addrs);
+        collect_slice_addresses(&slice, target, &mut addrs);
     }
     Ok(addrs)
 }
 
 /// Collects ready addresses from a single `EndpointSlice`.
-fn collect_slice_addresses(slice: &EndpointSlice, target_port: i32, out: &mut Vec<String>) {
-    let port = resolve_slice_port(slice, target_port);
+fn collect_slice_addresses(slice: &EndpointSlice, target: &TargetPort, out: &mut Vec<String>) {
+    let port = resolve_slice_port(slice, target);
 
     for ep in &slice.endpoints {
         if !is_endpoint_ready(ep) {
@@ -97,19 +136,23 @@ fn is_endpoint_ready(ep: &k8s_openapi::api::discovery::v1::Endpoint) -> bool {
     }
 }
 
-/// Resolves the port from an `EndpointSlice`, falling back to `target_port`.
-fn resolve_slice_port(slice: &EndpointSlice, target_port: i32) -> i32 {
+/// Resolves the port from an `EndpointSlice`.
+///
+/// Prefers the port whose name matches the `ServicePort` name, then a
+/// numeric match, then the first declared port.
+fn resolve_slice_port(slice: &EndpointSlice, target: &TargetPort) -> i32 {
     slice
         .ports
         .as_ref()
         .and_then(|ports| {
             ports
                 .iter()
-                .find(|p| p.port == Some(target_port))
+                .find(|p| target.matches_name(p.name.as_deref()))
+                .or_else(|| target.number.and_then(|n| ports.iter().find(|p| p.port == Some(n))))
                 .or_else(|| ports.first())
         })
         .and_then(|p| p.port)
-        .unwrap_or(target_port)
+        .unwrap_or_else(|| target.fallback())
 }
 
 /// Fetches a namespaced resource, returning `None` on 404.
@@ -147,9 +190,9 @@ fn not_found_to_none<T>(e: kube::Error, kind: &str, ns: &str, name: &str) -> Res
 
 /// Collects `ip:port` addresses from an [`Endpoints`] resource.
 ///
-/// For each subset, resolves the matching port (or falls back to
-/// `target_port`) and pairs it with each ready address.
-fn collect_endpoint_addresses(ep: Endpoints, target_port: i32) -> Vec<String> {
+/// For each subset, resolves the port by name, then number, then
+/// position, and pairs it with each ready address.
+fn collect_endpoint_addresses(ep: Endpoints, target: &TargetPort) -> Vec<String> {
     ep.subsets
         .unwrap_or_default()
         .into_iter()
@@ -157,8 +200,14 @@ fn collect_endpoint_addresses(ep: Endpoints, target_port: i32) -> Vec<String> {
             let resolved_port = subset
                 .ports
                 .as_ref()
-                .and_then(|ports| ports.iter().find(|p| p.port == target_port).or_else(|| ports.first()))
-                .map_or(target_port, |p| p.port);
+                .and_then(|ports| {
+                    ports
+                        .iter()
+                        .find(|p| target.matches_name(p.name.as_deref()))
+                        .or_else(|| target.number.and_then(|n| ports.iter().find(|p| p.port == n)))
+                        .or_else(|| ports.first())
+                })
+                .map_or_else(|| target.fallback(), |p| p.port);
 
             subset
                 .addresses
@@ -173,22 +222,37 @@ fn collect_endpoint_addresses(ep: Endpoints, target_port: i32) -> Vec<String> {
         .collect()
 }
 
-/// Resolves a `Service` port number to its target port.
+/// Resolves a `Service` port into the criteria for picking an endpoint
+/// port.
 ///
-/// Finds the `ServicePort` matching `service_port` and returns its
-/// `targetPort` (falling back to the service port if unset).
-fn resolve_target_port(svc: &Service, service_port: i32) -> i32 {
-    svc.spec
+/// A `targetPort` given as a name cannot be resolved from the `Service`
+/// alone; it is resolved later against the endpoint port names, which
+/// Kubernetes derives from `Service.ports[].name`.
+fn resolve_target_port(svc: &Service, service_port: i32) -> TargetPort {
+    let matching = svc
+        .spec
         .as_ref()
         .and_then(|spec| spec.ports.as_ref())
-        .and_then(|ports| ports.iter().find(|p| p.port == service_port))
-        .and_then(|sp| {
-            sp.target_port.as_ref().map(|tp| match tp {
-                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(n) => *n,
-                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(_) => service_port,
-            })
-        })
-        .unwrap_or(service_port)
+        .and_then(|ports| ports.iter().find(|p| p.port == service_port));
+
+    let Some(sp) = matching else {
+        return TargetPort {
+            name: None,
+            number: None,
+            service_port,
+        };
+    };
+
+    let number = match sp.target_port.as_ref() {
+        Some(IntOrString::Int(n)) => Some(*n),
+        Some(IntOrString::String(_)) | None => None,
+    };
+
+    TargetPort {
+        name: sp.name.clone().filter(|n| !n.is_empty()),
+        number,
+        service_port,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -226,9 +290,9 @@ mod tests {
         let svc = service(&[(80, Some(IntOrString::Int(8080)))]);
 
         assert_eq!(
-            resolve_target_port(&svc, 80),
-            8080,
-            "a numeric targetPort should be used verbatim"
+            resolve_target_port(&svc, 80).number,
+            Some(8080),
+            "a numeric targetPort should be carried through"
         );
     }
 
@@ -237,20 +301,23 @@ mod tests {
         let svc = service(&[(80, None)]);
 
         assert_eq!(
-            resolve_target_port(&svc, 80),
+            resolve_target_port(&svc, 80).fallback(),
             80,
             "an unset targetPort defaults to the service port"
         );
     }
 
     #[test]
-    fn test_resolve_target_port_named_target_falls_back() {
-        let svc = service(&[(80, Some(IntOrString::String("http".to_owned())))]);
+    fn test_resolve_target_port_named_target_defers_to_the_port_name() {
+        let mut svc = service(&[(80, Some(IntOrString::String("http".to_owned())))]);
+        set_port_name(&mut svc, 80, "web");
+        let target = resolve_target_port(&svc, 80);
 
+        assert_eq!(target.number, None, "a named targetPort has no number to match on");
         assert_eq!(
-            resolve_target_port(&svc, 80),
-            80,
-            "a named targetPort cannot be resolved here and falls back to the service port"
+            target.name,
+            Some("web".to_owned()),
+            "the ServicePort name is what endpoint ports are keyed by"
         );
     }
 
@@ -259,8 +326,8 @@ mod tests {
         let svc = service(&[(80, Some(IntOrString::Int(8080))), (443, Some(IntOrString::Int(8443)))]);
 
         assert_eq!(
-            resolve_target_port(&svc, 443),
-            8443,
+            resolve_target_port(&svc, 443).number,
+            Some(8443),
             "the ServicePort matching the requested port should win"
         );
     }
@@ -270,7 +337,7 @@ mod tests {
         let svc = service(&[(80, Some(IntOrString::Int(8080)))]);
 
         assert_eq!(
-            resolve_target_port(&svc, 9000),
+            resolve_target_port(&svc, 9000).fallback(),
             9000,
             "an unmatched service port falls back to itself"
         );
@@ -281,9 +348,37 @@ mod tests {
         let svc = Service::default();
 
         assert_eq!(
-            resolve_target_port(&svc, 80),
+            resolve_target_port(&svc, 80).fallback(),
             80,
             "a Service without a spec falls back to the requested port"
+        );
+    }
+
+    #[test]
+    fn test_resolve_slice_port_prefers_the_named_port() {
+        let mut svc = service(&[(80, Some(IntOrString::String("http".to_owned()))), (443, None)]);
+        set_port_name(&mut svc, 80, "web");
+        let target = resolve_target_port(&svc, 80);
+        let slice = named_endpoint_slice(&[(Some("admin"), 9901), (Some("web"), 8080)]);
+
+        assert_eq!(
+            resolve_slice_port(&slice, &target),
+            8080,
+            "a named targetPort must resolve through the matching endpoint port name, not position"
+        );
+    }
+
+    #[test]
+    fn test_resolve_slice_port_name_beats_number() {
+        let mut svc = service(&[(80, Some(IntOrString::Int(9999)))]);
+        set_port_name(&mut svc, 80, "web");
+        let target = resolve_target_port(&svc, 80);
+        let slice = named_endpoint_slice(&[(Some("other"), 9999), (Some("web"), 8080)]);
+
+        assert_eq!(
+            resolve_slice_port(&slice, &target),
+            8080,
+            "the port name is more specific than a numeric match"
         );
     }
 
@@ -340,7 +435,7 @@ mod tests {
         let slice = endpoint_slice(&[8080, 9090], &[]);
 
         assert_eq!(
-            resolve_slice_port(&slice, 9090),
+            resolve_slice_port(&slice, &numeric_target(9090)),
             9090,
             "the slice port equal to the target port should be chosen"
         );
@@ -351,7 +446,7 @@ mod tests {
         let slice = endpoint_slice(&[8080, 9090], &[]);
 
         assert_eq!(
-            resolve_slice_port(&slice, 1234),
+            resolve_slice_port(&slice, &numeric_target(1234)),
             8080,
             "an unmatched target port falls back to the first slice port"
         );
@@ -363,7 +458,7 @@ mod tests {
         slice.ports = None;
 
         assert_eq!(
-            resolve_slice_port(&slice, 8080),
+            resolve_slice_port(&slice, &numeric_target(8080)),
             8080,
             "a slice without ports falls back to the target port"
         );
@@ -374,7 +469,7 @@ mod tests {
         let slice = endpoint_slice(&[8080], &[("10.0.0.1", Some(true)), ("10.0.0.2", Some(false))]);
         let mut out = Vec::new();
 
-        collect_slice_addresses(&slice, 8080, &mut out);
+        collect_slice_addresses(&slice, &numeric_target(8080), &mut out);
 
         assert_eq!(
             out,
@@ -388,7 +483,7 @@ mod tests {
         let ep = endpoints_resource(&[8080, 9090], &["10.0.0.1", "10.0.0.2"]);
 
         assert_eq!(
-            collect_endpoint_addresses(ep, 9090),
+            collect_endpoint_addresses(ep, &numeric_target(9090)),
             vec!["10.0.0.1:9090".to_owned(), "10.0.0.2:9090".to_owned()],
             "every address should be paired with the matching subset port"
         );
@@ -399,7 +494,7 @@ mod tests {
         let ep = endpoints_resource(&[8080, 9090], &["10.0.0.1"]);
 
         assert_eq!(
-            collect_endpoint_addresses(ep, 1234),
+            collect_endpoint_addresses(ep, &numeric_target(1234)),
             vec!["10.0.0.1:8080".to_owned()],
             "an unmatched target port falls back to the first subset port"
         );
@@ -408,7 +503,7 @@ mod tests {
     #[test]
     fn test_collect_endpoint_addresses_without_subsets() {
         assert!(
-            collect_endpoint_addresses(Endpoints::default(), 80).is_empty(),
+            collect_endpoint_addresses(Endpoints::default(), &numeric_target(80)).is_empty(),
             "an Endpoints resource with no subsets yields no addresses"
         );
     }
@@ -433,6 +528,48 @@ mod tests {
     // -----------------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------------
+
+    /// Builds a [`TargetPort`] that matches purely on a port number.
+    fn numeric_target(port: i32) -> TargetPort {
+        TargetPort {
+            name: None,
+            number: Some(port),
+            service_port: port,
+        }
+    }
+
+    /// Sets the `name` of the `ServicePort` with the given port number.
+    fn set_port_name(svc: &mut Service, port: i32, name: &str) {
+        let ports = svc
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.ports.as_mut())
+            .expect("service should declare ports");
+        let sp = ports
+            .iter_mut()
+            .find(|p| p.port == port)
+            .expect("service should declare the requested port");
+        sp.name = Some(name.to_owned());
+    }
+
+    /// Builds an `EndpointSlice` with explicitly named ports.
+    fn named_endpoint_slice(ports: &[(Option<&str>, i32)]) -> EndpointSlice {
+        EndpointSlice {
+            address_type: "IPv4".to_owned(),
+            endpoints: Vec::new(),
+            metadata: Default::default(),
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|(name, port)| k8s_openapi::api::discovery::v1::EndpointPort {
+                        name: name.map(str::to_owned),
+                        port: Some(*port),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        }
+    }
 
     /// Builds a Service exposing the given `(port, target_port)` pairs.
     fn service(ports: &[(i32, Option<IntOrString>)]) -> Service {
