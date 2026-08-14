@@ -647,7 +647,7 @@ mod tests {
         let router = &config.filter_chains[0].filters[1];
         assert_eq!(
             router.config.get("multi_level_subdomain_matching"),
-            Some(&serde_norway::Value::Bool(true)),
+            Some(&yaml_serde::Value::Bool(true)),
             "Praxis defaults this off, which would 404 foo.bar.example.com on a *.example.com \
              listener — traffic the Gateway API says the wildcard covers"
         );

@@ -269,6 +269,25 @@ fn process_rule(
     );
 }
 
+/// Returns `true` when a rule has at least one backend the gateway may
+/// forward to.
+///
+/// A rule whose every `backendRef` was refused is not the same as a
+/// rule that named none: it still has to answer, with the 500 the
+/// Gateway API prescribes for an unresolvable reference, so the caller
+/// needs to tell the two apart.
+pub fn rule_has_authorized_backend(
+    rule: &gateway_api::httproutes::HttpRouteRules,
+    route_ns: &str,
+    grants: &[ReferenceGrant],
+) -> bool {
+    rule.backend_refs
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|b| is_backend_authorized(b, route_ns, grants))
+}
+
 /// Returns `true` if authorized; logs and returns `false` otherwise.
 fn check_backend_authorized(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
     if is_backend_authorized(backend, route_ns, grants) {

@@ -23,10 +23,10 @@ use tracing::debug;
 use crate::{
     config::{
         cluster::{PraxisCluster, build_cluster},
-        filter_conversion::{RouteFilters, convert_filters},
+        filter_conversion::{RouteFilters, ServedRule, convert_filters},
         generate::assemble_config,
         listener::{PraxisCertificate, PraxisListener, PraxisTls, convert_listener},
-        routing::{BackendRef, PraxisRoute, convert_routes},
+        routing::{BackendRef, PraxisRoute, convert_routes, rule_has_authorized_backend},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},
     },
     endpoints,
@@ -82,7 +82,7 @@ pub(super) async fn build_praxis_config(
     let listener_hostnames = build_listener_hostname_map(&supported);
     let praxis_listeners = merge_listeners_by_port(&supported);
     let (praxis_routes, backend_refs) = convert_attached_routes(attached, &listener_hostnames, grants);
-    let route_filters = collect_filters(attached);
+    let route_filters = collect_filters(attached, grants);
     let clusters = resolve_clusters(client, &backend_refs).await?;
     let config = assemble_config(
         praxis_listeners,
@@ -175,11 +175,27 @@ fn convert_attached_routes(
 }
 
 /// Extracts and converts filters from all attached route rules.
-fn collect_filters(attached: &[AttachedRoute<'_>]) -> RouteFilters {
+///
+/// Each rule is paired with whether any of its backends survived the
+/// reference checks, which is what decides between a rule the router
+/// will serve and one that has to answer 500 on its own.
+fn collect_filters(attached: &[AttachedRoute<'_>], grants: &[ReferenceGrant]) -> RouteFilters {
     let all_rules: Vec<_> = attached
         .iter()
-        .flat_map(|attached| attached.route.spec.rules.as_deref().unwrap_or(&[]))
-        .cloned()
+        .flat_map(|attached| {
+            let namespace = attached.route.namespace().unwrap_or_default();
+            attached
+                .route
+                .spec
+                .rules
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(move |rule| ServedRule {
+                    rule,
+                    resolvable: rule_has_authorized_backend(rule, &namespace, grants),
+                })
+        })
         .collect();
     convert_filters(&all_rules)
 }

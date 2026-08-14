@@ -127,6 +127,27 @@ pub struct RouteFilters {
 }
 
 // -----------------------------------------------------------------------------
+// ServedRule
+// -----------------------------------------------------------------------------
+
+/// A rule paired with whether the gateway can forward its traffic.
+#[derive(Debug, Clone, Copy)]
+pub struct ServedRule<'a> {
+    /// The rule contributing filters.
+    pub rule: &'a HttpRouteRules,
+
+    /// Whether any `backendRef` on the rule survived reference checks.
+    ///
+    /// A rule whose every backend was refused — a cross-namespace
+    /// reference with no `ReferenceGrant` covering it — produces no
+    /// route, and the router answers a request for it with 404. The
+    /// Gateway API prescribes 500 for an unresolvable reference, so
+    /// such a rule gets the same static response as one that named no
+    /// backend at all.
+    pub resolvable: bool,
+}
+
+// -----------------------------------------------------------------------------
 // Filter Conversion
 // -----------------------------------------------------------------------------
 
@@ -136,18 +157,16 @@ pub struct RouteFilters {
 /// filters (`conditions`) derived from the rule's path match. This ensures
 /// header modifications and redirects apply only to traffic matching the
 /// originating rule.
-pub fn convert_filters(rules: &[HttpRouteRules]) -> RouteFilters {
+pub fn convert_filters(rules: &[ServedRule<'_>]) -> RouteFilters {
     let scoped = scope_rules(rules);
     let mut filters = RouteFilters::default();
-    for (index, rule) in rules.iter().enumerate() {
+    for (index, served) in rules.iter().enumerate() {
         let condition = rule_conditions(index, &scoped);
-        let has_backends = rule.backend_refs.as_ref().is_some_and(|refs| !refs.is_empty());
-        let has_redirect = rule_has_redirect(rule);
-        if !has_backends && !has_redirect {
+        if !served.resolvable && !rule_has_redirect(served.rule) {
             emit_no_backend_response(&condition, &mut filters.terminating);
         }
-        if rule.filters.is_some() {
-            convert_rule_filters(rule, &condition, &mut filters);
+        if served.rule.filters.is_some() {
+            convert_rule_filters(served.rule, &condition, &mut filters);
         }
     }
     filters
@@ -301,8 +320,8 @@ struct ScopedRule {
 }
 
 /// Describes every rule by the traffic it claims and its rank.
-fn scope_rules(rules: &[HttpRouteRules]) -> Vec<ScopedRule> {
-    rules.iter().map(scope_rule).collect()
+fn scope_rules(rules: &[ServedRule<'_>]) -> Vec<ScopedRule> {
+    rules.iter().map(|served| scope_rule(served.rule)).collect()
 }
 
 /// Describes one rule by the traffic it claims and its rank.
@@ -846,7 +865,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
 
         let transforming = &filters.transforming;
         assert_eq!(transforming.len(), 1, "should produce one header filter");
@@ -898,7 +917,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
 
         assert_eq!(filters.transforming.len(), 1, "should produce one header filter");
         let config_str = yaml_serde::to_string(&filters.transforming[0].config).unwrap();
@@ -929,7 +948,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
 
         let terminating = &filters.terminating;
         assert_eq!(terminating.len(), 1, "should produce one redirect filter");
@@ -982,7 +1001,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
 
         assert!(
             filters.terminating.iter().any(|f| f.filter == "redirect"),
@@ -1048,7 +1067,7 @@ mod tests {
             },
         ];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
 
         let transforming = &filters.transforming;
         assert_eq!(transforming.len(), 2, "should produce one filter per rule");
@@ -1075,6 +1094,44 @@ mod tests {
         assert!(
             second_yaml.contains("/add"),
             "second filter should be conditioned on /add"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unresolvable Backends
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_a_rule_whose_backends_were_all_refused_answers_500() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/v2");
+        rule.backend_refs = Some(dummy_backend_refs());
+        let rules = [ServedRule {
+            rule: &rule,
+            resolvable: false,
+        }];
+
+        let filters = convert_filters(&rules);
+
+        assert_eq!(
+            filters.terminating.first().map(|f| f.filter.as_str()),
+            Some("static_response"),
+            "a backendRef refused for want of a ReferenceGrant leaves no route, and the router \
+             would answer 404 where the Gateway API prescribes 500"
+        );
+    }
+
+    #[test]
+    fn test_a_rule_with_a_resolved_backend_adds_no_static_response() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/v2");
+        rule.backend_refs = Some(dummy_backend_refs());
+        let rules = [ServedRule {
+            rule: &rule,
+            resolvable: true,
+        }];
+
+        assert!(
+            convert_filters(&rules).terminating.is_empty(),
+            "the router serves this rule, so nothing may answer ahead of it"
         );
     }
 
@@ -1179,7 +1236,7 @@ mod tests {
             },
         )];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
         let yaml = yaml_serde::to_string(&filters.transforming[0].config).unwrap();
 
         assert_eq!(
@@ -1211,7 +1268,7 @@ mod tests {
             ),
         ];
 
-        let filters = convert_filters(&rules);
+        let filters = convert_filters(&served(&rules));
 
         assert_eq!(filters.transforming.len(), 2, "each rule rewrites its own traffic");
         for entry in &filters.transforming {
@@ -1321,7 +1378,7 @@ mod tests {
             rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/one"),
             HttpRouteRules::default(),
         ];
-        let scoped = scope_rules(&rules);
+        let scoped = scope_rules(&served(&rules));
 
         let cond = rule_conditions(1, &scoped).expect("a catch-all rule beside a narrower one must be scoped");
 
@@ -1343,7 +1400,7 @@ mod tests {
             rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/one"),
             rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/one/two"),
         ];
-        let scoped = scope_rules(&rules);
+        let scoped = scope_rules(&served(&rules));
 
         let cond = rule_conditions(1, &scoped).expect("a rule with a path match is always scoped");
 
@@ -1360,7 +1417,7 @@ mod tests {
             rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/one/two/three"),
             rule_with_path(HttpRouteRulesMatchesPathType::Exact, "/one"),
         ];
-        let scoped = scope_rules(&rules);
+        let scoped = scope_rules(&served(&rules));
 
         let cond = rule_conditions(0, &scoped).expect("a rule with a path match is always scoped");
 
@@ -1378,7 +1435,7 @@ mod tests {
             rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/one"),
             rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/one"),
         ];
-        let scoped = scope_rules(&rules);
+        let scoped = scope_rules(&served(&rules));
 
         let cond = rule_conditions(0, &scoped).expect("a catch-all rule beside narrower ones must be scoped");
 
@@ -1421,10 +1478,22 @@ mod tests {
         rule
     }
 
+    /// Pairs rules with whether their backends resolved, as the
+    /// controller does before converting them.
+    fn served(rules: &[HttpRouteRules]) -> Vec<ServedRule<'_>> {
+        rules
+            .iter()
+            .map(|rule| ServedRule {
+                rule,
+                resolvable: rule.backend_refs.as_ref().is_some_and(|refs| !refs.is_empty()),
+            })
+            .collect()
+    }
+
     /// Scopes a rule that has no siblings to be scoped against.
     fn lone_rule_condition(rule: &HttpRouteRules) -> Option<yaml_serde::Value> {
         let rules = [rule.clone()];
-        rule_conditions(0, &scope_rules(&rules))
+        rule_conditions(0, &scope_rules(&served(&rules)))
     }
 
     /// Builds a rule with a single path match of the given type.
