@@ -32,6 +32,22 @@ spec:
           env:
             - name: PRAXIS_IMAGE
               value: "__PRAXIS_IMAGE__"
+          ports:
+            - name: observability
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: observability
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: observability
+            periodSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m

@@ -12,6 +12,7 @@ mod endpoints;
 mod error;
 mod gateway_api;
 mod listing;
+mod observability;
 mod resources;
 
 use std::{future::Future, sync::Arc};
@@ -55,14 +56,20 @@ async fn main() -> error::Result<()> {
     let client = Client::try_default().await?;
     info!("connected to cluster, controller={}", context::CONTROLLER_NAME);
 
+    let health = Arc::new(observability::server::Health::default());
     let ctx = Arc::new(context::Context { client: client.clone() });
 
+    let observability = observability::server::serve(Arc::clone(&health));
     let gc = build_gc_controller(&client, Arc::clone(&ctx));
     let gw = build_gw_controller(&client, Arc::clone(&ctx));
     let rt = build_route_controller(&client, ctx);
 
     info!("starting controllers");
-    tokio::join!(gc, gw, rt);
+    health.mark_ready();
+    tokio::select! {
+        () = async { tokio::join!(gc, gw, rt); } => {},
+        () = observability => {},
+    }
 
     Ok(())
 }
@@ -95,10 +102,16 @@ fn build_gc_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
             controller::gateway_class::error_policy,
             ctx,
         )
-        .for_each(|res| async {
+        .for_each(|res| async move {
             match res {
-                Ok((obj, _action)) => info!("reconciled GatewayClass {obj}"),
-                Err(e) => tracing::warn!("GatewayClass reconcile error: {e:?}"),
+                Ok((obj, _action)) => {
+                    observability::metrics::global().record_reconcile(observability::metrics::Controller::GatewayClass);
+                    info!("reconciled GatewayClass {obj}");
+                },
+                Err(e) => {
+                    observability::metrics::global().record_error(observability::metrics::Controller::GatewayClass);
+                    tracing::warn!("GatewayClass reconcile error: {e:?}");
+                },
             }
         })
 }
@@ -129,10 +142,16 @@ fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
         )
         .shutdown_on_signal()
         .run(controller::gateway::reconcile, controller::gateway::error_policy, ctx)
-        .for_each(|res| async {
+        .for_each(|res| async move {
             match res {
-                Ok((obj, _action)) => info!("reconciled Gateway {obj}"),
-                Err(e) => tracing::warn!("Gateway reconcile error: {e:?}"),
+                Ok((obj, _action)) => {
+                    observability::metrics::global().record_reconcile(observability::metrics::Controller::Gateway);
+                    info!("reconciled Gateway {obj}");
+                },
+                Err(e) => {
+                    observability::metrics::global().record_error(observability::metrics::Controller::Gateway);
+                    tracing::warn!("Gateway reconcile error: {e:?}");
+                },
             }
         })
 }
@@ -153,10 +172,16 @@ fn build_route_controller(client: &Client, ctx: Arc<context::Context>) -> impl F
             controller::httproute::error_policy,
             ctx,
         )
-        .for_each(|res| async {
+        .for_each(|res| async move {
             match res {
-                Ok((obj, _action)) => info!("reconciled HTTPRoute {obj}"),
-                Err(e) => tracing::warn!("HTTPRoute reconcile error: {e:?}"),
+                Ok((obj, _action)) => {
+                    observability::metrics::global().record_reconcile(observability::metrics::Controller::HttpRoute);
+                    info!("reconciled HTTPRoute {obj}");
+                },
+                Err(e) => {
+                    observability::metrics::global().record_error(observability::metrics::Controller::HttpRoute);
+                    tracing::warn!("HTTPRoute reconcile error: {e:?}");
+                },
             }
         })
 }
