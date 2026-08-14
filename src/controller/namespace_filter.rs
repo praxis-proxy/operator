@@ -18,12 +18,10 @@ use gateway_api::{
     httproutes::HTTPRoute,
 };
 use k8s_openapi::api::core::v1::Namespace;
-use kube::Api;
-use tracing::warn;
 
 use crate::{
     gateway_api::{attachment::AttachedRoute, route_status},
-    listing,
+    stores::Stores,
 };
 
 // -----------------------------------------------------------------------------
@@ -35,13 +33,13 @@ use crate::{
 ///
 /// A route is retained if at least one listener it targets allows its
 /// namespace. The default policy (when unspecified) is `Same`.
-pub(super) async fn filter_routes_by_allowed_namespaces<'a>(
+pub(super) fn filter_routes_by_allowed_namespaces<'a>(
     attached: &[AttachedRoute<'a>],
     listeners: &[GatewayListeners],
     gateway_ns: &str,
-    client: &kube::Client,
+    stores: &Stores,
 ) -> Vec<AttachedRoute<'a>> {
-    let all_namespaces = fetch_all_namespaces(client).await;
+    let all_namespaces = Some(stores.namespaces());
 
     attached
         .iter()
@@ -56,17 +54,6 @@ pub(super) async fn filter_routes_by_allowed_namespaces<'a>(
         })
         .cloned()
         .collect()
-}
-
-/// Fetches all namespaces from the cluster, returning `None` on error.
-async fn fetch_all_namespaces(client: &kube::Client) -> Option<Vec<Namespace>> {
-    match listing::list_all(&Api::<Namespace>::all(client.clone())).await {
-        Ok(namespaces) => Some(namespaces),
-        Err(e) => {
-            warn!(%e, "failed to list namespaces for route filtering");
-            None
-        },
-    }
 }
 
 /// Checks whether a route is allowed by at least one targeted listener.
@@ -92,7 +79,7 @@ fn route_allowed_by_any_listener(
 /// Checks whether a route namespace is allowed by a listener's policy.
 ///
 /// Defaults to `Same` when `allowedRoutes` is unspecified.
-fn is_namespace_allowed(
+pub(super) fn is_namespace_allowed(
     listener: &GatewayListeners,
     route_ns: &str,
     gateway_ns: &str,

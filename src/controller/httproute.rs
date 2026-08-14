@@ -14,12 +14,11 @@ use gateway_api::{
     gatewayclasses::GatewayClass,
     gateways::{Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesSelector},
     httproutes::{HTTPRoute, HttpRouteParentRefs},
-    referencegrants::ReferenceGrant,
 };
 use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::Condition};
 use kube::{Api, ResourceExt as _, runtime::controller::Action};
 use serde_json::Value;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
     context::{CONTROLLER_NAME, Context},
@@ -119,7 +118,7 @@ async fn build_rejection_status(
     }
 
     let rejection = validate_listener_attachment(route, &gw, parent_ref, generation, &ctx.client).await;
-    let grants = list_reference_grants(ctx).await;
+    let grants = ctx.stores.grants();
     let resolve_result = route_status::check_backend_refs(route, route_ns, &ctx.client, &grants).await;
     let resolved = route_status::resolved_refs_condition(&resolve_result, generation);
 
@@ -152,18 +151,6 @@ async fn lookup_parent_gateway(gw_name: &str, gw_ns: &str, route_ns: &str, ctx: 
     }
     debug!("Gateway {gw_ns}/{gw_name} not found for HTTPRoute in {route_ns}");
     None
-}
-
-/// Lists all [`ReferenceGrant`] resources in the cluster.
-async fn list_reference_grants(ctx: &Context) -> Vec<ReferenceGrant> {
-    let grant_api = Api::<ReferenceGrant>::all(ctx.client.clone());
-    match crate::listing::list_all(&grant_api).await {
-        Ok(grants) => grants,
-        Err(e) => {
-            warn!(%e, "failed to list ReferenceGrants");
-            Vec::new()
-        },
-    }
 }
 
 // -----------------------------------------------------------------------------

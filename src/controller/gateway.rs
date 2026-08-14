@@ -24,7 +24,6 @@ use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
     gateway_api::{attachment::AttachedRoute, conditions, protocol::ListenerProtocol, route_status},
-    listing,
 };
 
 // -----------------------------------------------------------------------------
@@ -61,7 +60,7 @@ pub async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Action> {
             match event {
                 FinalizerEvent::Apply(gw) => Box::pin(apply(gw, &ctx)).await,
                 FinalizerEvent::Cleanup(gw) => {
-                    cleanup(&gw, &ctx.client).await;
+                    cleanup(&gw, &ctx).await;
                     Ok(Action::await_change())
                 },
             }
@@ -102,13 +101,13 @@ async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
         return Ok(Action::await_change());
     }
 
-    let routes = list_all_routes(&ctx.client).await?;
-    let attached = ownership::collect_routes(&ctx.client, &gw, &routes).await;
+    let routes = ctx.stores.routes();
+    let attached = ownership::collect_routes(&gw, &routes, &ctx.stores);
     let ns = gw.namespace().unwrap_or_default();
-    let grants = list_all_grants(&ctx.client).await?;
+    let grants = ctx.stores.grants();
     let config_changed = apply_config_if_supported(&ctx.client, &gw, &attached, &ns, &grants).await?;
 
-    gateway_status::build_and_apply_gateway_status(&ctx.client, &gw, &gw.spec.listeners, &attached).await?;
+    gateway_status::build_and_apply_gateway_status(ctx, &gw, &gw.spec.listeners, &attached).await?;
 
     let can_accept = can_accept_routes(&ctx.client, &gw, &ns, config_changed).await;
     if can_accept {
@@ -163,16 +162,6 @@ async fn can_accept_routes(client: &kube::Client, gw: &Gateway, ns: &str, config
     let can_accept = !config_changed && rolled_out;
     debug!(gateway = %gw.name_any(), can_accept, "route acceptance decision");
     can_accept
-}
-
-/// Lists all `HTTPRoute` resources across all namespaces.
-async fn list_all_routes(client: &kube::Client) -> Result<Vec<HTTPRoute>> {
-    listing::list_all(&Api::<HTTPRoute>::all(client.clone())).await
-}
-
-/// Lists all `ReferenceGrant` resources across all namespaces.
-async fn list_all_grants(client: &kube::Client) -> Result<Vec<ReferenceGrant>> {
-    listing::list_all(&Api::<ReferenceGrant>::all(client.clone())).await
 }
 
 /// Rejects a Gateway whose spec this operator cannot honour.
@@ -249,7 +238,7 @@ fn has_requested_addresses(gw: &Gateway) -> bool {
 // -----------------------------------------------------------------------------
 
 /// Cleanup path: owner references handle child deletion automatically.
-async fn cleanup(gw: &Gateway, client: &kube::Client) {
+async fn cleanup(gw: &Gateway, ctx: &Context) {
     let name = gw.name_any();
     let ns = gw.namespace().unwrap_or_else(|| {
         tracing::warn!(gateway = %name, "Gateway has no namespace during cleanup");
@@ -257,7 +246,7 @@ async fn cleanup(gw: &Gateway, client: &kube::Client) {
     });
     info!("cleaning up Gateway {ns}/{name} (owner refs handle child deletion)");
 
-    clear_route_parent_statuses(client, &name, &ns).await;
+    clear_route_parent_statuses(ctx, &name, &ns).await;
 }
 
 /// Removes this Gateway's entries from every route that referenced it.
@@ -269,16 +258,10 @@ async fn cleanup(gw: &Gateway, client: &kube::Client) {
 /// Failures are logged rather than propagated: a Gateway must always be
 /// able to finish deleting, and a route left with a stale entry is a
 /// smaller problem than a finalizer that never releases.
-async fn clear_route_parent_statuses(client: &kube::Client, gw_name: &str, gw_ns: &str) {
-    let routes = match list_all_routes(client).await {
-        Ok(routes) => routes,
-        Err(e) => {
-            tracing::warn!(%e, "could not list routes to clear parent status for {gw_ns}/{gw_name}");
-            return;
-        },
-    };
+async fn clear_route_parent_statuses(ctx: &Context, gw_name: &str, gw_ns: &str) {
+    let client = &ctx.client;
 
-    for route in &routes {
+    for route in &ctx.stores.routes() {
         if let Err(e) = route_status::clear_parent_statuses(client, route, gw_name, gw_ns).await {
             tracing::warn!(%e, route = route.name_any(), "could not clear parent status");
         }

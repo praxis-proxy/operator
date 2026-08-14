@@ -8,6 +8,8 @@
 //! Gateway own. Both are cheap checks that short-circuit the expensive
 //! path, so they run first and live together.
 
+use std::sync::Arc;
+
 use gateway_api::{gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HTTPRoute};
 use kube::{Api, ResourceExt as _};
 use tracing::debug;
@@ -17,6 +19,7 @@ use crate::{
     context::CONTROLLER_NAME,
     error::{OperatorError, Result},
     gateway_api::attachment::{self, AttachedRoute},
+    stores::Stores,
 };
 
 // -----------------------------------------------------------------------------
@@ -72,16 +75,16 @@ fn is_api_not_found(e: &kube::Error) -> bool {
 
 /// Collects `HTTPRoute` resources attached to the Gateway, filtered by
 /// namespace policies.
-pub(super) async fn collect_routes<'a>(
-    client: &kube::Client,
+pub(super) fn collect_routes<'a>(
     gw: &Gateway,
-    all_routes: &'a [HTTPRoute],
+    all_routes: &'a [Arc<HTTPRoute>],
+    stores: &Stores,
 ) -> Vec<AttachedRoute<'a>> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
     let attached = attachment::attached_routes(&name, &ns, all_routes);
-    namespace_filter::filter_routes_by_allowed_namespaces(&attached, &gw.spec.listeners, &ns, client).await
+    namespace_filter::filter_routes_by_allowed_namespaces(&attached, &gw.spec.listeners, &ns, stores)
 }
 
 // -----------------------------------------------------------------------------

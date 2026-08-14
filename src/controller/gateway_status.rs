@@ -22,7 +22,7 @@ use tracing::{debug, info};
 
 use super::listener_validation;
 use crate::{
-    context::FIELD_MANAGER,
+    context::{Context, FIELD_MANAGER},
     error::Result,
     gateway_api::{
         attachment::AttachedRoute, conditions, hostname, listener_conflict, protocol::ListenerProtocol, status,
@@ -40,11 +40,12 @@ use crate::{
 /// Gates the `Programmed` condition on both Deployment readiness and
 /// load-balancer address availability, per the Gateway API spec.
 pub(super) async fn build_and_apply_gateway_status(
-    client: &kube::Client,
+    ctx: &Context,
     gw: &Gateway,
     listeners: &[GatewayListeners],
     attached: &[AttachedRoute<'_>],
 ) -> Result<()> {
+    let client = &ctx.client;
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     let generation = gw.metadata.generation.unwrap_or(1);
@@ -53,7 +54,7 @@ pub(super) async fn build_and_apply_gateway_status(
     let addresses = resolve_lb_addresses(client, &ns, &child).await;
     let deployment_ready = is_deployment_ready(client, &ns, &child).await;
     let (listener_statuses, any_accepted, any_rejected) =
-        build_listener_statuses(listeners, generation, &ns, client, attached).await;
+        build_listener_statuses(listeners, generation, &ns, ctx, attached).await;
 
     let data_plane_ready = deployment_ready && !addresses.is_empty();
     let status = gateway_status_json(&GatewayStatusParts {
@@ -169,7 +170,7 @@ async fn build_listener_statuses(
     listeners: &[GatewayListeners],
     generation: i64,
     gateway_ns: &str,
-    client: &kube::Client,
+    ctx: &Context,
     attached: &[AttachedRoute<'_>],
 ) -> (Vec<Value>, bool, bool) {
     let conflicts = listener_conflict::detect_conflicts(listeners);
@@ -193,7 +194,7 @@ async fn build_listener_statuses(
 
         any_accepted = true;
         let count = count_attached_routes(attached, l);
-        let status = accepted_listener_status(l, generation, gateway_ns, client, count).await;
+        let status = accepted_listener_status(l, generation, gateway_ns, ctx, count).await;
         statuses.push(status);
     }
 
@@ -266,11 +267,11 @@ async fn accepted_listener_status(
     l: &GatewayListeners,
     generation: i64,
     gateway_ns: &str,
-    client: &kube::Client,
+    ctx: &Context,
     count: usize,
 ) -> Value {
     let (supported_kinds, resolved_refs_condition) =
-        listener_validation::listener_resolved_refs(l, generation, gateway_ns, client).await;
+        listener_validation::listener_resolved_refs(l, generation, gateway_ns, ctx).await;
 
     let refs_resolved = resolved_refs_condition.status == "True";
     let programmed_condition = if refs_resolved {

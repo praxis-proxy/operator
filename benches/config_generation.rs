@@ -21,11 +21,11 @@
     reason = "criterion_group and criterion_main generate undocumented items"
 )]
 
-use std::{collections::HashMap, hint::black_box};
+use std::{collections::HashMap, hint::black_box, sync::Arc};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use fixtures::{GATEWAY_NAME, GATEWAY_NAMESPACE, listener_manifests, route_manifests};
-use gateway_api::gateways::GatewayListeners;
+use gateway_api::{gateways::GatewayListeners, httproutes::HTTPRoute};
 use praxis_operator::{
     config::{
         cluster::{PraxisCluster, build_cluster},
@@ -98,7 +98,7 @@ criterion_main!(benches);
 
 /// Runs the synchronous half of `build_praxis_config` and returns the
 /// serialized length, which keeps the optimizer from eliding the work.
-fn generate_config(listeners: &[GatewayListeners], routes: &[gateway_api::httproutes::HTTPRoute]) -> usize {
+fn generate_config(listeners: &[GatewayListeners], routes: &[Arc<HTTPRoute>]) -> usize {
     let attached = attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, routes);
     let listener_hostnames: HashMap<String, Option<String>> =
         listeners.iter().map(|l| (l.name.clone(), l.hostname.clone())).collect();
@@ -137,6 +137,8 @@ fn synthesize_clusters(backend_refs: &[BackendRef]) -> Vec<PraxisCluster> {
 
 /// Gateway API manifests the benchmark converts.
 mod fixtures {
+    use std::sync::Arc;
+
     use gateway_api::{
         gateways::GatewayListeners,
         httproutes::{
@@ -166,8 +168,8 @@ mod fixtures {
     }
 
     /// Builds `count` routes, each with one match and one backend.
-    pub(super) fn route_manifests(count: usize) -> Vec<HTTPRoute> {
-        (0..count).map(build_route).collect()
+    pub(super) fn route_manifests(count: usize) -> Vec<Arc<HTTPRoute>> {
+        (0..count).map(|index| Arc::new(build_route(index))).collect()
     }
 
     /// Builds one route with a distinct path, hostname, and backend.
