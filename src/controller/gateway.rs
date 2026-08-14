@@ -23,7 +23,7 @@ use super::gateway_helpers;
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
-    gateway_api::{conditions, protocol::ListenerProtocol, route_status},
+    gateway_api::{attachment::AttachedRoute, conditions, protocol::ListenerProtocol, route_status},
     listing,
 };
 
@@ -119,7 +119,7 @@ async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
 async fn apply_config_if_supported(
     client: &kube::Client,
     gw: &Gateway,
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'_>],
     ns: &str,
     grants: &[ReferenceGrant],
 ) -> Result<bool> {

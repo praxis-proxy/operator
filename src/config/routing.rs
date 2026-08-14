@@ -13,7 +13,8 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::gateway_api::{
-    hostname::intersect_hostnames, reference_grant::is_reference_allowed, route_validation::validate_route,
+    attachment::AttachedRoute, hostname::intersect_hostnames, reference_grant::is_reference_allowed,
+    route_validation::validate_route,
 };
 
 // -----------------------------------------------------------------------------
@@ -113,7 +114,7 @@ pub(crate) struct BackendRef {
 ///
 /// [`intersect_hostnames`]: crate::gateway_api::hostname::intersect_hostnames
 pub(crate) fn convert_routes(
-    routes: &[(&HTTPRoute, Vec<Option<String>>)],
+    routes: &[AttachedRoute<'_>],
     listener_hostnames: &HashMap<String, Option<String>>,
     grants: &[ReferenceGrant],
 ) -> (Vec<PraxisRoute>, Vec<BackendRef>) {
@@ -121,7 +122,8 @@ pub(crate) fn convert_routes(
     let mut seen_clusters = HashSet::new();
     let mut backend_refs = Vec::new();
 
-    for (route, section_names) in routes {
+    for attached in routes {
+        let (route, section_names) = (attached.route, &attached.section_names);
         let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
         let raw_hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]);
         let effective = effective_hostnames(raw_hostnames, section_names, listener_hostnames);
@@ -560,7 +562,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
@@ -627,7 +632,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
@@ -688,7 +696,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
@@ -737,7 +748,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
@@ -779,7 +793,10 @@ mod tests {
         };
 
         let grant = make_reference_grant("other-ns", "app-ns", "svc");
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[grant]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
@@ -841,7 +858,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
@@ -893,7 +913,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
@@ -916,7 +939,10 @@ mod tests {
         }]);
         let route = route_with_rules(vec![rule]);
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert!(
@@ -939,7 +965,10 @@ mod tests {
         }]);
         let route = route_with_rules(vec![rule]);
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert!(
@@ -977,7 +1006,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert!(
@@ -1037,7 +1069,10 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
@@ -1085,7 +1120,10 @@ mod tests {
         let mut listener_map = HashMap::new();
         listener_map.insert("listener-1".to_owned(), Some("very.specific.com".to_owned()));
 
-        let routes = vec![(&route, vec![Some("listener-1".to_owned())])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![Some("listener-1".to_owned())],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         let hosts: Vec<_> = praxis_routes.iter().filter_map(|r| r.host.as_deref()).collect();
@@ -1136,7 +1174,10 @@ mod tests {
         let mut listener_map = HashMap::new();
         listener_map.insert("listener-2".to_owned(), Some("*.wildcard.io".to_owned()));
 
-        let routes = vec![(&route, vec![Some("listener-2".to_owned())])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![Some("listener-2".to_owned())],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         let hosts: Vec<_> = praxis_routes.iter().filter_map(|r| r.host.as_deref()).collect();
@@ -1179,7 +1220,10 @@ mod tests {
         let mut listener_map = HashMap::new();
         listener_map.insert("listener-1".to_owned(), Some("specific.com".to_owned()));
 
-        let routes = vec![(&route, vec![Some("listener-1".to_owned())])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![Some("listener-1".to_owned())],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one catch-all route");
@@ -1222,7 +1266,10 @@ mod tests {
         let mut listener_map = HashMap::new();
         listener_map.insert("listener-1".to_owned(), Some("very.specific.com".to_owned()));
 
-        let routes = vec![(&route, vec![Some("listener-1".to_owned())])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![Some("listener-1".to_owned())],
+        }];
         let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         assert!(
@@ -1277,7 +1324,10 @@ mod tests {
             ..Default::default()
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert!(
@@ -1321,7 +1371,10 @@ mod tests {
             ..Default::default()
         };
 
-        let routes = vec![(&route, vec![None])];
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
@@ -1361,7 +1414,10 @@ mod tests {
                 status: None,
             };
 
-            let routes = vec![(&route, vec![None])];
+            let routes = vec![AttachedRoute {
+                route: &route,
+                section_names: vec![None],
+            }];
             let (praxis_routes, _) = convert_routes(&routes, &listener_hostnames, &[]);
             yamls.insert(yaml_serde::to_string(&praxis_routes).expect("serializes"));
         }

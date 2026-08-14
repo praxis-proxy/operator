@@ -6,6 +6,36 @@
 use gateway_api::httproutes::{HTTPRoute, HttpRouteParentRefs};
 
 // -----------------------------------------------------------------------------
+// AttachedRoute
+// -----------------------------------------------------------------------------
+
+/// A route bound to a Gateway, with the listeners it targets.
+///
+/// A route may name the same Gateway more than once, so `section_names`
+/// carries one entry per matching `parentRef`. A `None` entry means that
+/// ref named no `sectionName` and therefore targets every listener.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AttachedRoute<'a> {
+    /// The route itself.
+    pub(crate) route: &'a HTTPRoute,
+
+    /// Listener section names this route targets.
+    pub(crate) section_names: Vec<Option<String>>,
+}
+
+impl AttachedRoute<'_> {
+    /// Returns whether the route targets the named listener.
+    ///
+    /// A ref without a `sectionName` targets every listener, so it
+    /// matches whatever name is asked about.
+    pub(crate) fn targets_listener(&self, listener: &str) -> bool {
+        self.section_names
+            .iter()
+            .any(|section| section.as_deref().is_none_or(|name| name == listener))
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Route Attachment
 // -----------------------------------------------------------------------------
 
@@ -35,7 +65,7 @@ pub(crate) fn attached_routes<'a>(
     gateway_name: &str,
     gateway_ns: &str,
     routes: &'a [HTTPRoute],
-) -> Vec<(&'a HTTPRoute, Vec<Option<String>>)> {
+) -> Vec<AttachedRoute<'a>> {
     let mut result = Vec::new();
 
     for route in routes {
@@ -50,7 +80,7 @@ pub(crate) fn attached_routes<'a>(
             }
 
             if !section_names.is_empty() {
-                result.push((route, section_names));
+                result.push(AttachedRoute { route, section_names });
             }
         }
     }
@@ -186,12 +216,12 @@ mod tests {
 
         assert_eq!(attached.len(), 1, "one route should be attached");
         assert_eq!(
-            attached[0].0.metadata.name.as_deref(),
+            attached[0].route.metadata.name.as_deref(),
             Some("test-route"),
             "should match route name"
         );
-        assert_eq!(attached[0].1.len(), 1, "should have one section name entry");
-        assert_eq!(attached[0].1[0], None, "section name should be None");
+        assert_eq!(attached[0].section_names.len(), 1, "should have one section name entry");
+        assert_eq!(attached[0].section_names[0], None, "section name should be None");
     }
 
     #[test]
@@ -219,7 +249,11 @@ mod tests {
         let attached = attached_routes("test-gateway", "default", &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
-        assert_eq!(attached[0].1[0], Some("https".to_owned()), "section name should match");
+        assert_eq!(
+            attached[0].section_names[0],
+            Some("https".to_owned()),
+            "section name should match"
+        );
     }
 
     #[test]
@@ -258,14 +292,18 @@ mod tests {
         let attached = attached_routes("test-gateway", "default", &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
-        assert_eq!(attached[0].1.len(), 2, "should have two section name entries");
         assert_eq!(
-            attached[0].1[0],
+            attached[0].section_names.len(),
+            2,
+            "should have two section name entries"
+        );
+        assert_eq!(
+            attached[0].section_names[0],
             Some("http".to_owned()),
             "first section should be http"
         );
         assert_eq!(
-            attached[0].1[1],
+            attached[0].section_names[1],
             Some("https".to_owned()),
             "second section should be https"
         );
