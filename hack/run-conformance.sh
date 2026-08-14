@@ -34,9 +34,12 @@ trap "rm -f ${KUBECONFIG_FILE}" EXIT
 
 if [ ! -d "${GWAPI_DIR}" ]; then
     echo "==> Cloning gateway-api ${GWAPI_CONFORMANCE_TAG}..."
-    git clone --depth 1 --branch "${GWAPI_CONFORMANCE_TAG}" \
-        https://github.com/kubernetes-sigs/gateway-api.git \
-        "${GWAPI_DIR}"
+    # Retried, and the directory is removed first: a clone that dies partway
+    # leaves one behind, and the next attempt would fail on it rather than on
+    # whatever went wrong.
+    "${SCRIPT_DIR}/retry.sh" bash -c \
+        "rm -rf '${GWAPI_DIR}' && git clone --depth 1 --branch '${GWAPI_CONFORMANCE_TAG}' \
+            https://github.com/kubernetes-sigs/gateway-api.git '${GWAPI_DIR}'"
 else
     echo "==> Using cached gateway-api at ${GWAPI_DIR}"
 fi
