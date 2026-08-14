@@ -15,12 +15,12 @@ use gateway_api::httproutes::{HTTPRoute, HttpRouteParentRefs};
 /// carries one entry per matching `parentRef`. A `None` entry means that
 /// ref named no `sectionName` and therefore targets every listener.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AttachedRoute<'a> {
+pub struct AttachedRoute<'a> {
     /// The route itself.
-    pub(crate) route: &'a HTTPRoute,
+    pub route: &'a HTTPRoute,
 
     /// Listener section names this route targets.
-    pub(crate) section_names: Vec<Option<String>>,
+    pub section_names: Vec<Option<String>>,
 }
 
 impl AttachedRoute<'_> {
@@ -28,7 +28,7 @@ impl AttachedRoute<'_> {
     ///
     /// A ref without a `sectionName` targets every listener, so it
     /// matches whatever name is asked about.
-    pub(crate) fn targets_listener(&self, listener: &str) -> bool {
+    pub fn targets_listener(&self, listener: &str) -> bool {
         self.section_names
             .iter()
             .any(|section| section.as_deref().is_none_or(|name| name == listener))
@@ -44,7 +44,7 @@ impl AttachedRoute<'_> {
 /// The Gateway API spec defines defaults for `group` (`gateway.networking.k8s.io`),
 /// `kind` (`Gateway`), and `namespace` (route's namespace). All fields must match
 /// the target gateway to be considered attached.
-pub(crate) fn parent_ref_matches_gateway(
+pub fn parent_ref_matches_gateway(
     parent: &HttpRouteParentRefs,
     gateway_name: &str,
     gateway_ns: &str,
@@ -61,11 +61,7 @@ pub(crate) fn parent_ref_matches_gateway(
 ///
 /// Each tuple contains a route and a vector of section names (one per matching
 /// parentRef). A `None` section name means the route attaches to all listeners.
-pub(crate) fn attached_routes<'a>(
-    gateway_name: &str,
-    gateway_ns: &str,
-    routes: &'a [HTTPRoute],
-) -> Vec<AttachedRoute<'a>> {
+pub fn attached_routes<'a>(gateway_name: &str, gateway_ns: &str, routes: &'a [HTTPRoute]) -> Vec<AttachedRoute<'a>> {
     let mut result = Vec::new();
 
     for route in routes {

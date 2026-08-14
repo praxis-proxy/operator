@@ -22,42 +22,42 @@ use super::{
 /// Clusters are embedded inside the `load_balancer` filter config in each
 /// filter chain, matching the Praxis `deny_unknown_fields` schema.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisConfig {
+pub struct PraxisConfig {
     /// Admin endpoint configuration.
-    pub(crate) admin: PraxisAdmin,
+    pub admin: PraxisAdmin,
 
     /// Filter chains with routing and processing filters.
-    pub(crate) filter_chains: Vec<PraxisFilterChain>,
+    pub filter_chains: Vec<PraxisFilterChain>,
 
     /// Insecure options for container deployments.
-    pub(crate) insecure_options: PraxisInsecureOptions,
+    pub insecure_options: PraxisInsecureOptions,
 
     /// Listeners (proxy entry points).
-    pub(crate) listeners: Vec<PraxisListener>,
+    pub listeners: Vec<PraxisListener>,
 }
 
 /// Admin endpoint configuration.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisAdmin {
+pub struct PraxisAdmin {
     /// Admin bind address.
-    pub(crate) address: String,
+    pub address: String,
 }
 
 /// Named filter chain.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisFilterChain {
+pub struct PraxisFilterChain {
     /// Filter chain name.
-    pub(crate) name: String,
+    pub name: String,
 
     /// Ordered filters in the chain.
-    pub(crate) filters: Vec<PraxisFilterEntry>,
+    pub filters: Vec<PraxisFilterEntry>,
 }
 
 /// Insecure options (for container deployments).
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisInsecureOptions {
+pub struct PraxisInsecureOptions {
     /// Allow admin endpoint on public interface.
-    pub(crate) allow_public_admin: bool,
+    pub allow_public_admin: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -73,7 +73,7 @@ pub(crate) struct PraxisInsecureOptions {
 /// # Errors
 ///
 /// Returns an error if filter config serialization fails.
-pub(crate) fn assemble_config(
+pub fn assemble_config(
     listeners: Vec<PraxisListener>,
     routes: &[PraxisRoute],
     clusters: &[PraxisCluster],

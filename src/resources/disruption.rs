@@ -31,7 +31,7 @@ use super::labels::{owner_reference, standard_labels};
 /// # Errors
 ///
 /// Returns an error if the Gateway has no UID.
-pub(crate) fn build_pod_disruption_budget(
+pub fn build_pod_disruption_budget(
     name: &str,
     namespace: &str,
     gateway: &Gateway,

@@ -37,19 +37,19 @@ const MAX_REQUEST_BYTES: usize = 8192; // 8 KiB
 
 /// Liveness and readiness shared with the controllers.
 #[derive(Debug, Default)]
-pub(crate) struct Health {
+pub struct Health {
     /// Whether every controller has completed a first pass.
     ready: AtomicBool,
 }
 
 impl Health {
     /// Marks the operator ready to serve.
-    pub(crate) fn mark_ready(&self) {
+    pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Relaxed);
     }
 
     /// Returns whether the operator is ready to serve.
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
 }
@@ -62,7 +62,7 @@ impl Health {
 ///
 /// Binding failures are logged rather than propagated: losing metrics
 /// is not a reason to take a working control plane down.
-pub(crate) async fn serve(health: Arc<Health>) {
+pub async fn serve(health: Arc<Health>) {
     let listener = match TcpListener::bind(BIND_ADDRESS).await {
         Ok(listener) => listener,
         Err(e) => {

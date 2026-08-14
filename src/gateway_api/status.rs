@@ -33,7 +33,7 @@ const TRANSITION_TIME_KEY: &str = "lastTransitionTime";
 /// Without this step every reconcile produces a document that differs
 /// only by timestamp, so each write re-triggers the controller's own
 /// watch and the loop never settles.
-pub(crate) fn preserve_condition_times(desired: &mut Value, observed: &Value) {
+pub fn preserve_condition_times(desired: &mut Value, observed: &Value) {
     if let (Some(desired), Some(observed)) = (desired.as_object_mut(), observed.as_object()) {
         preserve_in_object(desired, observed);
         return;
@@ -52,7 +52,7 @@ pub(crate) fn preserve_condition_times(desired: &mut Value, observed: &Value) {
 /// patch. Fields the operator does not set are ignored at every depth,
 /// and an absent field counts as matching when the desired value is an
 /// empty list, which the API server may store by omission.
-pub(crate) fn is_status_unchanged(desired: &Value, observed: &Value) -> bool {
+pub fn is_status_unchanged(desired: &Value, observed: &Value) -> bool {
     if let (Some(desired), Some(observed)) = (desired.as_object(), observed.as_object()) {
         return desired.iter().all(|(key, value)| field_unchanged(observed, key, value));
     }

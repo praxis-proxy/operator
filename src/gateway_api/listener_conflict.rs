@@ -22,7 +22,7 @@ use gateway_api::gateways::GatewayListeners;
 /// The variants map onto the Gateway API `ListenerConditionReason`
 /// values of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConflictReason {
+pub enum ConflictReason {
     /// Another listener claims the same port with a different protocol.
     ProtocolConflict,
 
@@ -32,7 +32,7 @@ pub(crate) enum ConflictReason {
 
 impl ConflictReason {
     /// Returns the Gateway API condition reason string.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ProtocolConflict => "ProtocolConflict",
             Self::HostnameConflict => "HostnameConflict",
@@ -40,7 +40,7 @@ impl ConflictReason {
     }
 
     /// Returns the message to report on the conflicting conditions.
-    pub(crate) fn message(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         match self {
             Self::ProtocolConflict => {
                 "listener conflicts with another listener on the same port using a \
@@ -60,7 +60,7 @@ impl ConflictReason {
 /// Returns a map from listener name to the reason it conflicts. Both
 /// sides of a conflict are reported: neither can be programmed, so
 /// neither may claim the port.
-pub(crate) fn detect_conflicts(listeners: &[GatewayListeners]) -> HashMap<String, ConflictReason> {
+pub fn detect_conflicts(listeners: &[GatewayListeners]) -> HashMap<String, ConflictReason> {
     let mut conflicts = HashMap::new();
 
     for group in group_by_port(listeners).values() {

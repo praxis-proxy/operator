@@ -100,7 +100,7 @@ struct RedirectFilterConfig {
 /// filters (`conditions`) derived from the rule's path match. This ensures
 /// header modifications and redirects apply only to traffic matching the
 /// originating rule.
-pub(crate) fn convert_filters(rules: &[HttpRouteRules]) -> Vec<PraxisFilterEntry> {
+pub fn convert_filters(rules: &[HttpRouteRules]) -> Vec<PraxisFilterEntry> {
     let mut filters = Vec::new();
     for rule in rules {
         let has_backends = rule.backend_refs.as_ref().is_some_and(|refs| !refs.is_empty());

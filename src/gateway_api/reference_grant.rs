@@ -19,7 +19,34 @@ use gateway_api::referencegrants::ReferenceGrant;
     clippy::too_many_lines,
     reason = "params map 1:1 to Gateway API fields"
 )]
-pub(crate) fn is_reference_allowed(
+/// ```
+/// use praxis_operator::gateway_api::reference_grant::is_reference_allowed;
+///
+/// // Same-namespace references never need a grant.
+/// assert!(is_reference_allowed(
+///     "app",
+///     "gateway.networking.k8s.io",
+///     "HTTPRoute",
+///     "app",
+///     "",
+///     "Service",
+///     Some("backend"),
+///     &[],
+/// ));
+///
+/// // Crossing a namespace without one is denied.
+/// assert!(!is_reference_allowed(
+///     "app",
+///     "gateway.networking.k8s.io",
+///     "HTTPRoute",
+///     "other",
+///     "",
+///     "Service",
+///     Some("backend"),
+///     &[],
+/// ));
+/// ```
+pub fn is_reference_allowed(
     from_ns: &str,
     from_group: &str,
     from_kind: &str,

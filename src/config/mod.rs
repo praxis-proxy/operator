@@ -3,8 +3,9 @@
 
 //! Praxis YAML configuration generation from Gateway API resources.
 
-pub(crate) mod cluster;
-pub(crate) mod filter_conversion;
-pub(crate) mod generate;
-pub(crate) mod listener;
-pub(crate) mod routing;
+pub mod cluster;
+pub mod filter_conversion;
+pub mod generate;
+pub mod listener;
+pub mod routing;
+pub mod weights;

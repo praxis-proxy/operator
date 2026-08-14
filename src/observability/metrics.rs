@@ -39,13 +39,13 @@ static GLOBAL: LazyLock<Metrics> = LazyLock::new(Metrics::default);
 // -----------------------------------------------------------------------------
 
 /// Returns the process-wide counter registry.
-pub(crate) fn global() -> &'static Metrics {
+pub fn global() -> &'static Metrics {
     &GLOBAL
 }
 
 /// Which controller a measurement belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Controller {
+pub enum Controller {
     /// The `GatewayClass` reconciler.
     GatewayClass,
 
@@ -73,7 +73,7 @@ impl Controller {
 
 /// Counters shared by every controller.
 #[derive(Debug, Default)]
-pub(crate) struct Metrics {
+pub struct Metrics {
     /// Successful reconciliations, indexed by [`Controller::index`].
     reconciles: [AtomicU64; 3],
 
@@ -100,27 +100,27 @@ pub(crate) struct Metrics {
 
 impl Metrics {
     /// Records a successful reconciliation.
-    pub(crate) fn record_reconcile(&self, controller: Controller) {
+    pub fn record_reconcile(&self, controller: Controller) {
         Self::bump(&self.reconciles, controller);
     }
 
     /// Records a failed reconciliation.
-    pub(crate) fn record_error(&self, controller: Controller) {
+    pub fn record_error(&self, controller: Controller) {
         Self::bump(&self.errors, controller);
     }
 
     /// Records a status patch that was skipped as redundant.
-    pub(crate) fn record_status_skipped(&self) {
+    pub fn record_status_skipped(&self) {
         self.status_patches_skipped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a status patch that was written.
-    pub(crate) fn record_status_written(&self) {
+    pub fn record_status_written(&self) {
         self.status_patches_written.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records whether this replica holds the leadership lease.
-    pub(crate) fn set_leader(&self, leading: bool) {
+    pub fn set_leader(&self, leading: bool) {
         self.leader.store(u64::from(leading), Ordering::Relaxed);
     }
 

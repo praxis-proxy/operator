@@ -13,13 +13,13 @@ use kube::{
 // -----------------------------------------------------------------------------
 
 /// The controller name registered in `GatewayClass` resources.
-pub(crate) const CONTROLLER_NAME: &str = "praxis.sh/gateway-controller";
+pub const CONTROLLER_NAME: &str = "praxis.sh/gateway-controller";
 
 /// Finalizer string applied to Gateways.
-pub(crate) const GATEWAY_FINALIZER: &str = "gateway.praxis.sh/finalizer";
+pub const GATEWAY_FINALIZER: &str = "gateway.praxis.sh/finalizer";
 
 /// Admin port on the Praxis data-plane container.
-pub(crate) const ADMIN_PORT: i32 = 9901;
+pub const ADMIN_PORT: i32 = 9901;
 
 /// Image used when `PRAXIS_IMAGE` is unset.
 const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:latest";
@@ -31,7 +31,7 @@ const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:latest";
 /// Praxis container image, configurable via `PRAXIS_IMAGE` env var.
 ///
 /// Falls back to `ghcr.io/praxis-proxy/praxis:latest` when unset.
-pub(crate) fn praxis_image() -> String {
+pub fn praxis_image() -> String {
     std::env::var("PRAXIS_IMAGE").unwrap_or_else(|_| DEFAULT_PRAXIS_IMAGE.to_owned())
 }
 
@@ -40,16 +40,16 @@ pub(crate) fn praxis_image() -> String {
 // -----------------------------------------------------------------------------
 
 /// Shared state passed to all reconcilers.
-pub(crate) struct Context {
+pub struct Context {
     /// Kubernetes API client.
-    pub(crate) client: Client,
+    pub client: Client,
 
     /// Publishes Kubernetes events for user-visible decisions.
-    pub(crate) recorder: Recorder,
+    pub recorder: Recorder,
 }
 
 /// Builds the event reporter identifying this operator.
-pub(crate) fn reporter() -> Reporter {
+pub fn reporter() -> Reporter {
     Reporter {
         controller: "praxis-operator".to_owned(),
         instance: std::env::var("POD_NAME").ok(),

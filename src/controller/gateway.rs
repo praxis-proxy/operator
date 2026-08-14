@@ -43,7 +43,14 @@ const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
 /// Uses a finalizer to ensure cleanup runs before deletion. On apply,
 /// generates Praxis configuration and applies child `Deployment`,
 /// `ConfigMap`, and `Service` resources via server-side apply.
-pub(crate) async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Action> {
+///
+/// # Errors
+///
+/// Returns an error if the finalizer cannot be maintained, if any API
+/// read the reconciliation depends on fails, or if applying a child
+/// resource or the Gateway status is rejected. The error reaches
+/// [`error_policy`], which requeues with backoff.
+pub async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Action> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     info!("reconciling Gateway {ns}/{name}");
@@ -68,7 +75,7 @@ pub(crate) async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Act
 ///
 /// Uses differentiated backoff: shorter for transient API errors,
 /// longer for configuration or logic errors.
-pub(crate) fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
+pub fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     let delay = match error {
         OperatorError::Kube(_) | OperatorError::Finalizer(_) => Duration::from_secs(15),
         _ => Duration::from_secs(30),
@@ -351,7 +358,7 @@ async fn reject_gateway(
 /// Gateway reconciliation on route changes.
 ///
 /// [`Controller::watches`]: kube::runtime::controller::Controller::watches
-pub(crate) fn map_route_to_gateway(route: &HTTPRoute) -> Option<ObjectRef<Gateway>> {
+pub fn map_route_to_gateway(route: &HTTPRoute) -> Option<ObjectRef<Gateway>> {
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let parent_refs = route.spec.parent_refs.as_deref()?;
     find_gateway_parent_ref(parent_refs, route_ns)
@@ -364,10 +371,7 @@ pub(crate) fn map_route_to_gateway(route: &HTTPRoute) -> Option<ObjectRef<Gatewa
 /// Gateways in the trusted namespace (cross-namespace TLS secrets); a
 /// grant trusting route sources can affect any Gateway, because a route
 /// in the trusted namespace may attach anywhere.
-pub(crate) fn map_grant_to_gateways(
-    grant: &ReferenceGrant,
-    known_gateways: &[Arc<Gateway>],
-) -> Vec<ObjectRef<Gateway>> {
+pub fn map_grant_to_gateways(grant: &ReferenceGrant, known_gateways: &[Arc<Gateway>]) -> Vec<ObjectRef<Gateway>> {
     let mut refs = Vec::new();
 
     for gw in known_gateways {

@@ -16,66 +16,66 @@ use crate::gateway_api::protocol::ListenerProtocol;
 ///
 /// Serializes to YAML format for the Praxis proxy configuration file.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisListener {
+pub struct PraxisListener {
     /// Listener name.
-    pub(crate) name: String,
+    pub name: String,
 
     /// Bind address (e.g., "0.0.0.0:80").
-    pub(crate) address: String,
+    pub address: String,
 
     /// Filter chain names.
-    pub(crate) filter_chains: Vec<String>,
+    pub filter_chains: Vec<String>,
 
     /// Listener hostname constraint (not serialized to Praxis config).
     ///
     /// Propagated from Gateway listener; used to scope routes that lack
     /// an HTTPRoute-level hostname.
     #[serde(skip)]
-    pub(crate) hostname: Option<String>,
+    pub hostname: Option<String>,
 
     /// All section names in the merged port group (not serialized).
     ///
     /// When multiple Gateway listeners share a port, routes targeting
     /// any of these section names belong to this listener's filter chain.
     #[serde(skip)]
-    pub(crate) merged_section_names: Vec<String>,
+    pub merged_section_names: Vec<String>,
 
     /// Protocol (omit for HTTP, "http" for HTTPS with TLS).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) protocol: Option<String>,
+    pub protocol: Option<String>,
 
     /// TLS configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tls: Option<PraxisTls>,
+    pub tls: Option<PraxisTls>,
 }
 
 /// Praxis TLS configuration.
 ///
 /// Contains certificate references for TLS listeners.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisTls {
+pub struct PraxisTls {
     /// Certificate configurations.
-    pub(crate) certificates: Vec<PraxisCertificate>,
+    pub certificates: Vec<PraxisCertificate>,
 }
 
 /// Praxis certificate configuration.
 ///
 /// Points to certificate and key files on disk with optional SNI routing.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisCertificate {
+pub struct PraxisCertificate {
     /// Path to certificate file.
-    pub(crate) cert_path: String,
+    pub cert_path: String,
 
     /// Path to private key file.
-    pub(crate) key_path: String,
+    pub key_path: String,
 
     /// SNI hostnames this certificate serves.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) server_names: Option<Vec<String>>,
+    pub server_names: Option<Vec<String>>,
 
     /// Whether this is the default certificate when no SNI matches.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) default: Option<bool>,
+    pub default: Option<bool>,
 }
 
 // -----------------------------------------------------------------------------
@@ -87,7 +87,7 @@ pub(crate) struct PraxisCertificate {
 /// Maps `Gateway` listener properties to Praxis-compatible YAML structure.
 /// For HTTP listeners, protocol is omitted (Praxis defaults to HTTP).
 /// For HTTPS listeners, TLS certificates are mapped from `Secret` references.
-pub(crate) fn convert_listener(listener: &GatewayListeners, chain_name: &str) -> PraxisListener {
+pub fn convert_listener(listener: &GatewayListeners, chain_name: &str) -> PraxisListener {
     let port = listener.port;
     let address = format!("0.0.0.0:{port}");
     let is_https = ListenerProtocol::terminates_tls(&listener.protocol);
