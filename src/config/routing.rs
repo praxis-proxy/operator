@@ -44,10 +44,6 @@ pub(crate) struct PraxisRoute {
     #[serde(skip)]
     pub(crate) listener_names: Vec<Option<String>>,
 
-    /// HTTP method to match.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) method: Option<String>,
-
     /// Exact path match. Takes precedence over `path_prefix`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
@@ -55,10 +51,6 @@ pub(crate) struct PraxisRoute {
     /// Path prefix match. Must end with '/'.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) path_prefix: String,
-
-    /// Query parameters to match (exact match only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) query_params: Option<BTreeMap<String, String>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -390,10 +382,8 @@ fn emit_catchall_routes(
         headers: None,
         host: None,
         listener_names: section_names.to_vec(),
-        method: None,
         path: None,
         path_prefix: "/".to_owned(),
-        query_params: None,
     };
 
     push_per_hostname(base, hostnames, out);
@@ -411,8 +401,6 @@ fn emit_match_routes(
     out: &mut Vec<PraxisRoute>,
 ) {
     let headers = extract_headers(&m.headers);
-    let method = extract_method(m);
-    let query_params = extract_query_params(&m.query_params);
 
     for (path, path_prefix) in extract_path_match(&m.path) {
         let base = PraxisRoute {
@@ -420,10 +408,8 @@ fn emit_match_routes(
             headers: headers.clone(),
             host: None,
             listener_names: section_names.to_vec(),
-            method: method.clone(),
             path,
             path_prefix,
-            query_params: query_params.clone(),
         };
 
         push_per_hostname(base, hostnames, out);
@@ -496,31 +482,6 @@ fn extract_headers(
 ) -> Option<BTreeMap<String, String>> {
     let hs = headers.as_ref().filter(|hs| !hs.is_empty())?;
     let map = collect_exact_headers(hs);
-    if map.is_empty() { None } else { Some(map) }
-}
-
-/// Extracts the HTTP method a match constrains, if any.
-fn extract_method(m: &HttpRouteRulesMatches) -> Option<String> {
-    m.method.as_ref().map(|method| format!("{method:?}").to_uppercase())
-}
-
-/// Extracts exact query-parameter matches.
-///
-/// Regular-expression matches never reach here: a rule carrying one is
-/// rejected by [`validate_route`] before conversion. Per the Gateway API
-/// spec the first entry wins for duplicate parameter names.
-///
-/// [`validate_route`]: crate::gateway_api::route_validation::validate_route
-fn extract_query_params(
-    params: &Option<Vec<gateway_api::httproutes::HttpRouteRulesMatchesQueryParams>>,
-) -> Option<BTreeMap<String, String>> {
-    let entries = params.as_ref().filter(|p| !p.is_empty())?;
-
-    let mut map = BTreeMap::new();
-    for param in entries {
-        map.entry(param.name.clone()).or_insert_with(|| param.value.clone());
-    }
-
     if map.is_empty() { None } else { Some(map) }
 }
 
@@ -947,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_routes_carries_method_match() {
+    fn test_convert_routes_rejects_method_match() {
         let mut rule = rule_with_backend();
         rule.matches = Some(vec![HttpRouteRulesMatches {
             method: Some(gateway_api::httproutes::HttpRouteRulesMatchesMethod::Post),
@@ -958,16 +919,15 @@ mod tests {
         let routes = vec![(&route, vec![None])];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
-        assert_eq!(praxis_routes.len(), 1, "a method-only match should produce one route");
-        assert_eq!(
-            praxis_routes[0].method,
-            Some("POST".to_owned()),
-            "the method match must reach the data-plane config, not be dropped"
+        assert!(
+            praxis_routes.is_empty(),
+            "the Praxis route schema has no method field, so emitting the route would serve \
+             every method instead of only POST"
         );
     }
 
     #[test]
-    fn test_convert_routes_carries_query_param_match() {
+    fn test_convert_routes_rejects_query_param_match() {
         let mut rule = rule_with_backend();
         rule.matches = Some(vec![HttpRouteRulesMatches {
             query_params: Some(vec![gateway_api::httproutes::HttpRouteRulesMatchesQueryParams {
@@ -982,62 +942,9 @@ mod tests {
         let routes = vec![(&route, vec![None])];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
-        let params = praxis_routes[0]
-            .query_params
-            .as_ref()
-            .expect("query parameter match should reach the config");
-        assert_eq!(
-            params.get("version"),
-            Some(&"v2".to_owned()),
-            "the query parameter constraint must be preserved"
-        );
-    }
-
-    #[test]
-    fn test_convert_routes_first_duplicate_query_param_wins() {
-        let mut rule = rule_with_backend();
-        rule.matches = Some(vec![HttpRouteRulesMatches {
-            query_params: Some(vec![
-                gateway_api::httproutes::HttpRouteRulesMatchesQueryParams {
-                    name: "q".to_owned(),
-                    value: "first".to_owned(),
-                    r#type: None,
-                },
-                gateway_api::httproutes::HttpRouteRulesMatchesQueryParams {
-                    name: "q".to_owned(),
-                    value: "second".to_owned(),
-                    r#type: None,
-                },
-            ]),
-            ..Default::default()
-        }]);
-        let route = route_with_rules(vec![rule]);
-
-        let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
-
-        let params = praxis_routes[0].query_params.as_ref().expect("params should be set");
-        assert_eq!(
-            params.get("q"),
-            Some(&"first".to_owned()),
-            "the Gateway API specifies first-wins for duplicate query parameter names"
-        );
-    }
-
-    #[test]
-    fn test_convert_routes_without_method_leaves_it_unset() {
-        let route = route_with_rules(vec![rule_with_backend()]);
-
-        let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
-
-        assert_eq!(
-            praxis_routes[0].method, None,
-            "an unconstrained route must not gain a method constraint"
-        );
-        assert_eq!(
-            praxis_routes[0].query_params, None,
-            "an unconstrained route must not gain query parameters"
+        assert!(
+            praxis_routes.is_empty(),
+            "the Praxis route schema has no query parameter field, so the constraint cannot be honoured"
         );
     }
 
