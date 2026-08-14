@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use gateway_api::gateways::GatewayListeners;
 
+use crate::gateway_api::protocol::ListenerProtocol;
+
 // -----------------------------------------------------------------------------
 // ConflictReason
 // -----------------------------------------------------------------------------
@@ -63,7 +65,21 @@ impl ConflictReason {
 pub fn detect_conflicts(listeners: &[GatewayListeners]) -> HashMap<String, ConflictReason> {
     let mut conflicts = HashMap::new();
 
-    for group in group_by_port(listeners).values() {
+    // Only listeners this operator would actually serve can conflict.
+    //
+    // A listener naming a protocol we do not implement is rejected on
+    // its own terms, with `UnsupportedProtocol`. Letting it into the
+    // port grouping made it collide with whatever valid listener shared
+    // its port, and both came back `Conflicted` — so a Gateway with one
+    // good HTTP listener and one TCP listener on the same port reported
+    // no accepted listeners at all, when the good one should have been
+    // accepted and only the TCP one rejected.
+    let servable: Vec<&GatewayListeners> = listeners
+        .iter()
+        .filter(|listener| ListenerProtocol::is_supported(&listener.protocol))
+        .collect();
+
+    for group in group_by_port_refs(&servable).values() {
         mark_protocol_conflicts(group, &mut conflicts);
         mark_hostname_conflicts(group, &mut conflicts);
     }
@@ -74,8 +90,8 @@ pub fn detect_conflicts(listeners: &[GatewayListeners]) -> HashMap<String, Confl
 /// Groups listeners by the port they bind.
 ///
 /// Ordered so that conflict reporting is stable across reconciles.
-fn group_by_port(listeners: &[GatewayListeners]) -> BTreeMap<i32, Vec<&GatewayListeners>> {
-    let mut by_port: BTreeMap<i32, Vec<&GatewayListeners>> = BTreeMap::new();
+fn group_by_port_refs<'a>(listeners: &[&'a GatewayListeners]) -> BTreeMap<i32, Vec<&'a GatewayListeners>> {
+    let mut by_port: BTreeMap<i32, Vec<&'a GatewayListeners>> = BTreeMap::new();
     for listener in listeners {
         by_port.entry(listener.port).or_default().push(listener);
     }
@@ -152,6 +168,31 @@ mod tests {
         assert!(
             detect_conflicts(&listeners).is_empty(),
             "listeners on different ports cannot conflict"
+        );
+    }
+
+    #[test]
+    fn test_an_unserved_protocol_does_not_conflict_with_a_served_one() {
+        let listeners = vec![listener("http", 80, "HTTP", None), listener("tcp", 80, "TCP", None)];
+        let conflicts = detect_conflicts(&listeners);
+
+        assert!(
+            conflicts.is_empty(),
+            "a listener naming a protocol this operator does not serve is rejected with \
+             UnsupportedProtocol on its own; dragging the servable listener into Conflicted \
+             leaves the Gateway with no accepted listeners at all, which is what the \
+             GatewayListenerUnsupportedProtocol conformance case checks: {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn test_two_unserved_protocols_on_one_port_do_not_conflict() {
+        let listeners = vec![listener("tcp", 80, "TCP", None), listener("udp", 80, "UDP", None)];
+
+        assert!(
+            detect_conflicts(&listeners).is_empty(),
+            "neither listener would be programmed anyway, and UnsupportedProtocol is the \
+             reason that describes why"
         );
     }
 
