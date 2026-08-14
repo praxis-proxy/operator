@@ -23,7 +23,7 @@ use k8s_openapi::{
 };
 use kube::ResourceExt as _;
 
-use super::labels::{owner_reference, standard_labels};
+use super::labels::{descriptive_labels, infrastructure_annotations, owner_reference, standard_labels};
 use crate::context::{ADMIN_PORT, praxis_image};
 
 // -----------------------------------------------------------------------------
@@ -105,8 +105,15 @@ pub struct DeploymentParams<'a> {
 /// Returns an error if the Gateway has no UID.
 pub fn build_deployment(params: &DeploymentParams<'_>) -> crate::error::Result<Deployment> {
     let instance = params.gateway.name_any();
-    let labels = standard_labels(&instance);
-    let pod_annotations = BTreeMap::from([("praxis.sh/config-hash".to_owned(), params.config_hash.to_owned())]);
+    let selector = standard_labels(&instance);
+
+    // Everything the selector must not carry, because a selector cannot
+    // be edited after creation and these can change with the Gateway.
+    let mut labels = selector.clone();
+    labels.extend(descriptive_labels(params.gateway));
+
+    let mut pod_annotations = infrastructure_annotations(params.gateway);
+    pod_annotations.insert("praxis.sh/config-hash".to_owned(), params.config_hash.to_owned());
 
     let (mut volume_mounts, mut volumes) = config_volume(params.name);
     let (tls_mounts, tls_vols) = build_tls_volumes(params.tls_secret_names);
@@ -120,9 +127,18 @@ pub fn build_deployment(params: &DeploymentParams<'_>) -> crate::error::Result<D
     let ports = build_container_ports(params.listener_ports);
     let container = build_praxis_container(ports, volume_mounts);
 
-    let pod_template = build_pod_template(&labels, pod_annotations, container, volumes);
+    let pod_template = build_pod_template(&labels, &selector, pod_annotations, container, volumes);
 
-    build_deployment_object(params.name, params.namespace, params.gateway, labels, pod_template)
+    build_deployment_object(
+        params.name,
+        params.namespace,
+        params.gateway,
+        DeploymentMetadata {
+            labels,
+            selector,
+            pod_template,
+        },
+    )
 }
 
 // -----------------------------------------------------------------------------
@@ -308,9 +324,11 @@ fn proxy_security_context() -> SecurityContext {
 
 /// Builds the pod template spec with labels, annotations, and volumes.
 ///
-/// Wraps a single container in a hardened pod spec.
+/// Wraps a single container in a hardened pod spec. `labels` go on the
+/// pods; `selector` is the narrower, fixed set that identifies them.
 fn build_pod_template(
     labels: &BTreeMap<String, String>,
+    selector: &BTreeMap<String, String>,
     pod_annotations: BTreeMap<String, String>,
     container: Container,
     volumes: Vec<Volume>,
@@ -319,7 +337,7 @@ fn build_pod_template(
         automount_service_account_token: Some(false),
         containers: vec![container],
         termination_grace_period_seconds: Some(15),
-        topology_spread_constraints: Some(spread_constraints(labels)),
+        topology_spread_constraints: Some(spread_constraints(selector)),
         volumes: Some(volumes),
         ..Default::default()
     };
@@ -369,6 +387,18 @@ fn spread_constraints(labels: &BTreeMap<String, String>) -> Vec<TopologySpreadCo
     }]
 }
 
+/// The label sets and pod template a [`Deployment`] is assembled from.
+struct DeploymentMetadata {
+    /// Labels stamped on the Deployment and its pods.
+    labels: BTreeMap<String, String>,
+
+    /// The immutable subset that selects those pods.
+    selector: BTreeMap<String, String>,
+
+    /// The pod template itself.
+    pod_template: PodTemplateSpec,
+}
+
 /// Assembles the final [`Deployment`] object with metadata and spec.
 ///
 /// Sets owner references, labels, rolling update strategy, and the pod
@@ -377,28 +407,28 @@ fn build_deployment_object(
     name: &str,
     namespace: &str,
     gateway: &Gateway,
-    labels: BTreeMap<String, String>,
-    pod_template: PodTemplateSpec,
+    meta: DeploymentMetadata,
 ) -> crate::error::Result<Deployment> {
     Ok(Deployment {
         metadata: ObjectMeta {
+            annotations: Some(infrastructure_annotations(gateway)),
             name: Some(name.to_owned()),
             namespace: Some(namespace.to_owned()),
             owner_references: Some(vec![owner_reference(gateway)?]),
-            labels: Some(labels.clone()),
+            labels: Some(meta.labels),
             ..Default::default()
         },
         spec: Some(DeploymentSpec {
             replicas: Some(desired_replicas(gateway)),
             selector: LabelSelector {
-                match_labels: Some(labels),
+                match_labels: Some(meta.selector),
                 ..Default::default()
             },
             strategy: Some(DeploymentStrategy {
                 type_: Some("RollingUpdate".to_owned()),
                 ..Default::default()
             }),
-            template: pod_template,
+            template: meta.pod_template,
             ..Default::default()
         }),
         ..Default::default()
@@ -438,6 +468,84 @@ mod tests {
             tls_secret_names: &[],
             listener_ports: ports,
         }
+    }
+
+    #[test]
+    fn test_deployment_selector_excludes_the_variable_labels() {
+        let gateway = infrastructure_gateway();
+        let deployment = build_deployment(&params(&gateway)).expect("a gateway with a uid builds");
+
+        let spec = deployment.spec.expect("spec should be set");
+        let selector = spec.selector.match_labels.expect("selector should be set");
+        let pod_labels = spec
+            .template
+            .metadata
+            .expect("template metadata should be set")
+            .labels
+            .expect("pod labels should be set");
+
+        assert!(
+            !selector.contains_key("key2") && !selector.contains_key(super::super::labels::GATEWAY_NAME_LABEL),
+            "a Deployment selector cannot be edited after creation, so the first Gateway to \
+             change spec.infrastructure would leave the operator unable to apply: {selector:?}"
+        );
+        assert!(
+            selector.iter().all(|(key, value)| pod_labels.get(key) == Some(value)),
+            "the selector still has to select the pods: {selector:?} vs {pod_labels:?}"
+        );
+    }
+
+    #[test]
+    fn test_pods_carry_gateway_infrastructure_metadata() {
+        let gateway = infrastructure_gateway();
+        let deployment = build_deployment(&params(&gateway)).expect("a gateway with a uid builds");
+
+        let template = deployment
+            .spec
+            .expect("spec should be set")
+            .template
+            .metadata
+            .expect("template metadata should be set");
+        let labels = template.labels.expect("pod labels should be set");
+        let annotations = template.annotations.expect("pod annotations should be set");
+
+        assert_eq!(
+            labels.get(super::super::labels::GATEWAY_NAME_LABEL),
+            Some(&"test-gateway".to_owned()),
+            "conformance finds an implementation's generated pods by this label"
+        );
+        assert_eq!(
+            labels.get("key2"),
+            Some(&"value2".to_owned()),
+            "spec.infrastructure.labels asks for these on every generated resource"
+        );
+        assert_eq!(
+            annotations.get("key1"),
+            Some(&"value1".to_owned()),
+            "spec.infrastructure.annotations likewise"
+        );
+        assert!(
+            annotations.contains_key("praxis.sh/config-hash"),
+            "the config hash still has to reach the pod template, or config edits stop rolling out"
+        );
+    }
+
+    /// Builds a Gateway declaring infrastructure labels and annotations.
+    fn infrastructure_gateway() -> Gateway {
+        use gateway_api::gateways::GatewayInfrastructure;
+
+        let mut gateway = test_gateway();
+        gateway.spec.infrastructure = Some(GatewayInfrastructure {
+            annotations: Some(BTreeMap::from([("key1".to_owned(), "value1".to_owned())])),
+            labels: Some(BTreeMap::from([("key2".to_owned(), "value2".to_owned())])),
+            ..Default::default()
+        });
+        gateway
+    }
+
+    /// Builds deployment params for a gateway with no listener ports.
+    fn params(gateway: &Gateway) -> DeploymentParams<'_> {
+        test_params(gateway, &[])
     }
 
     #[test]

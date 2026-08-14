@@ -10,11 +10,18 @@ use k8s_openapi::{
 };
 use kube::ResourceExt as _;
 
-use super::labels::{owner_reference, standard_labels};
+use super::labels::{descriptive_labels, infrastructure_annotations, owner_reference, standard_labels};
 
 // -----------------------------------------------------------------------------
 // Service Builder
 // -----------------------------------------------------------------------------
+
+/// Returns the labels stamped on the Service itself.
+fn service_labels(gateway: &Gateway, instance: &str) -> std::collections::BTreeMap<String, String> {
+    let mut labels = standard_labels(instance);
+    labels.extend(descriptive_labels(gateway));
+    labels
+}
 
 /// Builds a `LoadBalancer` `Service` for Praxis.
 ///
@@ -33,14 +40,18 @@ pub fn build_service(
 
     Ok(Service {
         metadata: ObjectMeta {
+            annotations: Some(infrastructure_annotations(gateway)),
             name: Some(name.to_owned()),
             namespace: Some(namespace.to_owned()),
             owner_references: Some(vec![owner_reference(gateway)?]),
-            labels: Some(standard_labels(&instance)),
+            labels: Some(service_labels(gateway, &instance)),
             ..Default::default()
         },
         spec: Some(ServiceSpec {
             type_: Some("LoadBalancer".to_owned()),
+            // Deliberately the bare standard set: a Service selector is
+            // as immutable as a Deployment's, so nothing that can change
+            // with the Gateway spec may appear in it.
             selector: Some(standard_labels(&instance)),
             ports: Some(ports),
             ..Default::default()
@@ -58,7 +69,7 @@ pub fn build_service(
 mod tests {
     use k8s_openapi::apimachinery::pkg::{apis::meta::v1::ObjectMeta, util::intstr::IntOrString};
 
-    use super::*;
+    use super::{super::labels::GATEWAY_NAME_LABEL, *};
 
     #[test]
     fn test_build_service_metadata() {
@@ -183,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_service_selector_matches_labels() {
+    fn test_build_service_selector_is_a_subset_of_its_labels() {
         let gateway = Gateway {
             metadata: ObjectMeta {
                 name: Some("my-gateway".to_owned()),
@@ -201,6 +212,66 @@ mod tests {
         let spec = service.spec.expect("spec should be set");
         let selector = spec.selector.expect("selector should be set");
 
-        assert_eq!(labels, selector, "labels and selector should match");
+        assert!(
+            selector.iter().all(|(key, value)| labels.get(key) == Some(value)),
+            "the selector has to keep selecting the pods: {selector:?} vs {labels:?}"
+        );
+        assert!(
+            !selector.contains_key(GATEWAY_NAME_LABEL) && labels.contains_key(GATEWAY_NAME_LABEL),
+            "a Service selector is immutable once created, so only the fixed labels may appear in \
+             it — the descriptive ones belong on the object alone"
+        );
+    }
+
+    #[test]
+    fn test_build_service_carries_gateway_infrastructure_metadata() {
+        use gateway_api::gateways::{GatewayInfrastructure, GatewaySpec};
+
+
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("my-gateway".to_owned()),
+                namespace: Some("default".to_owned()),
+                uid: Some("test-uid".to_owned()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                infrastructure: Some(GatewayInfrastructure {
+                    annotations: Some(std::collections::BTreeMap::from([(
+                        "key1".to_owned(),
+                        "value1".to_owned(),
+                    )])),
+                    labels: Some(std::collections::BTreeMap::from([(
+                        "key2".to_owned(),
+                        "value2".to_owned(),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: None,
+        };
+
+        let service = build_service("praxis-svc", "default", &gateway, vec![]).unwrap();
+
+        assert_eq!(
+            service.metadata.labels.as_ref().and_then(|l| l.get("key2")),
+            Some(&"value2".to_owned()),
+            "spec.infrastructure.labels asks for these on every generated resource"
+        );
+        assert_eq!(
+            service.metadata.annotations.as_ref().and_then(|a| a.get("key1")),
+            Some(&"value1".to_owned()),
+            "spec.infrastructure.annotations likewise"
+        );
+        assert_eq!(
+            service
+                .spec
+                .and_then(|s| s.selector)
+                .and_then(|s| s.get("key2").cloned()),
+            None,
+            "an infrastructure label in the selector would make the Service unpatchable the first \
+             time someone edited it"
+        );
     }
 }
