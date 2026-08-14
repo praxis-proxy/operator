@@ -83,7 +83,7 @@ pub(super) fn collect_routes<'a>(
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
-    let attached = attachment::attached_routes(&name, &ns, all_routes);
+    let attached = attachment::attached_routes(&name, &ns, &gw.spec.listeners, all_routes);
     namespace_filter::filter_routes_by_allowed_namespaces(&attached, &gw.spec.listeners, &ns, stores)
 }
 

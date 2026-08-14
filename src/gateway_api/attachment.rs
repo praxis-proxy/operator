@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use gateway_api::httproutes::{HTTPRoute, HttpRouteParentRefs};
+use gateway_api::{
+    gateways::GatewayListeners,
+    httproutes::{HTTPRoute, HttpRouteParentRefs},
+};
 
 // -----------------------------------------------------------------------------
 // AttachedRoute
@@ -59,13 +62,46 @@ pub fn parent_ref_matches_gateway(
     group == "gateway.networking.k8s.io" && kind == "Gateway" && parent.name == gateway_name && namespace == gateway_ns
 }
 
+/// Returns `true` when a listener satisfies everything a `parentRef`
+/// asks of the listener it attaches to.
+///
+/// `sectionName` and `port` are both optional and both narrowing, and
+/// the Gateway API applies them together rather than as alternatives:
+/// a ref carrying each selects the listener satisfying both, and
+/// selects nothing when no listener does.
+pub fn listener_matches_parent_ref(listener: &GatewayListeners, parent: &HttpRouteParentRefs) -> bool {
+    parent.section_name.as_ref().is_none_or(|name| listener.name == *name)
+        && parent.port.is_none_or(|port| listener.port == port)
+}
+
+/// Returns the listeners a `parentRef` attaches to, by section name.
+///
+/// A ref naming a `sectionName` targets that listener alone. A ref
+/// naming only a `port` targets every listener serving that port — a
+/// Gateway may have several, told apart by hostname. A ref naming
+/// neither targets all of them, which is spelled `None` so that a
+/// route does not have to be re-derived when listeners change.
+fn targeted_sections(parent: &HttpRouteParentRefs, listeners: &[GatewayListeners]) -> Vec<Option<String>> {
+    if parent.section_name.is_none() && parent.port.is_none() {
+        return vec![None];
+    }
+
+    listeners
+        .iter()
+        .filter(|listener| listener_matches_parent_ref(listener, parent))
+        .map(|listener| Some(listener.name.clone()))
+        .collect()
+}
+
 /// Returns routes attached to the given Gateway with their section names.
 ///
-/// Each tuple contains a route and a vector of section names (one per matching
-/// parentRef). A `None` section name means the route attaches to all listeners.
+/// Each entry pairs a route with the listener section names its
+/// `parentRefs` resolve to. A `None` section name means the route
+/// attaches to all listeners.
 pub fn attached_routes<'a>(
     gateway_name: &str,
     gateway_ns: &str,
+    listeners: &[GatewayListeners],
     routes: &'a [Arc<HTTPRoute>],
 ) -> Vec<AttachedRoute<'a>> {
     let mut result = Vec::new();
@@ -77,7 +113,7 @@ pub fn attached_routes<'a>(
             let mut section_names = Vec::new();
             for parent_ref in refs {
                 if parent_ref_matches_gateway(parent_ref, gateway_name, gateway_ns, route_ns) {
-                    section_names.push(parent_ref.section_name.clone());
+                    section_names.extend(targeted_sections(parent_ref, listeners));
                 }
             }
 
@@ -177,7 +213,7 @@ mod tests {
     #[test]
     fn test_attached_routes_none() {
         let routes = vec![];
-        let attached = attached_routes("test-gateway", "default", &routes);
+        let attached = attached_routes("test-gateway", "default", &listeners(), &routes);
         assert!(attached.is_empty(), "no routes should be attached");
     }
 
@@ -202,7 +238,7 @@ mod tests {
         };
 
         let routes = vec![Arc::new(route)];
-        let attached = attached_routes("test-gateway", "default", &routes);
+        let attached = attached_routes("test-gateway", "default", &listeners(), &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
         assert_eq!(
@@ -236,7 +272,7 @@ mod tests {
         };
 
         let routes = vec![Arc::new(route)];
-        let attached = attached_routes("test-gateway", "default", &routes);
+        let attached = attached_routes("test-gateway", "default", &listeners(), &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
         assert_eq!(
@@ -279,7 +315,7 @@ mod tests {
         };
 
         let routes = vec![Arc::new(route)];
-        let attached = attached_routes("test-gateway", "default", &routes);
+        let attached = attached_routes("test-gateway", "default", &listeners(), &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
         assert_eq!(
@@ -320,8 +356,81 @@ mod tests {
         };
 
         let routes = vec![Arc::new(route)];
-        let attached = attached_routes("test-gateway", "default", &routes);
+        let attached = attached_routes("test-gateway", "default", &listeners(), &routes);
 
         assert!(attached.is_empty(), "no routes should be attached");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Builds the listener set the attachment tests resolve against.
+    fn listeners() -> Vec<GatewayListeners> {
+        vec![
+            GatewayListeners {
+                name: "http".to_owned(),
+                port: 80,
+                protocol: "HTTP".to_owned(),
+                ..Default::default()
+            },
+            GatewayListeners {
+                name: "https".to_owned(),
+                port: 443,
+                protocol: "HTTPS".to_owned(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn test_a_port_only_parent_ref_targets_every_listener_on_it() {
+        let listeners = vec![
+            GatewayListeners {
+                name: "foo".to_owned(),
+                port: 8080,
+                protocol: "HTTP".to_owned(),
+                ..Default::default()
+            },
+            GatewayListeners {
+                name: "bar".to_owned(),
+                port: 8080,
+                protocol: "HTTP".to_owned(),
+                ..Default::default()
+            },
+            GatewayListeners {
+                name: "other".to_owned(),
+                port: 80,
+                protocol: "HTTP".to_owned(),
+                ..Default::default()
+            },
+        ];
+        let parent = HttpRouteParentRefs {
+            name: "gw".to_owned(),
+            port: Some(8080),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            targeted_sections(&parent, &listeners),
+            vec![Some("foo".to_owned()), Some("bar".to_owned())],
+            "a Gateway may serve one port from several listeners, told apart by hostname, and the \
+             route attaches to all of them"
+        );
+    }
+
+    #[test]
+    fn test_a_parent_ref_naming_neither_stays_unresolved() {
+        let parent = HttpRouteParentRefs {
+            name: "gw".to_owned(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            targeted_sections(&parent, &listeners()),
+            vec![None],
+            "resolving it to today's listener names would leave the route bound to a stale set \
+             the next time the Gateway gained one"
+        );
     }
 }

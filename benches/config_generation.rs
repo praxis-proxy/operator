@@ -83,7 +83,8 @@ fn bench_attachment(c: &mut Criterion) {
     for count in ROUTE_COUNTS {
         group.bench_function(format!("{count}_routes"), |b| {
             let routes = route_manifests(count);
-            b.iter(|| black_box(attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, &routes).len()));
+            let listeners = listener_manifests();
+            b.iter(|| black_box(attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, &listeners, &routes).len()));
         });
     }
 
@@ -100,7 +101,7 @@ criterion_main!(benches);
 /// Runs the synchronous half of `build_praxis_config` and returns the
 /// serialized length, which keeps the optimizer from eliding the work.
 fn generate_config(listeners: &[GatewayListeners], routes: &[Arc<HTTPRoute>]) -> usize {
-    let attached = attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, routes);
+    let attached = attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, listeners, routes);
     let listener_hostnames: HashMap<String, Option<String>> =
         listeners.iter().map(|l| (l.name.clone(), l.hostname.clone())).collect();
 
