@@ -11,6 +11,7 @@ mod controller;
 mod endpoints;
 mod error;
 mod gateway_api;
+mod leader;
 mod listing;
 mod observability;
 mod resources;
@@ -57,21 +58,39 @@ async fn main() -> error::Result<()> {
     info!("connected to cluster, controller={}", context::CONTROLLER_NAME);
 
     let health = Arc::new(observability::server::Health::default());
-    let ctx = Arc::new(context::Context { client: client.clone() });
+    let observability = tokio::spawn(observability::server::serve(Arc::clone(&health)));
 
-    let observability = observability::server::serve(Arc::clone(&health));
-    let gc = build_gc_controller(&client, Arc::clone(&ctx));
-    let gw = build_gw_controller(&client, Arc::clone(&ctx));
-    let rt = build_route_controller(&client, ctx);
+    let identity = leader::identity();
+    info!("standing for election as {identity}");
+    leader::acquire(&client, &identity).await?;
+
+    let result = Box::pin(run_controllers(&client, &identity, &health)).await;
+
+    observability.abort();
+    result
+}
+
+/// Runs every controller until one exits or leadership is lost.
+///
+/// # Errors
+///
+/// Returns [`OperatorError::LeadershipLost`] when another replica takes
+/// the lease, so the process exits non-zero and restarts as a follower.
+///
+/// [`OperatorError::LeadershipLost`]: error::OperatorError::LeadershipLost
+async fn run_controllers(client: &Client, identity: &str, health: &observability::server::Health) -> error::Result<()> {
+    let ctx = Arc::new(context::Context { client: client.clone() });
+    let gc = build_gc_controller(client, Arc::clone(&ctx));
+    let gw = build_gw_controller(client, Arc::clone(&ctx));
+    let rt = build_route_controller(client, ctx);
 
     info!("starting controllers");
     health.mark_ready();
-    tokio::select! {
-        () = async { tokio::join!(gc, gw, rt); } => {},
-        () = observability => {},
-    }
 
-    Ok(())
+    tokio::select! {
+        () = async { tokio::join!(gc, gw, rt); } => Ok(()),
+        outcome = leader::renew_until_lost(client, identity) => outcome,
+    }
 }
 
 // -----------------------------------------------------------------------------
