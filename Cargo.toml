@@ -23,7 +23,12 @@ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
+[[bench]]
+name = "config_generation"
+harness = false
+
 [dev-dependencies]
+criterion = "0.7.0"
 chrono = "0.4.45"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 
