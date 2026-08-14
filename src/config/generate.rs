@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::{
     cluster::PraxisCluster,
+    filter_conversion::RouteFilters,
     listener::PraxisListener,
     routing::{PraxisFilterEntry, PraxisRoute},
 };
@@ -77,12 +78,12 @@ pub fn assemble_config(
     listeners: Vec<PraxisListener>,
     routes: &[PraxisRoute],
     clusters: &[PraxisCluster],
-    extra_filters: &[PraxisFilterEntry],
+    route_filters: &RouteFilters,
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisConfig> {
     let filter_chains: Vec<_> = listeners
         .iter()
-        .map(|l| build_filter_chain(l, routes, clusters, extra_filters, listener_hostnames))
+        .map(|l| build_filter_chain(l, routes, clusters, route_filters, listener_hostnames))
         .collect::<yaml_serde::Result<Vec<_>>>()?;
 
     Ok(PraxisConfig {
@@ -99,8 +100,11 @@ pub fn assemble_config(
 
 /// Builds a single filter chain for a listener.
 ///
-/// The chain contains `request_id`, `router` (with matching routes),
-/// any extra filters, and `load_balancer` (with embedded clusters).
+/// The chain runs `request_id`, the route filters that answer a request
+/// without an upstream, `router` (with matching routes), the route
+/// filters that reshape a routed request, and finally `load_balancer`
+/// (with embedded clusters). [`RouteFilters`] explains why the router
+/// splits the two groups.
 ///
 /// # Errors
 ///
@@ -109,7 +113,7 @@ fn build_filter_chain(
     listener: &PraxisListener,
     routes: &[PraxisRoute],
     clusters: &[PraxisCluster],
-    extra_filters: &[PraxisFilterEntry],
+    route_filters: &RouteFilters,
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisFilterChain> {
     let name = &listener.name;
@@ -133,8 +137,9 @@ fn build_filter_chain(
         filter: "request_id".to_owned(),
         config: yaml_serde::Value::Null,
     }];
-    filters.extend_from_slice(extra_filters);
+    filters.extend_from_slice(&route_filters.terminating);
     filters.push(build_router_filter(&scoped_refs)?);
+    filters.extend_from_slice(&route_filters.transforming);
     filters.push(build_lb_filter(clusters)?);
 
     Ok(PraxisFilterChain {
@@ -313,7 +318,14 @@ mod tests {
 
         let cluster = build_cluster("default~my-svc~8080", vec!["10.0.0.1:8080".to_owned()], None);
 
-        let config = assemble_config(vec![listener], &[route], &[cluster], &[], &Default::default()).unwrap();
+        let config = assemble_config(
+            vec![listener],
+            &[route],
+            &[cluster],
+            &RouteFilters::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.admin.address, "0.0.0.0:9901", "admin address should be set");
         assert_eq!(config.listeners.len(), 1, "should have one listener");
@@ -366,7 +378,14 @@ mod tests {
 
         let cluster = build_cluster("default~svc~80", vec!["10.0.0.1:80".to_owned()], None);
 
-        let config = assemble_config(vec![listener], &[route], &[cluster], &[], &Default::default()).unwrap();
+        let config = assemble_config(
+            vec![listener],
+            &[route],
+            &[cluster],
+            &RouteFilters::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
         let yaml = yaml_serde::to_string(&config).expect("config should serialize to YAML");
 
@@ -430,7 +449,7 @@ mod tests {
             vec![http_listener, https_listener],
             &[route],
             &[cluster],
-            &[],
+            &RouteFilters::default(),
             &Default::default(),
         )
         .unwrap();
@@ -478,7 +497,7 @@ mod tests {
             vec![listener],
             std::slice::from_ref(&route),
             &[cluster],
-            &[],
+            &RouteFilters::default(),
             &Default::default(),
         )
         .unwrap();
@@ -520,7 +539,7 @@ mod tests {
             tls: None,
         };
 
-        let config = assemble_config(vec![listener], &[], &[], &[], &Default::default()).unwrap();
+        let config = assemble_config(vec![listener], &[], &[], &RouteFilters::default(), &Default::default()).unwrap();
 
         let chain = &config.filter_chains[0];
         let lb_config = &chain.filters[2].config;
@@ -580,7 +599,7 @@ mod tests {
             vec![listener],
             &[route_l1, route_l2, route_l3],
             &[cluster_v1, cluster_v2, cluster_v3],
-            &[],
+            &RouteFilters::default(),
             &Default::default(),
         )
         .unwrap();
@@ -598,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extra_filters_placed_before_router() {
+    fn test_terminating_filters_run_before_the_router() {
         let listener = PraxisListener {
             name: "http".to_owned(),
             address: "0.0.0.0:80".to_owned(),
@@ -614,21 +633,26 @@ mod tests {
             config: yaml_serde::Value::Null,
         };
 
-        let config = assemble_config(vec![listener], &[], &[], &[redirect], &Default::default()).unwrap();
+        let headers = PraxisFilterEntry {
+            filter: "headers".to_owned(),
+            config: yaml_serde::Value::Null,
+        };
+
+        let route_filters = RouteFilters {
+            terminating: vec![redirect],
+            transforming: vec![headers],
+        };
+
+        let config = assemble_config(vec![listener], &[], &[], &route_filters, &Default::default()).unwrap();
 
         let chain = &config.filter_chains[0];
         let names: Vec<_> = chain.filters.iter().map(|f| f.filter.as_str()).collect();
 
-        let redirect_pos = names.iter().position(|n| *n == "redirect");
-        let router_pos = names.iter().position(|n| *n == "router");
-
-        assert!(
-            redirect_pos.is_some() && router_pos.is_some(),
-            "both redirect and router should be in the chain: {names:?}"
-        );
-        assert!(
-            redirect_pos.expect("redirect present") < router_pos.expect("router present"),
-            "redirect must come before router so conditional redirects fire before routing: {names:?}"
+        assert_eq!(
+            names,
+            vec!["request_id", "redirect", "router", "headers", "load_balancer"],
+            "a redirect answers the request its rule has no backend for, so it has to precede the \
+             router's 404; a header modifier changes what the router reads and so has to follow it"
         );
     }
 
@@ -658,7 +682,14 @@ mod tests {
         };
 
         let cluster = build_cluster("v3", vec!["10.0.0.3:80".to_owned()], None);
-        let config = assemble_config(vec![listener], &[route], &[cluster], &[], &hostnames).unwrap();
+        let config = assemble_config(
+            vec![listener],
+            &[route],
+            &[cluster],
+            &RouteFilters::default(),
+            &hostnames,
+        )
+        .unwrap();
 
         let chain = &config.filter_chains[0];
         let router_config = &chain.filters[1].config;

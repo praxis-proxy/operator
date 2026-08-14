@@ -23,10 +23,10 @@ use tracing::debug;
 use crate::{
     config::{
         cluster::{PraxisCluster, build_cluster},
-        filter_conversion::convert_filters,
+        filter_conversion::{RouteFilters, convert_filters},
         generate::assemble_config,
         listener::{PraxisCertificate, PraxisListener, PraxisTls, convert_listener},
-        routing::{BackendRef, PraxisFilterEntry, PraxisRoute, convert_routes},
+        routing::{BackendRef, PraxisRoute, convert_routes},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},
     },
     endpoints,
@@ -82,13 +82,13 @@ pub(super) async fn build_praxis_config(
     let listener_hostnames = build_listener_hostname_map(&supported);
     let praxis_listeners = merge_listeners_by_port(&supported);
     let (praxis_routes, backend_refs) = convert_attached_routes(attached, &listener_hostnames, grants);
-    let extra_filters = collect_filters(attached);
+    let route_filters = collect_filters(attached);
     let clusters = resolve_clusters(client, &backend_refs).await?;
     let config = assemble_config(
         praxis_listeners,
         &praxis_routes,
         &clusters,
-        &extra_filters,
+        &route_filters,
         &listener_hostnames,
     )?;
 
@@ -175,7 +175,7 @@ fn convert_attached_routes(
 }
 
 /// Extracts and converts filters from all attached route rules.
-fn collect_filters(attached: &[AttachedRoute<'_>]) -> Vec<PraxisFilterEntry> {
+fn collect_filters(attached: &[AttachedRoute<'_>]) -> RouteFilters {
     let all_rules: Vec<_> = attached
         .iter()
         .flat_map(|attached| attached.route.spec.rules.as_deref().unwrap_or(&[]))
