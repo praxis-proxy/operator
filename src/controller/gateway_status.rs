@@ -309,7 +309,19 @@ fn gateway_accepted_condition(generation: i64, any_accepted: bool, any_rejected:
     }
 
     if any_rejected {
-        return conditions::accepted(generation, "Gateway accepted, but some listeners are invalid");
+        // Accepted, but the reason has to say why it is not a clean
+        // acceptance. The Gateway API reserves `ListenersNotValid` for
+        // exactly this state — the Gateway stands, some listeners do
+        // not — and conformance asserts on the reason, not just the
+        // status. Reporting `Accepted` here loses the only signal that
+        // distinguishes a fully valid Gateway from a partly broken one.
+        return conditions::make_condition(
+            "Accepted",
+            "True",
+            "ListenersNotValid",
+            "Gateway accepted, but some listeners are invalid",
+            generation,
+        );
     }
 
     conditions::accepted(generation, "Gateway accepted")
@@ -390,8 +402,12 @@ mod tests {
         let cond = gateway_accepted_condition(1, true, true);
         assert_eq!(cond.status, "True", "should be True when some listeners are accepted");
         assert_eq!(
-            cond.reason, "Accepted",
-            "Accepted: True must not carry ListenersNotValid, which is a False-only reason"
+            cond.reason, "ListenersNotValid",
+            "this assertion used to require `Accepted`, on the belief that ListenersNotValid was \
+             a False-only reason. It is not: the GatewayListenerUnsupportedProtocol conformance \
+             case reports `Accepted condition Reason set to Accepted, expected ListenersNotValid` \
+             for a Gateway whose listeners are partly valid. Status stays True — the Gateway is \
+             accepted — while the reason carries the fact that some listeners are not"
         );
         assert!(
             cond.message.contains("some listeners are invalid"),
