@@ -250,7 +250,20 @@ fn dispatch_filter(
     }
 }
 
+/// A rule's traffic predicate, in Praxis `ConditionMatch` form.
+///
+/// Empty for a rule that constrains nothing and so matches every
+/// request.
+///
+/// Filters are chain-level in Praxis, not per-route, so a filter is
+/// confined to its own rule's traffic only as precisely as
+/// `praxis_core::config::ConditionMatch` allows: path, path prefix,
+/// methods and headers. That type has no host field, so two routes
+/// sharing a listener and a path but differing only in hostname still
+/// share their filters. Narrowing that further needs host matching in
+/// the Praxis condition schema.
 type Predicate = yaml_serde::Mapping;
+
 /// Dispatches a `URLRewrite` filter.
 ///
 /// Returns `true` when the hostname rewrite put a `Host` header into
@@ -638,7 +651,7 @@ fn build_redirect_location(redirect: &gateway_api::httproutes::HttpRouteRulesFil
 /// filter.
 fn emit_conditional_timeout(
     rule: &HttpRouteRules,
-    condition: &Option<serde_norway::Value>,
+    condition: &Option<yaml_serde::Value>,
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
     let Some(timeouts) = &rule.timeouts else { return };
@@ -649,13 +662,13 @@ fn emit_conditional_timeout(
         return;
     };
 
-    let mut config = serde_norway::Mapping::new();
+    let mut config = yaml_serde::Mapping::new();
     config.insert(
-        serde_norway::Value::String("timeout_ms".to_owned()),
-        serde_norway::Value::Number(timeout_ms.into()),
+        yaml_serde::Value::String("timeout_ms".to_owned()),
+        yaml_serde::Value::Number(timeout_ms.into()),
     );
 
-    let config = inject_conditions(serde_norway::Value::Mapping(config), condition);
+    let config = inject_conditions(yaml_serde::Value::Mapping(config), condition);
     filters.push(PraxisFilterEntry {
         filter: "timeout".to_owned(),
         config,
@@ -1228,7 +1241,7 @@ mod tests {
 
         assert_eq!(
             filters.first().and_then(|f| f.config.get("timeout_ms")),
-            Some(&serde_norway::Value::Number(500.into())),
+            Some(&yaml_serde::Value::Number(500.into())),
             "Praxis has one timeout to give, and the shorter one is what would fire first anyway"
         );
     }

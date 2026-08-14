@@ -228,9 +228,19 @@ fn unsupported_spec_reason(gw: &Gateway) -> Option<(&'static str, &'static str)>
     None
 }
 
-/// Checks whether a `Gateway` requests specific addresses.
+/// Checks whether a `Gateway` asks for a specific address.
+///
+/// An entry carrying no `value` asks for nothing in particular — the
+/// Gateway API defines it as "assign an address matching the requested
+/// type", which is what the data-plane Service does anyway. Only an
+/// entry naming an address is a request this operator cannot honour.
 fn has_requested_addresses(gw: &Gateway) -> bool {
-    gw.spec.addresses.as_ref().is_some_and(|a| !a.is_empty())
+    gw.spec
+        .addresses
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|address| address.value.is_some())
 }
 
 // -----------------------------------------------------------------------------
@@ -553,6 +563,51 @@ mod tests {
         assert_eq!(
             reason, "UnsupportedAddress",
             "the Gateway API reason for an address this operator cannot assign is UnsupportedAddress"
+        );
+    }
+
+    #[test]
+    fn test_an_address_entry_without_a_value_asks_for_nothing() {
+        let mut gw = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: None,
+        };
+        gw.spec.addresses = Some(vec![GatewayAddresses {
+            r#type: Some("IPAddress".to_owned()),
+            value: None,
+        }]);
+
+        assert!(
+            unsupported_spec_reason(&gw).is_none(),
+            "the Gateway API reads a valueless entry as `assign an address of this type`, which is \
+             what the data-plane Service does regardless — rejecting it refuses a Gateway that \
+             asked for nothing this operator cannot give"
+        );
+    }
+
+    #[test]
+    fn test_one_named_address_rejects_the_whole_gateway() {
+        let mut gw = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: None,
+        };
+        gw.spec.addresses = Some(vec![
+            GatewayAddresses {
+                r#type: Some("IPAddress".to_owned()),
+                value: None,
+            },
+            GatewayAddresses {
+                value: Some("192.0.2.1".to_owned()),
+                ..Default::default()
+            },
+        ]);
+
+        assert!(
+            unsupported_spec_reason(&gw).is_some(),
+            "a valueless entry beside a named one does not excuse the named one, which the \
+             operator still cannot assign"
         );
     }
 
