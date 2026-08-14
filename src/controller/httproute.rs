@@ -288,6 +288,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
+    use crate::testing;
 
     #[test]
     fn test_a_parent_ref_naming_nothing_selects_every_listener() {
@@ -567,5 +568,222 @@ mod tests {
             !route_allowed_by_listeners("apps", "infra", &listeners, None, &[]),
             "a route in another namespace is not allowed by the default policy"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconciliation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_route_naming_no_parent_is_left_alone() {
+        let (ctx, journal) = testing::fake_context(vec![], testing::Cached::default());
+        let mut route = route(&[]);
+        route.spec.parent_refs = None;
+
+        let action = reconcile(Arc::new(route), ctx)
+            .await
+            .expect("skipping is not a failure");
+
+        assert_eq!(action, Action::await_change(), "there is nothing to requeue for");
+        assert!(
+            journal.requests().is_empty(),
+            "a route naming no Gateway is not this operator's to write to"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_route_naming_an_unknown_gateway_is_left_alone() {
+        let (ctx, journal) = testing::fake_context(vec![], testing::Cached::default());
+
+        reconcile(Arc::new(parented_route(parent_ref(None))), ctx)
+            .await
+            .expect("a missing Gateway is not this controller's failure");
+
+        assert!(
+            journal.matching("/status").is_empty(),
+            "writing a rejection for a Gateway that may simply not exist yet would fight whichever \
+             controller does own it once it appears"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_route_naming_another_controllers_gateway_is_left_alone() {
+        let (ctx, journal) = testing::fake_context(
+            vec![gateway_response(), foreign_class_response()],
+            testing::Cached::default(),
+        );
+
+        reconcile(Arc::new(parented_route(parent_ref(None))), ctx)
+            .await
+            .expect("skipping is not a failure");
+
+        assert!(
+            journal.matching("/status").is_empty(),
+            "two controllers writing the same route's status would each undo the other"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_section_name_is_rejected() {
+        let (ctx, journal) = testing::fake_context(
+            vec![gateway_response(), owned_class_response(), route_response()],
+            testing::Cached::default(),
+        );
+
+        reconcile(Arc::new(parented_route(parent_ref(Some("nope")))), ctx)
+            .await
+            .expect("a rejection is a clean outcome");
+
+        assert_eq!(
+            rejection_reason(&journal),
+            Some("NoMatchingParent".to_owned()),
+            "a sectionName no listener answers to has to say so, or the author is left guessing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_hostname_that_intersects_nothing_is_rejected() {
+        let (ctx, journal) = testing::fake_context(
+            vec![hostname_gateway_response(), owned_class_response(), route_response()],
+            testing::Cached::default(),
+        );
+        let mut route = parented_route(parent_ref(None));
+        route.spec.hostnames = Some(vec!["other.example.com".to_owned()]);
+
+        reconcile(Arc::new(route), ctx)
+            .await
+            .expect("a rejection is a clean outcome");
+
+        assert_eq!(
+            rejection_reason(&journal),
+            Some("NoMatchingListenerHostname".to_owned()),
+            "a route whose hostnames miss every listener serves nothing, and the status is the \
+             only place that is visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_acceptable_route_is_left_for_the_gateway_controller() {
+        let (ctx, journal) = testing::fake_context(
+            vec![gateway_response(), owned_class_response(), route_response()],
+            testing::Cached::default(),
+        );
+
+        reconcile(Arc::new(parented_route(parent_ref(None))), ctx)
+            .await
+            .expect("an acceptable route is not a failure");
+
+        assert!(
+            journal.matching("/status").is_empty(),
+            "acceptance waits on the data-plane rollout, which only the Gateway controller knows \
+             about; writing Accepted here would invite traffic to a stale proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_policy_requeues_rather_than_dropping_the_route() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+
+        let action = error_policy(
+            Arc::new(route(&[])),
+            &OperatorError::MissingObjectKey(".metadata.uid"),
+            ctx,
+        );
+
+        assert_eq!(
+            action,
+            Action::requeue(Duration::from_secs(30)),
+            "a route left without a status is indistinguishable from one nobody owns"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Returns the `Accepted` reason from the rejection that was written.
+    fn rejection_reason(journal: &testing::Journal) -> Option<String> {
+        journal
+            .matching("/status")
+            .pop()?
+            .body?
+            .pointer("/status/parents/0/conditions")?
+            .as_array()?
+            .iter()
+            .find(|c| c["type"] == "Accepted")?
+            .get("reason")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// Builds a route naming the test Gateway through `parent`.
+    fn parented_route(parent: HttpRouteParentRefs) -> HTTPRoute {
+        let mut route = route(&[]);
+        route.spec.parent_refs = Some(vec![parent]);
+        route
+    }
+
+    /// The Gateway the fake API server hands back, one plain listener.
+    fn gateway_response() -> testing::Canned {
+        testing::Canned::ok("/gateways/gw", gateway_json(&serde_json::Value::Null))
+    }
+
+    /// The same Gateway, with a hostname on its listener.
+    fn hostname_gateway_response() -> testing::Canned {
+        testing::Canned::ok("/gateways/gw", gateway_json(&serde_json::json!("foo.example.com")))
+    }
+
+    /// Builds the Gateway body, optionally constraining the hostname.
+    fn gateway_json(hostname: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": { "name": "gw", "namespace": "apps" },
+            "spec": {
+                "gatewayClassName": "praxis",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "hostname": hostname,
+                }],
+            },
+        })
+    }
+
+    /// A `GatewayClass` this operator owns.
+    fn owned_class_response() -> testing::Canned {
+        class_response(CONTROLLER_NAME)
+    }
+
+    /// A `GatewayClass` belonging to somebody else.
+    fn foreign_class_response() -> testing::Canned {
+        class_response("example.com/other")
+    }
+
+    /// Builds a `GatewayClass` body naming `controller`.
+    fn class_response(controller: &str) -> testing::Canned {
+        testing::Canned::ok(
+            "/gatewayclasses/praxis",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "GatewayClass",
+                "metadata": { "name": "praxis" },
+                "spec": { "controllerName": controller },
+            }),
+        )
+    }
+
+    /// The object the API server hands back from a route status apply.
+    fn route_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/httproutes/route",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "HTTPRoute",
+                "metadata": { "name": "route", "namespace": "apps" },
+                "spec": {},
+            }),
+        )
     }
 }
