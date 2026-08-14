@@ -98,7 +98,7 @@ impl Stores {
     /// with the cluster; cloning it per Gateway reconcile would give
     /// back much of what the cache saves.
     pub fn routes(&self) -> Vec<Arc<HTTPRoute>> {
-        self.routes.state()
+        sorted(self.routes.state())
     }
 
     /// Returns every cached `ReferenceGrant`.
@@ -108,8 +108,7 @@ impl Stores {
 
     /// Returns cached `ReferenceGrants` in one namespace.
     pub fn grants_in(&self, namespace: &str) -> Vec<ReferenceGrant> {
-        self.grants
-            .state()
+        sorted(self.grants.state())
             .iter()
             .filter(|grant| grant.metadata.namespace.as_deref() == Some(namespace))
             .map(|grant| (**grant).clone())
@@ -145,7 +144,32 @@ where
     K: Resource + Clone + 'static,
     K::DynamicType: Eq + Hash + Clone + Default,
 {
-    store.state().iter().map(|obj| (**obj).clone()).collect()
+    sorted(store.state()).iter().map(|obj| (**obj).clone()).collect()
+}
+
+/// Orders cached objects by namespace and name.
+///
+/// `Store::state` collects the values of an `AHashMap`, so it hands back
+/// a different order from one call to the next. That is fatal here, not
+/// merely untidy: route order reaches the generated Praxis YAML, the
+/// YAML is hashed into the data-plane pod template, and a hash that
+/// changes every reconcile rolls a new `ReplicaSet` every reconcile. The
+/// rollout then never completes, so routes are never accepted and the
+/// Gateway never reports Programmed.
+///
+/// The `LIST` this cache replaced returned API-server order, which is
+/// stable, so nothing downstream had ever needed to sort. Sorting here
+/// restores the property the rest of the pipeline was written against.
+fn sorted<K>(mut objects: Vec<Arc<K>>) -> Vec<Arc<K>>
+where
+    K: Resource + 'static,
+{
+    objects.sort_by(|a, b| {
+        let left = (a.meta().namespace.as_deref(), a.meta().name.as_deref());
+        let right = (b.meta().namespace.as_deref(), b.meta().name.as_deref());
+        left.cmp(&right)
+    });
+    objects
 }
 
 /// Starts a watch feeding a store, and returns the store.
@@ -298,6 +322,34 @@ mod tests {
             rendered.contains("grants: 1"),
             "Debug should surface cache depth, since an unexpectedly empty cache is the \
              failure mode worth seeing in a log: {rendered}"
+        );
+    }
+    #[test]
+    fn test_reads_are_ordered_regardless_of_insertion_order() {
+        let forward = populated(vec![grant("b", "two"), grant("a", "one"), grant("a", "two")], vec![]);
+        let reverse = populated(vec![grant("a", "two"), grant("b", "two"), grant("a", "one")], vec![]);
+
+        let key = |g: &ReferenceGrant| {
+            format!(
+                "{}/{}",
+                g.metadata.namespace.clone().unwrap_or_default(),
+                g.metadata.name.clone().unwrap_or_default()
+            )
+        };
+        let forward_keys: Vec<_> = forward.grants().iter().map(key).collect();
+        let reverse_keys: Vec<_> = reverse.grants().iter().map(key).collect();
+
+        assert_eq!(
+            forward_keys,
+            vec!["a/one".to_owned(), "a/two".to_owned(), "b/two".to_owned()],
+            "cache reads must come back sorted by namespace then name"
+        );
+        assert_eq!(
+            forward_keys, reverse_keys,
+            "the order objects happened to arrive in must not reach the caller. `Store::state` \
+             iterates an AHashMap, and route order flows into the generated Praxis YAML, which \
+             is hashed into the data-plane pod template — an unstable order there rolls a new \
+             ReplicaSet on every reconcile and the rollout never finishes"
         );
     }
 }
