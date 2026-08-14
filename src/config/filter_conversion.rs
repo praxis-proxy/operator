@@ -14,6 +14,14 @@ use tracing::warn;
 use super::routing::PraxisFilterEntry;
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Redirect status used when the route names none, or names one Praxis
+/// cannot accept.
+const DEFAULT_REDIRECT_STATUS: u16 = 302;
+
+// -----------------------------------------------------------------------------
 // HeaderEntry
 // -----------------------------------------------------------------------------
 
@@ -355,7 +363,7 @@ fn emit_conditional_redirect(
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
     let location = build_redirect_location(redirect);
-    let status = u16::try_from(redirect.status_code.unwrap_or(302)).unwrap_or(302);
+    let status = redirect_status(redirect.status_code);
 
     let redirect_config = RedirectFilterConfig { status, location };
 
@@ -368,6 +376,27 @@ fn emit_conditional_redirect(
             });
         },
         Err(err) => warn!(%err, "failed to serialize redirect filter config"),
+    }
+}
+
+/// Maps a Gateway API redirect status onto one Praxis accepts.
+///
+/// Praxis deserializes this field through a `TryFrom<u16>` limited to
+/// 301, 302, 307 and 308, and its filter config denies unknown values,
+/// so an out-of-range status does not degrade one redirect — it fails
+/// the whole document and leaves that Gateway's data plane without a
+/// config. Anything unrecognised falls back to the Gateway API default
+/// rather than being passed through.
+fn redirect_status(status_code: Option<i64>) -> u16 {
+    match status_code {
+        Some(301) => 301,
+        Some(307) => 307,
+        Some(308) => 308,
+        Some(302) | None => DEFAULT_REDIRECT_STATUS,
+        Some(other) => {
+            warn!(status = other, "unsupported redirect status, falling back to 302");
+            DEFAULT_REDIRECT_STATUS
+        },
     }
 }
 
@@ -819,5 +848,41 @@ mod tests {
             }]),
             ..Default::default()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Redirect Status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_supported_redirect_statuses_pass_through() {
+        for code in [301_i64, 302, 307, 308] {
+            assert_eq!(
+                i64::from(redirect_status(Some(code))),
+                code,
+                "Praxis accepts {code} and it should reach the config unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsupported_redirect_status_falls_back() {
+        for code in [200_i64, 303, 399, -1, 99999] {
+            assert_eq!(
+                redirect_status(Some(code)),
+                DEFAULT_REDIRECT_STATUS,
+                "Praxis denies unknown redirect statuses and rejects the whole document, so {code} \
+                 must never be emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_absent_redirect_status_uses_the_spec_default() {
+        assert_eq!(
+            redirect_status(None),
+            302,
+            "the Gateway API default for an unspecified redirect status is 302"
+        );
     }
 }
