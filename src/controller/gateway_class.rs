@@ -67,6 +67,21 @@ use crate::{
 /// The port features come from `parentRefs[].port`, which the
 /// operator now resolves to listeners rather than ignoring.
 ///
+/// `HTTPRouteNamedRouteRule` needs no code at all. The suite gating on
+/// it only checks that a route carrying `rules[].name` still routes,
+/// and that field is already carried and already ignored harmlessly;
+/// nothing validates or rejects it. `GatewayAddressEmpty` is nearly as
+/// cheap: an address entry with no value asks for an address of the
+/// given type rather than a particular one, which is what the
+/// data-plane Service provides regardless.
+///
+/// `GatewayStaticAddresses` stays absent, despite sitting next to it.
+/// That suite hands the Gateway three addresses — invalid, unusable,
+/// and usable — and steps through rejecting, accepting, and finally
+/// programming with the usable one. Satisfying it needs the operator
+/// to bind a requested address on the Service and the cluster to
+/// honour that binding, neither of which exists here.
+///
 /// The two timeout features are claimed with a caveat worth stating.
 /// Praxis's `timeout` filter compares elapsed time in the response
 /// phase, so it converts a late response into a 504 but does not abort
@@ -90,6 +105,7 @@ use crate::{
 /// [`validate_route`]: crate::gateway_api::route_validation::validate_route
 const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
+    "GatewayAddressEmpty",
     "GatewayInfrastructurePropagation",
     "GatewayPort8080",
     "HTTPRoute",
@@ -98,6 +114,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteBackendTimeout",
     "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",
+    "HTTPRouteNamedRouteRule",
     "HTTPRouteParentRefPort",
     "HTTPRoutePathRewrite",
     "HTTPRouteRequestHeaderModification",
