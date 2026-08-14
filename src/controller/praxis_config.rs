@@ -350,8 +350,13 @@ fn sha256_hex(data: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
     use super::*;
-    use crate::controller::fixtures::{https_listener, listener};
+    use crate::{
+        controller::fixtures::{https_listener, listener},
+        testing,
+    };
 
     #[test]
     fn test_sha256_hex_of_empty_string() {
@@ -476,5 +481,237 @@ mod tests {
             "the data plane listens on the same port"
         );
         assert_eq!(ports[0].protocol, Some("TCP".to_owned()), "HTTP listeners are TCP");
+    }
+
+    // -----------------------------------------------------------------------
+    // Config Generation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_gateway_with_one_route_generates_a_routed_config() {
+        let (client, _) = testing::fake_client(vec![backend_service_response(), endpoint_slice_response()]);
+        let route = route();
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        let output = build_praxis_config(&client, &[http_listener()], &attached, &[])
+            .await
+            .expect("the backend resolves");
+
+        assert!(
+            output.config_yaml.contains("10.0.0.1:8080"),
+            "the resolved endpoint has to reach the data plane config: {}",
+            output.config_yaml
+        );
+        assert_eq!(
+            output.listener_ports,
+            vec![("http".to_owned(), 80)],
+            "the container and Service need a port per distinct listener port"
+        );
+        assert!(
+            output.tls_secret_names.is_empty(),
+            "an HTTP listener mounts no certificates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unsupported_listener_contributes_nothing() {
+        let (client, _) = testing::fake_client(vec![]);
+        let mut listener = http_listener();
+        listener.protocol = "TCP".to_owned();
+
+        let output = build_praxis_config(&client, &[listener], &[], &[])
+            .await
+            .expect("a config with no listeners is still a config");
+
+        assert!(
+            output.listener_ports.is_empty(),
+            "binding a port for a protocol the data plane cannot serve would answer requests with \
+             nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_backend_lookup_failure_fails_the_config() {
+        let (client, _) = testing::failing_client();
+        let route = route();
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        let Err(error) = build_praxis_config(&client, &[http_listener()], &attached, &[]).await else {
+            panic!("a 500 from the endpoints API is not an empty backend");
+        };
+
+        assert!(
+            matches!(error, crate::error::OperatorError::Kube(_)),
+            "generating a config with no endpoints because the API server was down would blackhole \
+             live traffic: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_applying_children_writes_all_four_and_returns_the_hash() {
+        let (client, journal) = testing::fake_client(vec![
+            testing::Canned::ok("/configmaps", serde_json::json!({ "kind": "ConfigMap" })),
+            testing::Canned::ok("/deployments", serde_json::json!({ "kind": "Deployment" })),
+            testing::Canned::ok("/services", serde_json::json!({ "kind": "Service" })),
+            testing::Canned::ok(
+                "/poddisruptionbudgets",
+                serde_json::json!({ "kind": "PodDisruptionBudget" }),
+            ),
+        ]);
+        let output = PraxisConfigOutput {
+            config_yaml: "listeners: []\n".to_owned(),
+            listener_ports: vec![("http".to_owned(), 80)],
+            tls_secret_names: vec![],
+        };
+
+        let hash = Box::pin(apply_child_resources(&client, &gateway(), &output))
+            .await
+            .expect("every apply is answered");
+
+        assert_eq!(
+            hash,
+            sha256_hex(&output.config_yaml),
+            "the returned hash is what the pod template is annotated with, so it has to be the \
+             hash of the config that was actually applied"
+        );
+        for kind in ["/configmaps", "/deployments", "/services", "/poddisruptionbudgets"] {
+            assert_eq!(
+                journal.matching(kind).len(),
+                1,
+                "every child resource has to be applied, or the data plane is half-built: {kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_apply_stops_the_rest() {
+        let (client, journal) = testing::failing_client();
+        let output = PraxisConfigOutput {
+            config_yaml: "listeners: []\n".to_owned(),
+            listener_ports: vec![],
+            tls_secret_names: vec![],
+        };
+
+        Box::pin(apply_child_resources(&client, &gateway(), &output))
+            .await
+            .expect_err("a refused ConfigMap is not success");
+
+        assert_eq!(
+            journal.requests().len(),
+            1,
+            "applying a Deployment that points at a ConfigMap the API server refused would start \
+             pods with no config"
+        );
+    }
+
+    #[test]
+    fn test_service_ports_target_the_listener_port() {
+        let ports = build_service_ports(&[("http".to_owned(), 80), ("https".to_owned(), 443)]);
+
+        assert_eq!(ports.len(), 2, "one Service port per listener port");
+        assert_eq!(
+            (ports[0].port, ports[0].target_port.clone()),
+            (80, Some(IntOrString::Int(80))),
+            "the data plane listens on the same port the Service publishes, so the two match"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Builds a plain HTTP listener on port 80.
+    fn http_listener() -> GatewayListeners {
+        GatewayListeners {
+            name: "http".to_owned(),
+            port: 80,
+            protocol: "HTTP".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a route with one backend in the same namespace.
+    fn route() -> gateway_api::httproutes::HTTPRoute {
+        use gateway_api::httproutes::{HTTPRoute, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteSpec};
+
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_owned()),
+                namespace: Some("infra".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                rules: Some(vec![HttpRouteRules {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                        name: "svc".to_owned(),
+                        port: Some(8080),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Builds the Gateway the child resources belong to.
+    fn gateway() -> Gateway {
+        use gateway_api::gateways::GatewaySpec;
+
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_owned()),
+                namespace: Some("infra".to_owned()),
+                uid: Some("uid".to_owned()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "praxis".to_owned(),
+                listeners: vec![http_listener()],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// The backend Service the route names.
+    fn backend_service_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/services/svc",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": "svc", "namespace": "infra" },
+                "spec": { "ports": [{ "port": 8080, "targetPort": 8080 }] },
+            }),
+        )
+    }
+
+    /// One ready endpoint for the route's backend Service.
+    fn endpoint_slice_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/endpointslices",
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSliceList",
+                "metadata": {},
+                "items": [{
+                    "metadata": { "name": "svc-abc", "namespace": "infra" },
+                    "addressType": "IPv4",
+                    "endpoints": [{
+                        "addresses": ["10.0.0.1"],
+                        "conditions": { "ready": true },
+                    }],
+                    "ports": [{ "port": 8080 }],
+                }],
+            }),
+        )
     }
 }
