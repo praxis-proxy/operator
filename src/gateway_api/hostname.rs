@@ -14,23 +14,40 @@ use std::collections::BTreeSet;
 /// Wildcard matching per Gateway API spec: `*.example.com` is a suffix
 /// match that covers any depth (`foo.example.com` and
 /// `foo.bar.example.com`). Matching is bidirectional.
+///
+/// Comparison is ASCII case-insensitive: DNS names are case-insensitive
+/// per RFC 1123 section 2.1 and RFC 4343 section 1.
 pub(crate) fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
-    if route_host == listener_host {
+    if route_host.eq_ignore_ascii_case(listener_host) {
         return true;
     }
-    if let Some(suffix) = listener_host.strip_prefix("*")
-        && route_host.len() > suffix.len()
-        && route_host.ends_with(suffix)
-    {
-        return true;
+    wildcard_covers(listener_host, route_host) || wildcard_covers(route_host, listener_host)
+}
+
+/// Returns `true` when `wildcard` is a `*.` pattern covering `candidate`.
+///
+/// The wildcard label must be the whole first label, so only a literal
+/// `*.` prefix is honoured; `*foo.com` is not a wildcard. The retained
+/// dot separator is what stops `*.example.com` from covering
+/// `fooexample.com`.
+fn wildcard_covers(wildcard: &str, candidate: &str) -> bool {
+    if !wildcard.starts_with("*.") {
+        return false;
     }
-    if let Some(suffix) = route_host.strip_prefix("*")
-        && listener_host.len() > suffix.len()
-        && listener_host.ends_with(suffix)
-    {
-        return true;
+    let Some(suffix) = wildcard.strip_prefix('*') else {
+        return false;
+    };
+
+    let Some(start) = candidate.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    if start == 0 {
+        return false;
     }
-    false
+
+    candidate
+        .get(start..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 /// Computes the intersection of a route hostname with a listener hostname.
@@ -43,7 +60,7 @@ pub(crate) fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
 /// intersects to `foo.example.com`; `bar.other.com` on the same listener
 /// yields `None`. See `test_intersection_route_exact_listener_wildcard`.
 pub(crate) fn hostname_intersection(route_host: &str, listener_host: &str) -> Option<String> {
-    if route_host == listener_host {
+    if route_host.eq_ignore_ascii_case(listener_host) {
         return Some(route_host.to_owned());
     }
     if listener_host.starts_with("*.") && hostname_matches(route_host, listener_host) {
@@ -77,7 +94,7 @@ pub(crate) fn intersect_hostnames(route_hostnames: &[String], listener_hostnames
     for rh in route_hostnames {
         for lh in &constrained {
             if let Some(intersected) = hostname_intersection(rh, lh) {
-                if seen.insert(intersected.clone()) {
+                if seen.insert(intersected.to_ascii_lowercase()) {
                     result.push(intersected);
                 }
                 break;
@@ -349,6 +366,76 @@ mod tests {
             result,
             vec!["example.org".to_owned(), "other.com".to_owned()],
             "presence of unconstrained listener should pass all route hostnames"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 1123 section 2.1 / RFC 4343 section 1: DNS names are
+    // case-insensitive.
+    // -----------------------------------------------------------------------
+
+    /// RFC 1123 section 2.1: host names are matched without regard to case.
+    #[test]
+    fn test_rfc1123_exact_hostname_match_is_case_insensitive() {
+        assert!(
+            hostname_matches("Example.COM", "example.com"),
+            "exact hostnames differing only in case must match per RFC 1123 s2.1"
+        );
+    }
+
+    /// RFC 4343 section 1: DNS name comparison is case-insensitive.
+    #[test]
+    fn test_rfc4343_wildcard_hostname_match_is_case_insensitive() {
+        assert!(
+            hostname_matches("FOO.Example.com", "*.example.COM"),
+            "wildcard matching must ignore case per RFC 4343 s1"
+        );
+    }
+
+    /// RFC 4343 section 1: case-insensitive comparison applies to
+    /// intersection as well as matching.
+    #[test]
+    fn test_rfc4343_intersection_is_case_insensitive() {
+        assert_eq!(
+            hostname_intersection("Foo.Example.com", "*.example.com"),
+            Some("Foo.Example.com".to_owned()),
+            "intersection must match case-insensitively and preserve the route's spelling"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_requires_dot_separator() {
+        assert!(
+            !hostname_matches("fooexample.com", "*.example.com"),
+            "wildcard must not match a host that merely ends with the domain text"
+        );
+    }
+
+    #[test]
+    fn test_bare_star_prefix_is_not_a_wildcard() {
+        assert!(
+            !hostname_matches("bar.foo.com", "*foo.com"),
+            "a wildcard label must be a whole label, so *foo.com is not a wildcard"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_does_not_match_its_own_bare_domain_case_insensitively() {
+        assert!(
+            !hostname_matches("Example.com", "*.EXAMPLE.com"),
+            "bare domain must not match its wildcard regardless of case"
+        );
+    }
+
+    #[test]
+    fn test_intersect_dedups_case_variants() {
+        let route = &["Foo.Example.com".to_owned(), "foo.example.com".to_owned()];
+        let listeners = &[Some("*.example.com".to_owned())];
+
+        assert_eq!(
+            intersect_hostnames(route, listeners).len(),
+            1,
+            "hostnames differing only in case must dedup to a single entry"
         );
     }
 }
