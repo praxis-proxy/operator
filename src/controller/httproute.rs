@@ -17,14 +17,13 @@ use gateway_api::{
 };
 use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::Condition};
 use kube::{Api, ResourceExt as _, runtime::controller::Action};
-use serde_json::Value;
 use tracing::{debug, error, info};
 
 use super::namespace_filter;
 use crate::{
     context::{CONTROLLER_NAME, Context},
     error::{OperatorError, Result},
-    gateway_api::{conditions, hostname, route_status},
+    gateway_api::{conditions, hostname, route_status, status_types::RouteParentStatus},
 };
 
 // -----------------------------------------------------------------------------
@@ -84,7 +83,7 @@ async fn collect_rejection_statuses(
     route_ns: &str,
     generation: i64,
     ctx: &Context,
-) -> Vec<Value> {
+) -> Vec<RouteParentStatus> {
     let mut statuses = Vec::new();
     for parent_ref in parent_refs {
         if let Some(status) = build_rejection_status(route, parent_ref, route_ns, generation, ctx).await {
@@ -106,7 +105,7 @@ async fn build_rejection_status(
     route_ns: &str,
     generation: i64,
     ctx: &Context,
-) -> Option<Value> {
+) -> Option<RouteParentStatus> {
     if !route_status::is_gateway_parent_ref(parent_ref) {
         return None;
     }

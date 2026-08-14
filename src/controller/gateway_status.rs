@@ -17,7 +17,7 @@ use kube::{
     Api, ResourceExt as _,
     api::{Patch, PatchParams},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{debug, info};
 
 use super::listener_validation;
@@ -25,7 +25,11 @@ use crate::{
     context::{Context, FIELD_MANAGER},
     error::Result,
     gateway_api::{
-        attachment::AttachedRoute, conditions, hostname, listener_conflict, protocol::ListenerProtocol, status,
+        attachment::AttachedRoute,
+        conditions, hostname, listener_conflict,
+        protocol::ListenerProtocol,
+        status,
+        status_types::{self, GatewayAddress, GatewayStatus, ListenerStatus},
     },
     observability::metrics,
     resources::labels::child_name,
@@ -57,40 +61,18 @@ pub(super) async fn build_and_apply_gateway_status(
         build_listener_statuses(listeners, generation, &ns, ctx, attached).await;
 
     let data_plane_ready = deployment_ready && !addresses.is_empty();
-    let status = gateway_status_json(&GatewayStatusParts {
-        accepted: &gateway_accepted_condition(generation, any_accepted, any_rejected),
-        addresses: &addresses,
-        listener_statuses: &listener_statuses,
-        programmed: &gateway_programmed_condition(generation, any_accepted, data_plane_ready),
-    });
+    let status = serde_json::to_value(GatewayStatus {
+        conditions: vec![
+            gateway_accepted_condition(generation, any_accepted, any_rejected),
+            gateway_programmed_condition(generation, any_accepted, data_plane_ready),
+        ],
+        addresses,
+        listeners: listener_statuses,
+    })?;
 
     apply_gateway_status(client, gw, &status).await?;
     info!("Gateway {ns}/{name} reconciled successfully");
     Ok(())
-}
-
-/// Components used to build the Gateway status JSON payload.
-struct GatewayStatusParts<'a> {
-    /// Gateway-level `Accepted` condition.
-    accepted: &'a Condition,
-
-    /// Load-balancer addresses.
-    addresses: &'a [Value],
-
-    /// Per-listener status entries.
-    listener_statuses: &'a [Value],
-
-    /// Gateway-level `Programmed` condition.
-    programmed: &'a Condition,
-}
-
-/// Constructs the `status` sub-object of the Gateway status patch.
-fn gateway_status_json(parts: &GatewayStatusParts<'_>) -> Value {
-    json!({
-        "addresses": parts.addresses,
-        "conditions": [parts.accepted, parts.programmed],
-        "listeners": parts.listener_statuses,
-    })
 }
 
 /// Patches the Gateway status via server-side apply.
@@ -115,12 +97,7 @@ pub(super) async fn apply_gateway_status(client: &kube::Client, gw: &Gateway, st
     }
     metrics::global().record_status_written();
 
-    let payload = json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": { "name": name, "namespace": ns },
-        "status": desired,
-    });
+    let payload = status_types::status_patch("Gateway", &name, Some(&ns), desired);
 
     Api::<Gateway>::namespaced(client.clone(), &ns)
         .patch_status(
@@ -133,7 +110,7 @@ pub(super) async fn apply_gateway_status(client: &kube::Client, gw: &Gateway, st
 }
 
 /// Queries the child Service for load-balancer ingress IP addresses.
-async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> Vec<Value> {
+async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> Vec<GatewayAddress> {
     Api::<Service>::namespaced(client.clone(), ns)
         .get(child)
         .await
@@ -144,7 +121,7 @@ async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> V
         .map(|ingress| {
             ingress
                 .iter()
-                .filter_map(|i| i.ip.as_ref().map(|ip| json!({ "type": "IPAddress", "value": ip })))
+                .filter_map(|i| i.ip.as_deref().map(GatewayAddress::ip))
                 .collect()
         })
         .unwrap_or_default()
@@ -172,7 +149,7 @@ async fn build_listener_statuses(
     gateway_ns: &str,
     ctx: &Context,
     attached: &[AttachedRoute<'_>],
-) -> (Vec<Value>, bool, bool) {
+) -> (Vec<ListenerStatus>, bool, bool) {
     let conflicts = listener_conflict::detect_conflicts(listeners);
     let mut statuses = Vec::new();
     let mut any_accepted = false;
@@ -210,36 +187,30 @@ fn conflicted_listener_status(
     l: &GatewayListeners,
     generation: i64,
     reason: listener_conflict::ConflictReason,
-) -> Value {
-    json!({
-        "name": l.name,
-        "attachedRoutes": 0,
-        "supportedKinds": [],
-        "conditions": [
+) -> ListenerStatus {
+    ListenerStatus {
+        name: l.name.clone(),
+        attached_routes: 0,
+        supported_kinds: vec![],
+        conditions: vec![
             conditions::not_accepted(generation, reason.as_str(), reason.message()),
             conditions::conflicted(generation, reason.as_str(), reason.message()),
             conditions::not_programmed(generation, reason.as_str(), reason.message()),
         ],
-    })
+    }
 }
 
 /// Builds a status entry for an unsupported-protocol listener.
-fn unsupported_listener_status(l: &GatewayListeners, generation: i64) -> Value {
-    json!({
-        "name": l.name,
-        "attachedRoutes": 0,
-        "supportedKinds": [],
-        "conditions": [
-            conditions::not_accepted(
-                generation,
-                "UnsupportedProtocol",
-                "protocol not supported",
-            ),
-            conditions::not_programmed(
-                generation, "Invalid", "unsupported protocol",
-            ),
+fn unsupported_listener_status(l: &GatewayListeners, generation: i64) -> ListenerStatus {
+    ListenerStatus {
+        name: l.name.clone(),
+        attached_routes: 0,
+        supported_kinds: vec![],
+        conditions: vec![
+            conditions::not_accepted(generation, "UnsupportedProtocol", "protocol not supported"),
+            conditions::not_programmed(generation, "Invalid", "unsupported protocol"),
         ],
-    })
+    }
 }
 
 /// Counts routes attached to a specific listener.
@@ -269,7 +240,7 @@ async fn accepted_listener_status(
     gateway_ns: &str,
     ctx: &Context,
     count: usize,
-) -> Value {
+) -> ListenerStatus {
     let (supported_kinds, resolved_refs_condition) =
         listener_validation::listener_resolved_refs(l, generation, gateway_ns, ctx).await;
 
@@ -280,17 +251,17 @@ async fn accepted_listener_status(
         conditions::not_programmed(generation, "Invalid", "listener has unresolved refs")
     };
 
-    json!({
-        "name": l.name,
-        "attachedRoutes": count,
-        "supportedKinds": supported_kinds,
-        "conditions": [
+    ListenerStatus {
+        name: l.name.clone(),
+        attached_routes: count,
+        supported_kinds,
+        conditions: vec![
             conditions::accepted(generation, "listener accepted"),
             programmed_condition,
             conditions::no_conflicts(generation),
             resolved_refs_condition,
         ],
-    })
+    }
 }
 
 /// Returns the `Accepted` condition for the Gateway.
