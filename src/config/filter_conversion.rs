@@ -91,6 +91,41 @@ struct RedirectFilterConfig {
 }
 
 // -----------------------------------------------------------------------------
+// RouteFilters
+// -----------------------------------------------------------------------------
+
+/// The filters one Gateway's routes contribute, split by where in the
+/// chain they have to run.
+///
+/// Praxis evaluates a chain in order and the `router` filter sits in the
+/// middle of it, so a route filter's position is not a matter of taste.
+/// The router picks a cluster from the request's path and `Host` header,
+/// reading `ctx.rewritten_path` in preference to the original URI, and
+/// rejects with 404 when nothing matches.
+///
+/// That splits route filters in two. A filter that answers the request
+/// itself belongs before the router, because the rule it came from has
+/// no backend and therefore no route for the router to find. A filter
+/// that changes what the router reads — the path or the `Host` header —
+/// belongs after it, because Gateway API selects the rule from the
+/// request as it arrived and applies the rule's transformations to what
+/// is forwarded upstream.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RouteFilters {
+    /// Filters that answer the request without an upstream.
+    ///
+    /// Run before the router, which would otherwise 404 the traffic
+    /// they exist to serve.
+    pub terminating: Vec<PraxisFilterEntry>,
+
+    /// Filters that reshape a request the router has already placed.
+    ///
+    /// Run after the router, so route selection sees the request the
+    /// client sent.
+    pub transforming: Vec<PraxisFilterEntry>,
+}
+
+// -----------------------------------------------------------------------------
 // Filter Conversion
 // -----------------------------------------------------------------------------
 
@@ -100,15 +135,15 @@ struct RedirectFilterConfig {
 /// filters (`conditions`) derived from the rule's path match. This ensures
 /// header modifications and redirects apply only to traffic matching the
 /// originating rule.
-pub fn convert_filters(rules: &[HttpRouteRules]) -> Vec<PraxisFilterEntry> {
+pub fn convert_filters(rules: &[HttpRouteRules]) -> RouteFilters {
     let scoped = scope_rules(rules);
-    let mut filters = Vec::new();
+    let mut filters = RouteFilters::default();
     for (index, rule) in rules.iter().enumerate() {
         let condition = rule_conditions(index, &scoped);
         let has_backends = rule.backend_refs.as_ref().is_some_and(|refs| !refs.is_empty());
         let has_redirect = rule_has_redirect(rule);
         if !has_backends && !has_redirect {
-            emit_no_backend_response(&condition, &mut filters);
+            emit_no_backend_response(&condition, &mut filters.terminating);
         }
         if rule.filters.is_some() {
             convert_rule_filters(rule, &condition, &mut filters);
@@ -126,11 +161,7 @@ fn rule_has_redirect(rule: &HttpRouteRules) -> bool {
 }
 
 /// Converts filters from a single rule into conditional filter entries.
-fn convert_rule_filters(
-    rule: &HttpRouteRules,
-    condition: &Option<yaml_serde::Value>,
-    filters: &mut Vec<PraxisFilterEntry>,
-) {
+fn convert_rule_filters(rule: &HttpRouteRules, condition: &Option<yaml_serde::Value>, filters: &mut RouteFilters) {
     let Some(rule_filters) = &rule.filters else {
         return;
     };
@@ -143,7 +174,7 @@ fn convert_rule_filters(
     }
 
     if has_header_mods {
-        emit_conditional_header_filter(&header_config, condition, filters);
+        emit_conditional_header_filter(&header_config, condition, &mut filters.transforming);
     }
 }
 
@@ -154,14 +185,14 @@ fn dispatch_filter(
     filter: &HttpRouteRulesFilters,
     condition: &Option<yaml_serde::Value>,
     header_config: &mut HeaderFilterConfig,
-    filters: &mut Vec<PraxisFilterEntry>,
+    filters: &mut RouteFilters,
 ) -> bool {
     match &filter.r#type {
         HttpRouteRulesFiltersType::RequestHeaderModifier => dispatch_request_header(filter, header_config),
         HttpRouteRulesFiltersType::ResponseHeaderModifier => dispatch_response_header(filter, header_config),
         HttpRouteRulesFiltersType::RequestRedirect => {
             if let Some(redirect) = &filter.request_redirect {
-                emit_conditional_redirect(redirect, condition, filters);
+                emit_conditional_redirect(redirect, condition, &mut filters.terminating);
             }
             false
         },
@@ -266,12 +297,7 @@ fn rule_conditions(index: usize, scoped: &[ScopedRule]) -> Option<yaml_serde::Va
         conditions.push(condition_entry("unless", predicate));
     }
 
-    let entry = yaml_serde::Mapping::from_iter([(
-        yaml_serde::Value::String("when".to_owned()),
-        yaml_serde::Value::Mapping(predicate),
-    )]);
-
-    Some(yaml_serde::Value::Sequence(vec![yaml_serde::Value::Mapping(entry)]))
+    (!conditions.is_empty()).then(|| yaml_serde::Value::Sequence(conditions))
 }
 
 /// Collects the distinct predicates of the rules that outrank `own`.
@@ -292,7 +318,6 @@ fn condition_entry(keyword: &str, predicate: &Predicate) -> yaml_serde::Value {
         yaml_serde::Value::String(keyword.to_owned()),
         yaml_serde::Value::Mapping(predicate.clone()),
     )]))
->>>>>>> ac1f7e7 (fix: scope a rule's filters against the rules that outrank it)
 }
 
 /// Adds the path constraint to a filter predicate.
@@ -532,7 +557,7 @@ fn emit_conditional_header_filter(
 }
 
 /// Emits a `static_response` filter returning 500 for rules with no backends.
-fn emit_no_backend_response(rule: &HttpRouteRules, filters: &mut Vec<PraxisFilterEntry>) {
+fn emit_no_backend_response(condition: &Option<yaml_serde::Value>, filters: &mut Vec<PraxisFilterEntry>) {
     let mut config = yaml_serde::Mapping::new();
     config.insert(
         yaml_serde::Value::String("status".to_owned()),
@@ -542,7 +567,7 @@ fn emit_no_backend_response(rule: &HttpRouteRules, filters: &mut Vec<PraxisFilte
         yaml_serde::Value::String("body".to_owned()),
         yaml_serde::Value::String("no backends available".to_owned()),
     );
-    let config = inject_conditions(yaml_serde::Value::Mapping(config), &condition);
+    let config = inject_conditions(yaml_serde::Value::Mapping(config), condition);
     filters.push(PraxisFilterEntry {
         filter: "static_response".to_owned(),
         config,
@@ -605,10 +630,15 @@ mod tests {
 
         let filters = convert_filters(&rules);
 
-        assert_eq!(filters.len(), 1, "should produce one header filter");
-        assert_eq!(filters[0].filter, "headers", "filter name should be headers");
+        let transforming = &filters.transforming;
+        assert_eq!(transforming.len(), 1, "should produce one header filter");
+        assert_eq!(transforming[0].filter, "headers", "filter name should be headers");
+        assert!(
+            filters.terminating.is_empty(),
+            "a header modifier does not answer the request, so nothing runs before the router"
+        );
 
-        let config_str = yaml_serde::to_string(&filters[0].config).unwrap();
+        let config_str = yaml_serde::to_string(&transforming[0].config).unwrap();
         assert!(
             config_str.contains("request_add"),
             "should have request_add for added headers"
@@ -652,8 +682,8 @@ mod tests {
 
         let filters = convert_filters(&rules);
 
-        assert_eq!(filters.len(), 1, "should produce one header filter");
-        let config_str = yaml_serde::to_string(&filters[0].config).unwrap();
+        assert_eq!(filters.transforming.len(), 1, "should produce one header filter");
+        let config_str = yaml_serde::to_string(&filters.transforming[0].config).unwrap();
         assert!(config_str.contains("X-Response"), "should contain response header");
         assert!(
             config_str.contains("X-Remove-Response"),
@@ -683,10 +713,15 @@ mod tests {
 
         let filters = convert_filters(&rules);
 
-        assert_eq!(filters.len(), 1, "should produce one redirect filter");
-        assert_eq!(filters[0].filter, "redirect", "filter name should be redirect");
+        let terminating = &filters.terminating;
+        assert_eq!(terminating.len(), 1, "should produce one redirect filter");
+        assert_eq!(terminating[0].filter, "redirect", "filter name should be redirect");
+        assert!(
+            filters.transforming.is_empty(),
+            "a redirect answers the request itself and never reaches an upstream"
+        );
 
-        let config_str = yaml_serde::to_string(&filters[0].config).unwrap();
+        let config_str = yaml_serde::to_string(&terminating[0].config).unwrap();
         assert!(config_str.contains("302"), "should contain status code");
         assert!(
             config_str.contains("https://example.com:443"),
@@ -731,14 +766,13 @@ mod tests {
 
         let filters = convert_filters(&rules);
 
-        assert_eq!(filters.len(), 2, "should produce two filters");
         assert!(
-            filters.iter().any(|f| f.filter == "redirect"),
-            "should have redirect filter"
+            filters.terminating.iter().any(|f| f.filter == "redirect"),
+            "the redirect answers the request, so it runs before the router"
         );
         assert!(
-            filters.iter().any(|f| f.filter == "headers"),
-            "should have headers filter"
+            filters.transforming.iter().any(|f| f.filter == "headers"),
+            "the header modifier reshapes a routed request, so it runs after the router"
         );
     }
 
@@ -798,9 +832,10 @@ mod tests {
 
         let filters = convert_filters(&rules);
 
-        assert_eq!(filters.len(), 2, "should produce one filter per rule");
+        let transforming = &filters.transforming;
+        assert_eq!(transforming.len(), 2, "should produce one filter per rule");
 
-        let first_yaml = yaml_serde::to_string(&filters[0].config).unwrap();
+        let first_yaml = yaml_serde::to_string(&transforming[0].config).unwrap();
         assert!(
             first_yaml.contains("X-First"),
             "first filter should have X-First header"
@@ -814,7 +849,7 @@ mod tests {
             "first filter should be conditioned on /set"
         );
 
-        let second_yaml = yaml_serde::to_string(&filters[1].config).unwrap();
+        let second_yaml = yaml_serde::to_string(&transforming[1].config).unwrap();
         assert!(
             second_yaml.contains("X-Second"),
             "second filter should have X-Second header"

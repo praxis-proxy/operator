@@ -29,6 +29,7 @@ use gateway_api::{gateways::GatewayListeners, httproutes::HTTPRoute};
 use praxis_operator::{
     config::{
         cluster::{PraxisCluster, build_cluster},
+        filter_conversion::RouteFilters,
         generate::assemble_config,
         listener::convert_listener,
         routing::{BackendRef, convert_routes},
@@ -111,10 +112,16 @@ fn generate_config(listeners: &[GatewayListeners], routes: &[Arc<HTTPRoute>]) ->
     let (praxis_routes, backend_refs) = convert_routes(&attached, &listener_hostnames, &[]);
     let clusters = synthesize_clusters(&backend_refs);
 
-    assemble_config(praxis_listeners, &praxis_routes, &clusters, &[], &listener_hostnames)
-        .ok()
-        .and_then(|config| yaml_serde::to_string(&config).ok())
-        .map_or(0, |yaml| yaml.len())
+    assemble_config(
+        praxis_listeners,
+        &praxis_routes,
+        &clusters,
+        &RouteFilters::default(),
+        &listener_hostnames,
+    )
+    .ok()
+    .and_then(|config| yaml_serde::to_string(&config).ok())
+    .map_or(0, |yaml| yaml.len())
 }
 
 /// Builds clusters with fixed endpoints, standing in for the API reads
