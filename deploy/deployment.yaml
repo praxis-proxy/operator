@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: praxis-operator
     app.kubernetes.io/managed-by: praxis-operator
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: praxis-operator
@@ -32,6 +32,14 @@ spec:
           env:
             - name: PRAXIS_IMAGE
               value: "__PRAXIS_IMAGE__"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: observability
               containerPort: 8080

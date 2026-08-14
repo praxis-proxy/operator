@@ -26,6 +26,10 @@ pub(crate) enum OperatorError {
     #[error("gatewayclass not found: {0}")]
     GatewayClassNotFound(String),
 
+    /// Leadership was taken by another replica.
+    #[error("leadership lost to another replica")]
+    LeadershipLost,
+
     /// Serialization failed.
     #[error("serialization: {0}")]
     Serialization(#[from] serde_json::Error),
