@@ -25,6 +25,7 @@ use futures::StreamExt as _;
 use k8s_openapi::api::{
     apps::v1::Deployment,
     core::v1::{ConfigMap, Service},
+    policy::v1::PodDisruptionBudget,
 };
 use kube::{
     Api, Client,
@@ -148,20 +149,7 @@ fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
     let controller = Controller::new(Api::<Gateway>::all(client.clone()), watcher::Config::default());
     let gateways = controller.store();
 
-    controller
-        .owns(Api::<Deployment>::all(client.clone()), managed_children())
-        .owns(Api::<ConfigMap>::all(client.clone()), managed_children())
-        .owns(Api::<Service>::all(client.clone()), managed_children())
-        .watches(
-            Api::<HTTPRoute>::all(client.clone()),
-            watcher::Config::default(),
-            |route| controller::gateway::map_route_to_gateway(&route),
-        )
-        .watches(
-            Api::<ReferenceGrant>::all(client.clone()),
-            watcher::Config::default(),
-            move |grant| controller::gateway::map_grant_to_gateways(&grant, &gateways.state()),
-        )
+    with_gateway_watches(controller, client, gateways)
         .shutdown_on_signal()
         .run(controller::gateway::reconcile, controller::gateway::error_policy, ctx)
         .for_each(|res| async move {
@@ -176,6 +164,33 @@ fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
                 },
             }
         })
+}
+
+/// Registers the owned children and cross-references a Gateway depends
+/// on.
+///
+/// Child watches carry the managed-by selector so the operator never
+/// deserializes unrelated cluster objects.
+fn with_gateway_watches(
+    controller: Controller<Gateway>,
+    client: &Client,
+    gateways: kube::runtime::reflector::Store<Gateway>,
+) -> Controller<Gateway> {
+    controller
+        .owns(Api::<Deployment>::all(client.clone()), managed_children())
+        .owns(Api::<ConfigMap>::all(client.clone()), managed_children())
+        .owns(Api::<Service>::all(client.clone()), managed_children())
+        .owns(Api::<PodDisruptionBudget>::all(client.clone()), managed_children())
+        .watches(
+            Api::<HTTPRoute>::all(client.clone()),
+            watcher::Config::default(),
+            |route| controller::gateway::map_route_to_gateway(&route),
+        )
+        .watches(
+            Api::<ReferenceGrant>::all(client.clone()),
+            watcher::Config::default(),
+            move |grant| controller::gateway::map_grant_to_gateways(&grant, &gateways.state()),
+        )
 }
 
 /// Watcher config scoped to the child resources this operator manages.

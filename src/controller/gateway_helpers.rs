@@ -53,6 +53,7 @@ use crate::{
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
+        disruption::build_pod_disruption_budget,
         labels::child_name,
         service::build_service,
     },
@@ -511,6 +512,9 @@ pub(super) async fn apply_child_resources(
     let ports = build_service_ports(&config_output.listener_ports);
     let svc = build_service(&child, &ns, gw, ports)?;
     super::gateway::apply_resource(client, &ns, &svc).await?;
+
+    let budget = build_pod_disruption_budget(&child, &ns, gw)?;
+    super::gateway::apply_resource(client, &ns, &budget).await?;
 
     Ok(config_hash)
 }
