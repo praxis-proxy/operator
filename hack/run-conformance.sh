@@ -59,7 +59,6 @@ go test ./conformance -run TestConformance \
     -args \
     --gateway-class="${GATEWAY_CLASS}" \
     --conformance-profiles=GATEWAY-HTTP \
-    --skip-tests=HTTPRouteReferenceGrant,HTTPRoutePartiallyInvalidViaInvalidReferenceGrant,HTTPRouteHostnameIntersection,HTTPRouteListenerHostnameMatching,HTTPRouteRequestHeaderModifier \
     --timeout-config-overrides="MaxTimeToConsistency:${MAX_CONSISTENCY};NamespacesMustBeReady:${NS_READY}" \
     --allow-crds-mismatch \
     --report-output=/tmp/conformance-report.yaml \

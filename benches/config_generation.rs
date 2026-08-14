@@ -113,7 +113,7 @@ fn generate_config(listeners: &[GatewayListeners], routes: &[Arc<HTTPRoute>]) ->
 
     assemble_config(praxis_listeners, &praxis_routes, &clusters, &[], &listener_hostnames)
         .ok()
-        .and_then(|config| serde_norway::to_string(&config).ok())
+        .and_then(|config| yaml_serde::to_string(&config).ok())
         .map_or(0, |yaml| yaml.len())
 }
 
