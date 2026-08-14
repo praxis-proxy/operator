@@ -3,6 +3,8 @@
 
 //! Full Praxis YAML configuration assembly.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use super::{
@@ -208,24 +210,40 @@ fn sort_routes_by_specificity_owned(routes: &mut [PraxisRoute]) {
     routes.sort_by_key(route_sort_key);
 }
 
-/// Returns a sort key `(priority, reverse_len, host_absent, headers_absent)`.
+/// Returns a sort key `(priority, reverse_len, host_absent,
+/// reverse_constraint_count)`.
 ///
 /// Lower values sort first. Exact matches get priority 0, prefix
 /// matches get priority 1. Within each tier, longer paths sort first
 /// via [`std::cmp::Reverse`]. Host-constrained routes precede
-/// unconstrained, and header-constrained precede unconstrained.
-fn route_sort_key(route: &PraxisRoute) -> (u8, std::cmp::Reverse<usize>, bool, bool) {
-    if route.path.is_some() {
-        let len = route.path.as_ref().map_or(0, String::len);
-        (0, std::cmp::Reverse(len), route.host.is_none(), route.headers.is_none())
+/// unconstrained, and among the rest the route carrying the most
+/// header, query and method constraints wins.
+fn route_sort_key(route: &PraxisRoute) -> (u8, std::cmp::Reverse<usize>, bool, std::cmp::Reverse<usize>) {
+    let (tier, length) = if route.path.is_some() {
+        (0, route.path.as_ref().map_or(0, String::len))
     } else {
-        (
-            1,
-            std::cmp::Reverse(route.path_prefix.len()),
-            route.host.is_none(),
-            route.headers.is_none(),
-        )
-    }
+        (1, route.path_prefix.len())
+    };
+
+    (
+        tier,
+        std::cmp::Reverse(length),
+        route.host.is_none(),
+        std::cmp::Reverse(extra_constraints(route)),
+    )
+}
+
+/// Counts the non-path constraints a route carries.
+///
+/// Two routes matching the same path are ordered by how specific they
+/// are, so a rule constrained by a method or a query parameter is
+/// evaluated before an otherwise identical unconstrained one.
+fn extra_constraints(route: &PraxisRoute) -> usize {
+    let headers = route.headers.as_ref().map_or(0, BTreeMap::len);
+    let query = route.query_params.as_ref().map_or(0, BTreeMap::len);
+    let method = usize::from(route.method.is_some());
+
+    headers + query + method
 }
 
 /// Builds the `router` filter entry from matched routes.
@@ -305,6 +323,8 @@ mod tests {
             path_prefix: "/api/".to_owned(),
             host: None,
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "default~my-svc~8080".to_owned(),
             listener_names: vec![],
         };
@@ -358,6 +378,8 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: None,
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "default~svc~80".to_owned(),
             listener_names: vec![],
         };
@@ -418,6 +440,8 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: None,
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "default~svc~80".to_owned(),
             listener_names: vec![],
         };
@@ -462,6 +486,8 @@ mod tests {
             path_prefix: "/api/".to_owned(),
             host: None,
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "test-cluster".to_owned(),
             listener_names: vec![],
         };
@@ -548,6 +574,8 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: Some("bar.com".to_owned()),
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "v1".to_owned(),
             listener_names: vec![Some("listener-1".to_owned())],
         };
@@ -557,6 +585,8 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: Some("foo.bar.com".to_owned()),
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "v2".to_owned(),
             listener_names: vec![Some("listener-2".to_owned())],
         };
@@ -566,6 +596,8 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: Some("*.bar.com".to_owned()),
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "v3".to_owned(),
             listener_names: vec![Some("listener-3".to_owned())],
         };
@@ -651,6 +683,8 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: None,
             headers: None,
+            method: None,
+            query_params: None,
             cluster: "v3".to_owned(),
             listener_names: vec![Some("l3".to_owned()), Some("l4".to_owned())],
         };

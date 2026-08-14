@@ -44,6 +44,10 @@ pub(crate) struct PraxisRoute {
     #[serde(skip)]
     pub(crate) listener_names: Vec<Option<String>>,
 
+    /// HTTP method to match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) method: Option<String>,
+
     /// Exact path match. Takes precedence over `path_prefix`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
@@ -51,6 +55,10 @@ pub(crate) struct PraxisRoute {
     /// Path prefix match. Must end with '/'.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) path_prefix: String,
+
+    /// Query parameters to match (exact match only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) query_params: Option<BTreeMap<String, String>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -369,28 +377,18 @@ fn emit_catchall_routes(
     section_names: &[Option<String>],
     out: &mut Vec<PraxisRoute>,
 ) {
-    let path_prefix = "/".to_owned();
-    if hostnames.is_empty() {
-        out.push(PraxisRoute {
-            path: None,
-            path_prefix,
-            host: None,
-            headers: None,
-            cluster: cluster.to_owned(),
-            listener_names: section_names.to_vec(),
-        });
-    } else {
-        for hostname in hostnames {
-            out.push(PraxisRoute {
-                path: None,
-                path_prefix: path_prefix.clone(),
-                host: Some(hostname.clone()),
-                headers: None,
-                cluster: cluster.to_owned(),
-                listener_names: section_names.to_vec(),
-            });
-        }
-    }
+    let base = PraxisRoute {
+        cluster: cluster.to_owned(),
+        headers: None,
+        host: None,
+        listener_names: section_names.to_vec(),
+        method: None,
+        path: None,
+        path_prefix: "/".to_owned(),
+        query_params: None,
+    };
+
+    push_per_hostname(base, hostnames, out);
 }
 
 /// Emits routes for a single match entry, expanding across hostnames.
@@ -404,31 +402,39 @@ fn emit_match_routes(
     section_names: &[Option<String>],
     out: &mut Vec<PraxisRoute>,
 ) {
-    let path_entries = extract_path_match(&m.path);
     let headers = extract_headers(&m.headers);
+    let method = extract_method(m);
+    let query_params = extract_query_params(&m.query_params);
 
-    for (path, path_prefix) in path_entries {
-        if hostnames.is_empty() {
-            out.push(PraxisRoute {
-                path,
-                path_prefix,
-                host: None,
-                headers: headers.clone(),
-                cluster: cluster.to_owned(),
-                listener_names: section_names.to_vec(),
-            });
-        } else {
-            for hostname in hostnames {
-                out.push(PraxisRoute {
-                    path: path.clone(),
-                    path_prefix: path_prefix.clone(),
-                    host: Some(hostname.clone()),
-                    headers: headers.clone(),
-                    cluster: cluster.to_owned(),
-                    listener_names: section_names.to_vec(),
-                });
-            }
-        }
+    for (path, path_prefix) in extract_path_match(&m.path) {
+        let base = PraxisRoute {
+            cluster: cluster.to_owned(),
+            headers: headers.clone(),
+            host: None,
+            listener_names: section_names.to_vec(),
+            method: method.clone(),
+            path,
+            path_prefix,
+            query_params: query_params.clone(),
+        };
+
+        push_per_hostname(base, hostnames, out);
+    }
+}
+
+/// Pushes one copy of `base` per hostname.
+///
+/// A route with no hostname constraint is emitted once, unscoped.
+fn push_per_hostname(base: PraxisRoute, hostnames: &[String], out: &mut Vec<PraxisRoute>) {
+    if hostnames.is_empty() {
+        out.push(base);
+        return;
+    }
+
+    for hostname in hostnames {
+        let mut scoped = base.clone();
+        scoped.host = Some(hostname.clone());
+        out.push(scoped);
     }
 }
 
@@ -482,6 +488,31 @@ fn extract_headers(
 ) -> Option<BTreeMap<String, String>> {
     let hs = headers.as_ref().filter(|hs| !hs.is_empty())?;
     let map = collect_exact_headers(hs);
+    if map.is_empty() { None } else { Some(map) }
+}
+
+/// Extracts the HTTP method a match constrains, if any.
+fn extract_method(m: &HttpRouteRulesMatches) -> Option<String> {
+    m.method.as_ref().map(|method| format!("{method:?}").to_uppercase())
+}
+
+/// Extracts exact query-parameter matches.
+///
+/// Regular-expression matches never reach here: a rule carrying one is
+/// rejected by [`validate_route`] before conversion. Per the Gateway API
+/// spec the first entry wins for duplicate parameter names.
+///
+/// [`validate_route`]: crate::gateway_api::route_validation::validate_route
+fn extract_query_params(
+    params: &Option<Vec<gateway_api::httproutes::HttpRouteRulesMatchesQueryParams>>,
+) -> Option<BTreeMap<String, String>> {
+    let entries = params.as_ref().filter(|p| !p.is_empty())?;
+
+    let mut map = BTreeMap::new();
+    for param in entries {
+        map.entry(param.name.clone()).or_insert_with(|| param.value.clone());
+    }
+
     if map.is_empty() { None } else { Some(map) }
 }
 
@@ -908,6 +939,101 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_routes_carries_method_match() {
+        let mut rule = rule_with_backend();
+        rule.matches = Some(vec![HttpRouteRulesMatches {
+            method: Some(gateway_api::httproutes::HttpRouteRulesMatchesMethod::Post),
+            ..Default::default()
+        }]);
+        let route = route_with_rules(vec![rule]);
+
+        let routes = vec![(&route, vec![None])];
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert_eq!(praxis_routes.len(), 1, "a method-only match should produce one route");
+        assert_eq!(
+            praxis_routes[0].method,
+            Some("POST".to_owned()),
+            "the method match must reach the data-plane config, not be dropped"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_carries_query_param_match() {
+        let mut rule = rule_with_backend();
+        rule.matches = Some(vec![HttpRouteRulesMatches {
+            query_params: Some(vec![gateway_api::httproutes::HttpRouteRulesMatchesQueryParams {
+                name: "version".to_owned(),
+                value: "v2".to_owned(),
+                r#type: Some(gateway_api::httproutes::HttpRouteRulesMatchesQueryParamsType::Exact),
+            }]),
+            ..Default::default()
+        }]);
+        let route = route_with_rules(vec![rule]);
+
+        let routes = vec![(&route, vec![None])];
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        let params = praxis_routes[0]
+            .query_params
+            .as_ref()
+            .expect("query parameter match should reach the config");
+        assert_eq!(
+            params.get("version"),
+            Some(&"v2".to_owned()),
+            "the query parameter constraint must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_first_duplicate_query_param_wins() {
+        let mut rule = rule_with_backend();
+        rule.matches = Some(vec![HttpRouteRulesMatches {
+            query_params: Some(vec![
+                gateway_api::httproutes::HttpRouteRulesMatchesQueryParams {
+                    name: "q".to_owned(),
+                    value: "first".to_owned(),
+                    r#type: None,
+                },
+                gateway_api::httproutes::HttpRouteRulesMatchesQueryParams {
+                    name: "q".to_owned(),
+                    value: "second".to_owned(),
+                    r#type: None,
+                },
+            ]),
+            ..Default::default()
+        }]);
+        let route = route_with_rules(vec![rule]);
+
+        let routes = vec![(&route, vec![None])];
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        let params = praxis_routes[0].query_params.as_ref().expect("params should be set");
+        assert_eq!(
+            params.get("q"),
+            Some(&"first".to_owned()),
+            "the Gateway API specifies first-wins for duplicate query parameter names"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_without_method_leaves_it_unset() {
+        let route = route_with_rules(vec![rule_with_backend()]);
+
+        let routes = vec![(&route, vec![None])];
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert_eq!(
+            praxis_routes[0].method, None,
+            "an unconstrained route must not gain a method constraint"
+        );
+        assert_eq!(
+            praxis_routes[0].query_params, None,
+            "an unconstrained route must not gain query parameters"
+        );
+    }
+
+    #[test]
     fn test_convert_routes_rejects_regular_expression_path() {
         let route = HTTPRoute {
             metadata: ObjectMeta {
@@ -1248,5 +1374,37 @@ mod tests {
             backend_refs.is_empty(),
             "unauthorized cross-ns backend should be excluded from cluster"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    /// Builds a rule with a single backend and no matches.
+    fn rule_with_backend() -> HttpRouteRules {
+        HttpRouteRules {
+            backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                name: "svc".to_owned(),
+                port: Some(80),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an `HTTPRoute` in the default namespace carrying `rules`.
+    fn route_with_rules(rules: Vec<HttpRouteRules>) -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("test-route".to_owned()),
+                namespace: Some("default".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                rules: Some(rules),
+                ..Default::default()
+            },
+            status: None,
+        }
     }
 }
