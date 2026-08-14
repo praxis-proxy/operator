@@ -1,0 +1,40 @@
+version: 2
+
+# ------------------------------------------------------------------------------
+# Dependency Updates
+# ------------------------------------------------------------------------------
+
+updates:
+  # Cargo dependencies. Grouped so a routine patch sweep arrives as one
+  # reviewable PR rather than a dozen; majors stay separate because they
+  # need judgement.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Workflow actions are pinned to commit SHAs, which nothing else keeps
+  # current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        update-types:
+          - patch
+          - minor
+          - major
+    commit-message:
+      prefix: "ci(deps)"
