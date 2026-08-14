@@ -76,9 +76,25 @@ fn collect_slice_addresses(slice: &EndpointSlice, target_port: i32, out: &mut Ve
     }
 }
 
-/// Checks if an endpoint is ready (or serving).
+/// Checks whether an endpoint should receive traffic.
+///
+/// Follows the `EndpointSlice` condition contract: an endpoint is usable
+/// when `ready` is true, or when `ready` is unset and `serving` is true.
+/// A terminating endpoint is never usable, whatever the other conditions
+/// say, so pods being drained stop receiving traffic.
 fn is_endpoint_ready(ep: &k8s_openapi::api::discovery::v1::Endpoint) -> bool {
-    ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)
+    let Some(conditions) = ep.conditions.as_ref() else {
+        return true;
+    };
+
+    if conditions.terminating == Some(true) {
+        return false;
+    }
+
+    match conditions.ready {
+        Some(ready) => ready,
+        None => conditions.serving.unwrap_or(true),
+    }
 }
 
 /// Resolves the port from an `EndpointSlice`, falling back to `target_port`.
@@ -292,6 +308,34 @@ mod tests {
     }
 
     #[test]
+    fn test_is_endpoint_ready_excludes_terminating() {
+        assert!(
+            !is_endpoint_ready(&endpoint_with_conditions(Some(true), Some(true), Some(true))),
+            "a terminating endpoint must be excluded even while still ready"
+        );
+    }
+
+    #[test]
+    fn test_is_endpoint_ready_falls_back_to_serving() {
+        assert!(
+            is_endpoint_ready(&endpoint_with_conditions(None, Some(true), Some(false))),
+            "an endpoint without ready should fall back to serving"
+        );
+        assert!(
+            !is_endpoint_ready(&endpoint_with_conditions(None, Some(false), None)),
+            "an endpoint that is neither ready nor serving must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_is_endpoint_ready_ignores_serving_when_ready_is_set() {
+        assert!(
+            !is_endpoint_ready(&endpoint_with_conditions(Some(false), Some(true), None)),
+            "an explicit ready=false must win over serving=true"
+        );
+    }
+
+    #[test]
     fn test_resolve_slice_port_prefers_the_matching_port() {
         let slice = endpoint_slice(&[8080, 9090], &[]);
 
@@ -417,6 +461,20 @@ mod tests {
             conditions: ready.map(|r| EndpointConditions {
                 ready: Some(r),
                 ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an endpoint with explicit `ready`, `serving` and
+    /// `terminating` conditions.
+    fn endpoint_with_conditions(ready: Option<bool>, serving: Option<bool>, terminating: Option<bool>) -> Endpoint {
+        Endpoint {
+            addresses: vec!["10.0.0.1".to_owned()],
+            conditions: Some(EndpointConditions {
+                ready,
+                serving,
+                terminating,
             }),
             ..Default::default()
         }
