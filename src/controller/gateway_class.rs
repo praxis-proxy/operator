@@ -14,9 +14,12 @@ use kube::{
 use tracing::{debug, error, info};
 
 use crate::{
-    context::{CONTROLLER_NAME, Context},
+    context::{CONTROLLER_NAME, Context, FIELD_MANAGER},
     error::{OperatorError, Result},
-    gateway_api::{conditions, status},
+    gateway_api::{
+        conditions, status,
+        status_types::{self, GatewayClassStatus, SupportedFeature},
+    },
     observability::metrics,
 };
 
@@ -101,7 +104,7 @@ async fn accept_gateway_class(gc: &GatewayClass, name: &str, ctx: &Context) -> R
     let generation = gc.metadata.generation.unwrap_or(0);
     let observed = serde_json::to_value(&gc.status)?;
 
-    let mut desired = build_accepted_status(generation);
+    let mut desired = build_accepted_status(generation)?;
     status::preserve_condition_times(&mut desired, &observed);
 
     if status::is_status_unchanged(&desired, &observed) {
@@ -111,17 +114,12 @@ async fn accept_gateway_class(gc: &GatewayClass, name: &str, ctx: &Context) -> R
     }
     metrics::global().record_status_written();
 
-    let payload = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "GatewayClass",
-        "metadata": { "name": name },
-        "status": desired,
-    });
+    let payload = status_types::status_patch("GatewayClass", name, None, desired);
 
     let api = Api::<GatewayClass>::all(ctx.client.clone());
     api.patch_status(
         name,
-        &PatchParams::apply("praxis-operator").force(),
+        &PatchParams::apply(FIELD_MANAGER).force(),
         &Patch::Apply(&payload),
     )
     .await?;
@@ -137,16 +135,17 @@ async fn accept_gateway_class(gc: &GatewayClass, name: &str, ctx: &Context) -> R
 /// Builds the `status` sub-object of the accepted patch.
 ///
 /// Sets the `Accepted` condition to `True` and declares supported features.
-fn build_accepted_status(generation: i64) -> serde_json::Value {
-    let condition = conditions::accepted(generation, "GatewayClass accepted");
-    let features: Vec<_> = SUPPORTED_FEATURES
+fn build_accepted_status(generation: i64) -> serde_json::Result<serde_json::Value> {
+    let features = SUPPORTED_FEATURES
         .iter()
-        .map(|name| serde_json::json!({ "name": name }))
+        .map(|name| SupportedFeature {
+            name: (*name).to_owned(),
+        })
         .collect();
 
-    serde_json::json!({
-        "conditions": [condition],
-        "supportedFeatures": features,
+    serde_json::to_value(GatewayClassStatus {
+        conditions: vec![conditions::accepted(generation, "GatewayClass accepted")],
+        supported_features: features,
     })
 }
 
@@ -187,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_build_accepted_status_sets_accepted_true() {
-        let status = build_accepted_status(3);
+        let status = build_accepted_status(3).expect("a class status is strings and conditions");
 
         assert_eq!(
             status["conditions"][0]["type"], "Accepted",
@@ -202,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_build_accepted_status_declares_supported_features() {
-        let status = build_accepted_status(1);
+        let status = build_accepted_status(1).expect("a class status is strings and conditions");
 
         assert_eq!(
             status["supportedFeatures"].as_array().map(Vec::len),
@@ -234,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_build_accepted_status_carries_no_metadata() {
-        let status = build_accepted_status(1);
+        let status = build_accepted_status(1).expect("a class status is strings and conditions");
 
         assert!(
             status.get("metadata").is_none(),

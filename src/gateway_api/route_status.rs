@@ -23,7 +23,10 @@ use tracing::debug;
 use crate::{
     context::{CONTROLLER_NAME, FIELD_MANAGER},
     error::Result,
-    gateway_api::{conditions, reference_grant, status},
+    gateway_api::{
+        conditions, reference_grant, status,
+        status_types::{self, ParentReference, RouteParentStatus},
+    },
     observability::metrics,
 };
 
@@ -194,7 +197,7 @@ pub fn parent_status_json(
     gw_ns: &str,
     accepted: &Condition,
     resolved: &Condition,
-) -> Value {
+) -> RouteParentStatus {
     parent_status_with_conditions(parent_ref, gw_ns, &[accepted.clone(), resolved.clone()])
 }
 
@@ -202,25 +205,22 @@ pub fn parent_status_json(
 ///
 /// Used when a route carries more than the usual `Accepted` and
 /// `ResolvedRefs` pair, such as a `PartiallyInvalid` route.
-pub fn parent_status_with_conditions(parent_ref: &HttpRouteParentRefs, gw_ns: &str, conditions: &[Condition]) -> Value {
-    let mut ref_json = json!({
-        "group": GATEWAY_GROUP,
-        "kind": "Gateway",
-        "name": parent_ref.name,
-        "namespace": gw_ns,
-    });
-
-    if let Some(section) = &parent_ref.section_name
-        && let Some(object) = ref_json.as_object_mut()
-    {
-        object.insert("sectionName".to_owned(), json!(section));
+pub fn parent_status_with_conditions(
+    parent_ref: &HttpRouteParentRefs,
+    gw_ns: &str,
+    conditions: &[Condition],
+) -> RouteParentStatus {
+    RouteParentStatus {
+        parent_ref: ParentReference {
+            group: GATEWAY_GROUP.to_owned(),
+            kind: "Gateway".to_owned(),
+            name: parent_ref.name.clone(),
+            namespace: gw_ns.to_owned(),
+            section_name: parent_ref.section_name.clone(),
+        },
+        controller_name: CONTROLLER_NAME.to_owned(),
+        conditions: conditions.to_vec(),
     }
-
-    json!({
-        "parentRef": ref_json,
-        "controllerName": CONTROLLER_NAME,
-        "conditions": conditions,
-    })
 }
 
 /// Merges `computed` parent entries into the route's live status and
@@ -236,9 +236,16 @@ pub fn parent_status_with_conditions(parent_ref: &HttpRouteParentRefs, gw_ns: &s
 /// Returns an error if the live status cannot be deserialized or if
 /// the status patch is rejected. When the merged status equals what is
 /// already stored no patch is sent, so an unchanged route cannot fail.
-pub async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRoute, computed: &[Value]) -> Result<()> {
+pub async fn apply_parent_statuses(
+    client: &kube::Client,
+    route: &HTTPRoute,
+    computed: &[RouteParentStatus],
+) -> Result<()> {
     let ns = route_namespace(route);
     let name = route.name_any();
+
+    let computed = serde_json::to_value(computed)?;
+    let computed = computed.as_array().map_or(&[][..], Vec::as_slice);
 
     let observed = json!({ "parents": observed_parents(route)? });
     let mut desired = json!({ "parents": merge_parent_statuses(&observed, computed) });
@@ -251,12 +258,7 @@ pub async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRoute, com
     }
     metrics::global().record_status_written();
 
-    let payload = json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "HTTPRoute",
-        "metadata": { "name": name, "namespace": ns },
-        "status": desired,
-    });
+    let payload = status_types::status_patch("HTTPRoute", &name, Some(ns), desired);
 
     Api::<HTTPRoute>::namespaced(client.clone(), ns)
         .patch_status(
@@ -296,12 +298,7 @@ pub async fn clear_parent_statuses(client: &kube::Client, route: &HTTPRoute, gw_
         return Ok(());
     }
 
-    let payload = json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "HTTPRoute",
-        "metadata": { "name": name, "namespace": ns },
-        "status": { "parents": retained },
-    });
+    let payload = status_types::status_patch("HTTPRoute", &name, Some(ns), json!({ "parents": retained }));
 
     debug!("clearing parent status for deleted Gateway {gw_ns}/{gw_name} from HTTPRoute {ns}/{name}");
     Api::<HTTPRoute>::namespaced(client.clone(), ns)
@@ -566,7 +563,13 @@ mod tests {
     fn test_parent_status_json_shape() {
         let accepted = conditions::accepted(1, "route accepted");
         let resolved = conditions::resolved_refs(1, "all backend refs resolved");
-        let entry = parent_status_json(&parent_ref("gw", None), "infra", &accepted, &resolved);
+        let entry = serde_json::to_value(parent_status_json(
+            &parent_ref("gw", None),
+            "infra",
+            &accepted,
+            &resolved,
+        ))
+        .expect("a parent status is strings and conditions");
 
         assert_eq!(entry["parentRef"]["name"], "gw", "parentRef should name the Gateway");
         assert_eq!(
@@ -591,7 +594,8 @@ mod tests {
         let mut reference = parent_ref("gw", None);
         reference.section_name = Some("https".to_owned());
 
-        let entry = parent_status_json(&reference, "infra", &accepted, &resolved);
+        let entry = serde_json::to_value(parent_status_json(&reference, "infra", &accepted, &resolved))
+            .expect("a parent status is strings and conditions");
 
         assert_eq!(
             entry["parentRef"]["sectionName"], "https",

@@ -12,3 +12,4 @@ pub mod reference_grant;
 pub mod route_status;
 pub mod route_validation;
 pub mod status;
+pub mod status_types;

@@ -15,11 +15,12 @@ use gateway_api::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::ResourceExt as _;
-use serde_json::Value;
 
 use crate::{
     error::Result,
-    gateway_api::{attachment::AttachedRoute, conditions, route_status, route_validation},
+    gateway_api::{
+        attachment::AttachedRoute, conditions, route_status, route_validation, status_types::RouteParentStatus,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -79,7 +80,7 @@ async fn build_route_statuses(
     generation: i64,
     client: &kube::Client,
     grants: &[ReferenceGrant],
-) -> Vec<Value> {
+) -> Vec<RouteParentStatus> {
     let validation = route_validation::validate_route(route);
 
     let mut statuses = Vec::new();

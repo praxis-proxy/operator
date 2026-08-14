@@ -17,11 +17,10 @@ use gateway_api::{
 };
 use k8s_openapi::{ByteString, api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::Condition};
 use kube::Api;
-use serde_json::{Value, json};
 
 use crate::{
     context::Context,
-    gateway_api::{conditions, reference_grant},
+    gateway_api::{conditions, reference_grant, status_types::RouteGroupKind},
 };
 
 // -----------------------------------------------------------------------------
@@ -37,7 +36,7 @@ pub(super) async fn listener_resolved_refs(
     generation: i64,
     gateway_ns: &str,
     ctx: &Context,
-) -> (Vec<Value>, Condition) {
+) -> (Vec<RouteGroupKind>, Condition) {
     let (supported, kinds_invalid) = validate_route_kinds(listener);
 
     if kinds_invalid {
@@ -57,7 +56,7 @@ pub(super) async fn listener_resolved_refs(
 /// Validates the configured `allowedRoutes.kinds` on a listener.
 ///
 /// Returns `(supported_kinds_json, has_invalid_kinds)`.
-fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<Value>, bool) {
+fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<RouteGroupKind>, bool) {
     let configured = listener.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref());
     let Some(kinds) = configured else {
         return (httproute_supported_kinds(), false);
@@ -74,8 +73,8 @@ fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<Value>, bool) {
 }
 
 /// Returns the default `supportedKinds` JSON for `HTTPRoute`.
-fn httproute_supported_kinds() -> Vec<Value> {
-    vec![json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})]
+fn httproute_supported_kinds() -> Vec<RouteGroupKind> {
+    vec![RouteGroupKind::httproute()]
 }
 
 /// Checks whether a route kind ref is `HTTPRoute` in the Gateway API group.
