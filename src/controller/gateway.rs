@@ -23,7 +23,7 @@ use super::gateway_helpers;
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
-    gateway_api::{conditions, route_status},
+    gateway_api::{conditions, protocol::ListenerProtocol, route_status},
     listing,
 };
 
@@ -127,7 +127,7 @@ async fn apply_config_if_supported(
         .spec
         .listeners
         .iter()
-        .any(|l| l.protocol == "HTTP" || l.protocol == "HTTPS");
+        .any(|l| ListenerProtocol::is_supported(&l.protocol));
     if !has_supported {
         return Ok(false);
     }

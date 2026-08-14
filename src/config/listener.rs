@@ -6,6 +6,8 @@
 use gateway_api::gateways::GatewayListeners;
 use serde::Serialize;
 
+use crate::gateway_api::protocol::ListenerProtocol;
+
 // -----------------------------------------------------------------------------
 // PraxisListener
 // -----------------------------------------------------------------------------
@@ -88,7 +90,7 @@ pub(crate) struct PraxisCertificate {
 pub(crate) fn convert_listener(listener: &GatewayListeners, chain_name: &str) -> PraxisListener {
     let port = listener.port;
     let address = format!("0.0.0.0:{port}");
-    let is_https = listener.protocol == "HTTPS";
+    let is_https = ListenerProtocol::terminates_tls(&listener.protocol);
 
     PraxisListener {
         name: listener.name.clone(),

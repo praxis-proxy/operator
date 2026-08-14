@@ -46,7 +46,8 @@ use crate::{
     endpoints,
     error::{OperatorError, Result},
     gateway_api::{
-        attachment, conditions, hostname, listener_conflict, reference_grant, route_status, route_validation, status,
+        attachment, conditions, hostname, listener_conflict, protocol::ListenerProtocol, reference_grant, route_status,
+        route_validation, status,
     },
     listing,
     observability::metrics,
@@ -179,7 +180,7 @@ pub(super) async fn build_praxis_config(
     let conflicts = listener_conflict::detect_conflicts(listeners);
     let supported: Vec<_> = listeners
         .iter()
-        .filter(|l| l.protocol == "HTTP" || l.protocol == "HTTPS")
+        .filter(|l| ListenerProtocol::is_supported(&l.protocol))
         .filter(|l| !conflicts.contains_key(&l.name))
         .collect();
 
@@ -460,7 +461,7 @@ fn collect_tls_secret_names(listeners: &[&GatewayListeners]) -> Vec<String> {
     let mut seen = HashSet::new();
     listeners
         .iter()
-        .filter(|l| l.protocol == "HTTPS")
+        .filter(|l| ListenerProtocol::terminates_tls(&l.protocol))
         .filter_map(|l| l.tls.as_ref())
         .flat_map(|tls| tls.certificate_refs.as_deref().unwrap_or(&[]))
         .filter(|cert_ref| seen.insert(cert_ref.name.clone()))
@@ -841,7 +842,7 @@ async fn build_listener_statuses(
             continue;
         }
 
-        let protocol_supported = l.protocol == "HTTP" || l.protocol == "HTTPS";
+        let protocol_supported = ListenerProtocol::is_supported(&l.protocol);
         if !protocol_supported {
             any_rejected = true;
             statuses.push(unsupported_listener_status(l, generation));
