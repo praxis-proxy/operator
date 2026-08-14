@@ -11,7 +11,8 @@ use kube::{
     api::{Patch, PatchParams},
     runtime::{
         controller::Action,
-        finalizer::{self, Event},
+        events::{Event, EventType},
+        finalizer::{self, Event as FinalizerEvent},
         reflector::ObjectRef,
     },
 };
@@ -51,8 +52,8 @@ pub(crate) async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Act
     finalizer::finalizer(&api, GATEWAY_FINALIZER, gw, |event| {
         Box::pin(async {
             match event {
-                Event::Apply(gw) => Box::pin(apply(gw, &ctx)).await,
-                Event::Cleanup(gw) => {
+                FinalizerEvent::Apply(gw) => Box::pin(apply(gw, &ctx)).await,
+                FinalizerEvent::Cleanup(gw) => {
                     cleanup(&gw, &ctx.client).await;
                     Ok(Action::await_change())
                 },
@@ -90,9 +91,7 @@ pub(crate) fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<C
 /// test from sending traffic before the data plane has the latest
 /// configuration.
 async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
-    if !gateway_helpers::validate_gateway_class(&ctx.client, &gw).await?
-        || reject_unsupported_spec(&ctx.client, &gw).await?
-    {
+    if !gateway_helpers::validate_gateway_class(&ctx.client, &gw).await? || reject_unsupported_spec(ctx, &gw).await? {
         return Ok(Action::await_change());
     }
 
@@ -173,18 +172,42 @@ async fn list_all_grants(client: &kube::Client) -> Result<Vec<ReferenceGrant>> {
 ///
 /// Returns `true` when the Gateway was rejected and the caller should
 /// stop reconciling it.
-async fn reject_unsupported_spec(client: &kube::Client, gw: &Gateway) -> Result<bool> {
+async fn reject_unsupported_spec(ctx: &Context, gw: &Gateway) -> Result<bool> {
     let Some((reason, message)) = unsupported_spec_reason(gw) else {
         return Ok(false);
     };
 
     let generation = gw.metadata.generation.unwrap_or(1);
-    reject_gateway(client, gw, generation, reason, message).await?;
+    reject_gateway(&ctx.client, gw, generation, reason, message).await?;
+    Box::pin(publish_rejection(ctx, gw, reason, message)).await;
 
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     info!("Gateway {ns}/{name} rejected: {message}");
     Ok(true)
+}
+
+/// Emits a warning event describing why a Gateway was rejected.
+///
+/// A rejected Gateway is otherwise inert, and its condition is easy to
+/// miss; an event puts the reason in `kubectl describe`. The recorder
+/// deduplicates within a TTL window, so a Gateway that stays rejected
+/// does not accumulate an event per reconcile.
+///
+/// A failure to publish is logged rather than propagated: losing an
+/// event must not turn a clean rejection into a reconcile error.
+async fn publish_rejection(ctx: &Context, gw: &Gateway, reason: &str, message: &str) {
+    let event = Event {
+        action: "Reject".to_owned(),
+        note: Some(message.to_owned()),
+        reason: reason.to_owned(),
+        secondary: None,
+        type_: EventType::Warning,
+    };
+
+    if let Err(e) = ctx.recorder.publish(&event, &gw.object_ref(&())).await {
+        debug!(%e, "could not publish rejection event");
+    }
 }
 
 /// Returns the `(reason, message)` for a Gateway spec this operator
