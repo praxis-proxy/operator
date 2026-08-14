@@ -18,6 +18,15 @@ pub const CONTROLLER_NAME: &str = "praxis.sh/gateway-controller";
 /// Finalizer string applied to Gateways.
 pub const GATEWAY_FINALIZER: &str = "gateway.praxis.sh/finalizer";
 
+/// Field manager recorded on every server-side apply the operator issues.
+///
+/// Server-side apply tracks ownership per manager name, so every write
+/// this operator makes must use the same one. Two names would let the
+/// operator fight itself: fields written under the first would look
+/// like another actor's to the second, and neither would ever release
+/// them.
+pub const FIELD_MANAGER: &str = "praxis-operator";
+
 /// Admin port on the Praxis data-plane container.
 pub const ADMIN_PORT: i32 = 9901;
 
@@ -67,19 +76,6 @@ impl std::fmt::Debug for Context {
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
 mod tests {
     use super::*;
 

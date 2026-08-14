@@ -19,7 +19,7 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, error, info};
 
-use super::gateway_helpers;
+use super::{gateway_status, ownership, praxis_config, rollout, route_parent_status};
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
@@ -98,21 +98,21 @@ pub fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>
 /// test from sending traffic before the data plane has the latest
 /// configuration.
 async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
-    if !gateway_helpers::validate_gateway_class(&ctx.client, &gw).await? || reject_unsupported_spec(ctx, &gw).await? {
+    if !ownership::validate_gateway_class(&ctx.client, &gw).await? || reject_unsupported_spec(ctx, &gw).await? {
         return Ok(Action::await_change());
     }
 
     let routes = list_all_routes(&ctx.client).await?;
-    let attached = gateway_helpers::collect_routes(&ctx.client, &gw, &routes).await;
+    let attached = ownership::collect_routes(&ctx.client, &gw, &routes).await;
     let ns = gw.namespace().unwrap_or_default();
     let grants = list_all_grants(&ctx.client).await?;
     let config_changed = apply_config_if_supported(&ctx.client, &gw, &attached, &ns, &grants).await?;
 
-    gateway_helpers::build_and_apply_gateway_status(&ctx.client, &gw, &gw.spec.listeners, &attached).await?;
+    gateway_status::build_and_apply_gateway_status(&ctx.client, &gw, &gw.spec.listeners, &attached).await?;
 
     let can_accept = can_accept_routes(&ctx.client, &gw, &ns, config_changed).await;
     if can_accept {
-        gateway_helpers::update_route_parent_statuses(&ctx.client, &gw, &attached, &grants).await?;
+        route_parent_status::update_route_parent_statuses(&ctx.client, &gw, &attached, &grants).await?;
     }
 
     let requeue_secs = if can_accept { 15 } else { 2 };
@@ -140,9 +140,9 @@ async fn apply_config_if_supported(
     }
 
     let child = crate::resources::labels::child_name(&gw.name_any());
-    let prev_hash = gateway_helpers::current_deployment_hash(client, ns, &child).await;
-    let config = gateway_helpers::build_praxis_config(client, &gw.spec.listeners, attached, grants).await?;
-    let new_hash = Box::pin(gateway_helpers::apply_child_resources(client, gw, &config)).await?;
+    let prev_hash = rollout::current_deployment_hash(client, ns, &child).await;
+    let config = praxis_config::build_praxis_config(client, &gw.spec.listeners, attached, grants).await?;
+    let new_hash = Box::pin(praxis_config::apply_child_resources(client, gw, &config)).await?;
 
     let changed = prev_hash.as_deref() != Some(&new_hash);
     debug!(
@@ -158,7 +158,7 @@ async fn apply_config_if_supported(
 /// rolled out, so attached routes may be marked accepted.
 async fn can_accept_routes(client: &kube::Client, gw: &Gateway, ns: &str, config_changed: bool) -> bool {
     let child = crate::resources::labels::child_name(&gw.name_any());
-    let rolled_out = gateway_helpers::is_deployment_rolled_out(client, ns, &child).await;
+    let rolled_out = rollout::is_deployment_rolled_out(client, ns, &child).await;
 
     let can_accept = !config_changed && rolled_out;
     debug!(gateway = %gw.name_any(), can_accept, "route acceptance decision");
@@ -344,7 +344,7 @@ async fn reject_gateway(
         ],
     });
 
-    gateway_helpers::apply_gateway_status(client, gw, &status).await
+    gateway_status::apply_gateway_status(client, gw, &status).await
 }
 
 // -----------------------------------------------------------------------------
@@ -421,19 +421,7 @@ fn find_gateway_parent_ref(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
+#[expect(clippy::default_trait_access, reason = "tests")]
 mod tests {
     use gateway_api::{
         gateways::GatewayAddresses,

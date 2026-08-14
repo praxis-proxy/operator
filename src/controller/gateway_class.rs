@@ -158,19 +158,6 @@ pub fn error_policy(_gc: Arc<GatewayClass>, error: &OperatorError, _ctx: Arc<Con
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
 mod tests {
     use gateway_api::gatewayclasses::GatewayClassSpec;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

@@ -95,19 +95,7 @@ pub fn build_cluster(name: &str, endpoints: Vec<String>, weights: Option<Vec<i32
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
+#[expect(clippy::match_wildcard_for_single_variants, reason = "tests")]
 mod tests {
     use super::*;
 
