@@ -46,8 +46,10 @@ use crate::{
     endpoints,
     error::{OperatorError, Result},
     gateway_api::{
-        attachment, conditions, hostname, listener_conflict, protocol::ListenerProtocol, reference_grant, route_status,
-        route_validation, status,
+        attachment::{self, AttachedRoute},
+        conditions, hostname, listener_conflict,
+        protocol::ListenerProtocol,
+        reference_grant, route_status, route_validation, status,
     },
     listing,
     observability::metrics,
@@ -145,7 +147,7 @@ pub(super) async fn collect_routes<'a>(
     client: &kube::Client,
     gw: &Gateway,
     all_routes: &'a [HTTPRoute],
-) -> Vec<(&'a HTTPRoute, Vec<Option<String>>)> {
+) -> Vec<AttachedRoute<'a>> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
@@ -174,7 +176,7 @@ pub(super) struct PraxisConfigOutput {
 pub(super) async fn build_praxis_config(
     client: &kube::Client,
     listeners: &[GatewayListeners],
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'_>],
     grants: &[ReferenceGrant],
 ) -> Result<PraxisConfigOutput> {
     let conflicts = listener_conflict::detect_conflicts(listeners);
@@ -272,19 +274,18 @@ fn build_listener_hostname_map(listeners: &[&GatewayListeners]) -> HashMap<Strin
 
 /// Converts attached routes to Praxis routes and collects backend refs.
 fn convert_attached_routes(
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'_>],
     listener_hostnames: &HashMap<String, Option<String>>,
     grants: &[ReferenceGrant],
 ) -> (Vec<PraxisRoute>, Vec<BackendRef>) {
-    let route_refs: Vec<_> = attached.iter().map(|(r, s)| (*r, s.clone())).collect();
-    convert_routes(&route_refs, listener_hostnames, grants)
+    convert_routes(attached, listener_hostnames, grants)
 }
 
 /// Extracts and converts filters from all attached route rules.
-fn collect_filters(attached: &[(&HTTPRoute, Vec<Option<String>>)]) -> Vec<PraxisFilterEntry> {
+fn collect_filters(attached: &[AttachedRoute<'_>]) -> Vec<PraxisFilterEntry> {
     let all_rules: Vec<_> = attached
         .iter()
-        .flat_map(|(route, _)| route.spec.rules.as_deref().unwrap_or(&[]))
+        .flat_map(|attached| attached.route.spec.rules.as_deref().unwrap_or(&[]))
         .cloned()
         .collect();
     convert_filters(&all_rules)
@@ -556,7 +557,7 @@ pub(super) async fn build_and_apply_gateway_status(
     client: &kube::Client,
     gw: &Gateway,
     listeners: &[GatewayListeners],
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'_>],
 ) -> Result<()> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
@@ -595,13 +596,13 @@ pub(super) async fn build_and_apply_gateway_status(
 pub(super) async fn update_route_parent_statuses(
     client: &kube::Client,
     gw: &Gateway,
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'_>],
     grants: &[ReferenceGrant],
 ) -> Result<()> {
     let gw_ns = gw.namespace().unwrap_or_default();
     let gw_name = gw.name_any();
 
-    for (route, _) in attached {
+    for AttachedRoute { route, .. } in attached {
         let route_ns = route_status::route_namespace(route);
         let generation = route.metadata.generation.unwrap_or(0);
         let Some(parent_refs) = &route.spec.parent_refs else {
@@ -828,7 +829,7 @@ async fn build_listener_statuses(
     generation: i64,
     gateway_ns: &str,
     client: &kube::Client,
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'_>],
 ) -> (Vec<Value>, bool, bool) {
     let conflicts = listener_conflict::detect_conflicts(listeners);
     let mut statuses = Vec::new();
@@ -900,17 +901,14 @@ fn unsupported_listener_status(l: &GatewayListeners, generation: i64) -> Value {
 }
 
 /// Counts routes attached to a specific listener.
-fn count_attached_routes(attached: &[(&HTTPRoute, Vec<Option<String>>)], listener: &GatewayListeners) -> usize {
+fn count_attached_routes(attached: &[AttachedRoute<'_>], listener: &GatewayListeners) -> usize {
     attached
         .iter()
-        .filter(|(route, sections)| {
-            let section_matches = sections
-                .iter()
-                .any(|s| s.is_none() || s.as_deref() == Some(&listener.name));
-            if !section_matches {
+        .filter(|attached| {
+            if !attached.targets_listener(&listener.name) {
                 return false;
             }
-            let route_hostnames = route.spec.hostnames.as_deref().unwrap_or(&[]);
+            let route_hostnames = attached.route.spec.hostnames.as_deref().unwrap_or(&[]);
             if route_hostnames.is_empty() {
                 return true;
             }
@@ -1200,17 +1198,23 @@ fn is_pem_entry(data: &BTreeMap<String, ByteString>, key: &str) -> bool {
 /// A route is retained if at least one listener it targets allows its
 /// namespace. The default policy (when unspecified) is `Same`.
 async fn filter_routes_by_allowed_namespaces<'a>(
-    attached: &[(&'a HTTPRoute, Vec<Option<String>>)],
+    attached: &[AttachedRoute<'a>],
     listeners: &[GatewayListeners],
     gateway_ns: &str,
     client: &kube::Client,
-) -> Vec<(&'a HTTPRoute, Vec<Option<String>>)> {
+) -> Vec<AttachedRoute<'a>> {
     let all_namespaces = fetch_all_namespaces(client).await;
 
     attached
         .iter()
-        .filter(|(route, section_names)| {
-            route_allowed_by_any_listener(route, section_names, listeners, gateway_ns, all_namespaces.as_deref())
+        .filter(|attached| {
+            route_allowed_by_any_listener(
+                attached.route,
+                &attached.section_names,
+                listeners,
+                gateway_ns,
+                all_namespaces.as_deref(),
+            )
         })
         .cloned()
         .collect()
@@ -1804,7 +1808,10 @@ mod tests {
     fn test_count_attached_routes_matches_hostname() {
         let listener = https_listener("https", 443, "cert");
         let route = route_with_hostnames(&["a.example.com"]);
-        let attached = vec![(&route, vec![None])];
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
 
         assert_eq!(
             count_attached_routes(&attached, &listener),
@@ -1817,7 +1824,10 @@ mod tests {
     fn test_count_attached_routes_counts_unconstrained_routes() {
         let listener = listener("http", 80, "HTTP");
         let route = route_with_hostnames(&[]);
-        let attached = vec![(&route, vec![None])];
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
 
         assert_eq!(
             count_attached_routes(&attached, &listener),
@@ -1830,7 +1840,10 @@ mod tests {
     fn test_count_attached_routes_respects_section_name() {
         let listener = listener("http", 80, "HTTP");
         let route = route_with_hostnames(&[]);
-        let attached = vec![(&route, vec![Some("https".to_owned())])];
+        let attached = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![Some("https".to_owned())],
+        }];
 
         assert_eq!(
             count_attached_routes(&attached, &listener),
