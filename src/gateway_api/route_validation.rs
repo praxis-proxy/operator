@@ -9,6 +9,14 @@
 //! header match dropped — sends traffic the author never asked for, so
 //! every unsupported construct is surfaced here and the rule is excluded
 //! from the generated config.
+//!
+//! Two categories are refused. Regular-expression matching this
+//! operator does not implement, and match fields the Praxis route
+//! schema has no field for at all: `praxis_core::config::Route` carries
+//! only a path match, host, headers and cluster, so a method or
+//! query-parameter constraint has nowhere to go. Emitting one anyway
+//! would be dropped during deserialization and the route would quietly
+//! serve every method.
 
 use std::collections::BTreeMap;
 
@@ -29,6 +37,9 @@ pub(crate) enum RuleRejection {
 
     /// A filter type this operator does not implement.
     UnsupportedFilter(String),
+
+    /// A match field the Praxis route schema has no equivalent for.
+    UnsupportedMatchField(&'static str),
 }
 
 impl RuleRejection {
@@ -39,6 +50,9 @@ impl RuleRejection {
                 format!("RegularExpression {field} matching is not supported")
             },
             Self::UnsupportedFilter(kind) => format!("filter type {kind} is not supported"),
+            Self::UnsupportedMatchField(field) => {
+                format!("{field} matching is not supported by the Praxis route schema")
+            },
         }
     }
 }
@@ -126,6 +140,12 @@ fn reject_match(m: &HttpRouteRulesMatches) -> Option<RuleRejection> {
     }
     if has_regex_query_param(m) {
         return Some(RuleRejection::RegularExpression("query parameter"));
+    }
+    if m.method.is_some() {
+        return Some(RuleRejection::UnsupportedMatchField("method"));
+    }
+    if m.query_params.as_deref().is_some_and(|q| !q.is_empty()) {
+        return Some(RuleRejection::UnsupportedMatchField("query parameter"));
     }
     None
 }
