@@ -219,14 +219,18 @@ fn is_pem_entry(data: &BTreeMap<String, ByteString>, key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use gateway_api::gateways::{GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds};
+    use gateway_api::{
+        gateways::{GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds, GatewayListenersTls},
+        referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo},
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
-    use crate::controller::fixtures::{listener, secret_data};
+    use crate::{controller::fixtures::secret_data, testing};
 
     #[test]
     fn test_validate_route_kinds_defaults_to_httproute() {
-        let (supported, invalid) = validate_route_kinds(&listener("http", 80, "HTTP"));
+        let (supported, invalid) = validate_route_kinds(&http_listener());
 
         assert_eq!(supported.len(), 1, "HTTPRoute is supported by default");
         assert!(!invalid, "an unspecified kind list is never invalid");
@@ -234,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_validate_route_kinds_flags_unsupported_kinds() {
-        let mut l = listener("http", 80, "HTTP");
+        let mut l = http_listener();
         l.allowed_routes = Some(GatewayListenersAllowedRoutes {
             kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
                 group: None,
@@ -312,5 +316,207 @@ mod tests {
         assert!(is_pem_entry(&data, "tls.crt"), "a PEM header should be recognised");
         assert!(!is_pem_entry(&data, "tls.key"), "non-PEM data should be rejected");
         assert!(!is_pem_entry(&data, "missing"), "an absent key is not PEM");
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolved Refs
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_plain_http_listener_resolves() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+
+        let (kinds, condition) = listener_resolved_refs(&http_listener(), 1, "infra", &ctx).await;
+
+        assert_eq!(
+            kinds,
+            vec![RouteGroupKind::httproute()],
+            "a listener that names no kinds serves the one kind this operator implements"
+        );
+        assert_eq!(condition.status, "True", "there is nothing for it to fail to resolve");
+    }
+
+    #[tokio::test]
+    async fn test_an_unsupported_route_kind_is_named_as_such() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+        let mut listener = http_listener();
+        listener.allowed_routes = Some(allowed_kinds(&["TCPRoute"]));
+
+        let (kinds, condition) = listener_resolved_refs(&listener, 1, "infra", &ctx).await;
+
+        assert_eq!(condition.reason, "InvalidRouteKinds", "the reason names the problem");
+        assert!(
+            kinds.is_empty(),
+            "advertising HTTPRoute on a listener that asked only for TCPRoute would invite routes \
+             it will not serve"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_tls_secret_is_an_invalid_certificate_ref() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+
+        let (_, condition) = listener_resolved_refs(&tls_listener("infra"), 1, "infra", &ctx).await;
+
+        assert_eq!(
+            (condition.status.as_str(), condition.reason.as_str()),
+            ("False", "InvalidCertificateRef"),
+            "a listener whose certificate does not exist cannot terminate TLS, and saying so is \
+             the only way an author learns why"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_well_formed_tls_secret_resolves() {
+        let (ctx, _) = testing::fake_context(vec![secret_response()], testing::Cached::default());
+
+        let (_, condition) = listener_resolved_refs(&tls_listener("infra"), 1, "infra", &ctx).await;
+
+        assert_eq!(
+            condition.status, "True",
+            "a PEM certificate in the same namespace resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cross_namespace_secret_needs_a_grant() {
+        let (ctx, journal) = testing::fake_context(vec![secret_response()], testing::Cached::default());
+
+        let (_, condition) = listener_resolved_refs(&tls_listener("certs"), 1, "infra", &ctx).await;
+
+        assert_eq!(
+            (condition.status.as_str(), condition.reason.as_str()),
+            ("False", "RefNotPermitted"),
+            "reading a Secret across a namespace boundary without a grant is exactly what a \
+             ReferenceGrant exists to prevent"
+        );
+        assert!(
+            journal.requests().is_empty(),
+            "the refusal has to come before the read, or the operator has already done the thing \
+             the grant was meant to authorize"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_grant_admits_the_cross_namespace_secret() {
+        let (ctx, _) = testing::fake_context(
+            vec![secret_response()],
+            testing::Cached {
+                grants: vec![secret_grant()],
+                ..Default::default()
+            },
+        );
+
+        let (_, condition) = listener_resolved_refs(&tls_listener("certs"), 1, "infra", &ctx).await;
+
+        assert_eq!(condition.status, "True", "the grant is what makes the reference legal");
+    }
+
+    #[tokio::test]
+    async fn test_a_non_secret_certificate_ref_is_refused() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+        let mut listener = tls_listener("infra");
+        if let Some(tls) = listener.tls.as_mut()
+            && let Some(refs) = tls.certificate_refs.as_mut()
+            && let Some(first) = refs.first_mut()
+        {
+            first.kind = Some("ConfigMap".to_owned());
+        }
+
+        let (_, condition) = listener_resolved_refs(&listener, 1, "infra", &ctx).await;
+
+        assert_eq!(
+            condition.reason, "InvalidCertificateRef",
+            "this operator mounts core Secrets and nothing else"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Builds a plain HTTP listener.
+    fn http_listener() -> GatewayListeners {
+        GatewayListeners {
+            name: "http".to_owned(),
+            port: 80,
+            protocol: "HTTP".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an HTTPS listener naming a certificate in `secret_ns`.
+    fn tls_listener(secret_ns: &str) -> GatewayListeners {
+        GatewayListeners {
+            name: "https".to_owned(),
+            port: 443,
+            protocol: "HTTPS".to_owned(),
+            tls: Some(GatewayListenersTls {
+                certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                    name: "cert".to_owned(),
+                    namespace: Some(secret_ns.to_owned()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an `allowedRoutes` naming the given kinds.
+    fn allowed_kinds(kinds: &[&str]) -> GatewayListenersAllowedRoutes {
+        GatewayListenersAllowedRoutes {
+            kinds: Some(
+                kinds
+                    .iter()
+                    .map(|kind| GatewayListenersAllowedRoutesKinds {
+                        group: None,
+                        kind: (*kind).to_owned(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// The Secret the fake API server hands back, PEM and all.
+    ///
+    /// A `Secret`'s `data` is base64 on the wire, so the value is
+    /// pre-encoded rather than pulling in an encoder for one literal.
+    /// It decodes to a one-line PEM block.
+    fn secret_response() -> testing::Canned {
+        let pem = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCngKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=";
+        testing::Canned::ok(
+            "/secrets/cert",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "cert", "namespace": "infra" },
+                "data": { "tls.crt": pem, "tls.key": pem },
+            }),
+        )
+    }
+
+    /// A grant letting Gateways in `infra` read Secrets in `certs`.
+    fn secret_grant() -> ReferenceGrant {
+        ReferenceGrant {
+            metadata: ObjectMeta {
+                name: Some("allow-certs".to_owned()),
+                namespace: Some("certs".to_owned()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: "gateway.networking.k8s.io".to_owned(),
+                    kind: "Gateway".to_owned(),
+                    namespace: "infra".to_owned(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: String::new(),
+                    kind: "Secret".to_owned(),
+                    name: Some("cert".to_owned()),
+                }],
+            },
+        }
     }
 }
