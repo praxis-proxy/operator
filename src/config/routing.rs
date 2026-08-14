@@ -1336,6 +1336,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_config_generation_is_deterministic_across_runs() {
+        let mut yamls = std::collections::BTreeSet::new();
+
+        for _ in 0..50 {
+            let mut listener_hostnames = HashMap::new();
+            listener_hostnames.insert("l1".to_owned(), Some("*.example.com".to_owned()));
+            listener_hostnames.insert("l2".to_owned(), Some("a.example.com".to_owned()));
+            listener_hostnames.insert("l3".to_owned(), Some("*.other.com".to_owned()));
+            listener_hostnames.insert("l4".to_owned(), Some("b.example.com".to_owned()));
+
+            let route = HTTPRoute {
+                metadata: ObjectMeta {
+                    name: Some("r".to_owned()),
+                    namespace: Some("default".to_owned()),
+                    ..Default::default()
+                },
+                spec: HttpRouteSpec {
+                    hostnames: Some(vec!["a.example.com".to_owned(), "b.example.com".to_owned()]),
+                    rules: Some(vec![rule_with_backend()]),
+                    ..Default::default()
+                },
+                status: None,
+            };
+
+            let routes = vec![(&route, vec![None])];
+            let (praxis_routes, _) = convert_routes(&routes, &listener_hostnames, &[]);
+            yamls.insert(serde_yaml::to_string(&praxis_routes).expect("serializes"));
+        }
+
+        assert_eq!(
+            yamls.len(),
+            1,
+            "config generation must be deterministic; unstable output churns the config hash and \
+             rolls the data plane forever. distinct outputs: {yamls:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------------
