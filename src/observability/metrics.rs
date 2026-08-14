@@ -89,6 +89,13 @@ pub(crate) struct Metrics {
 
     /// Status patches actually written.
     status_patches_written: AtomicU64,
+
+    /// Whether this replica currently holds the leadership lease.
+    ///
+    /// Readiness deliberately does not track this — a standby is healthy
+    /// — so leadership is reported here instead, where an operator can
+    /// alert on a cluster with no leader or more than one.
+    leader: AtomicU64,
 }
 
 impl Metrics {
@@ -110,6 +117,11 @@ impl Metrics {
     /// Records a status patch that was written.
     pub(crate) fn record_status_written(&self) {
         self.status_patches_written.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records whether this replica holds the leadership lease.
+    pub(crate) fn set_leader(&self, leading: bool) {
+        self.leader.store(u64::from(leading), Ordering::Relaxed);
     }
 
     /// Increments one controller's slot in a counter array.
@@ -147,7 +159,14 @@ impl fmt::Display for Metrics {
             "praxis_operator_status_patches_written_total",
             "Status patches written to the API server.",
             self.status_patches_written.load(Ordering::Relaxed),
-        )
+        )?;
+
+        writeln!(
+            f,
+            "# HELP praxis_operator_leader Whether this replica holds the leadership lease."
+        )?;
+        writeln!(f, "# TYPE praxis_operator_leader gauge")?;
+        writeln!(f, "praxis_operator_leader {}", self.leader.load(Ordering::Relaxed))
     }
 }
 
@@ -269,13 +288,30 @@ mod tests {
 
         assert_eq!(
             encoded.matches("# HELP ").count(),
-            4,
+            5,
             "every counter family needs a HELP line to be a valid exposition: {encoded}"
         );
         assert_eq!(
             encoded.matches("# TYPE ").count(),
-            4,
+            5,
             "every counter family needs a TYPE line: {encoded}"
+        );
+    }
+
+    #[test]
+    fn test_leadership_is_reported_as_a_gauge() {
+        let metrics = Metrics::default();
+
+        assert!(
+            metrics.to_string().contains("praxis_operator_leader 0"),
+            "a standby must report zero, not omit the gauge, or a cluster with no leader is \
+             indistinguishable from one that never reported"
+        );
+
+        metrics.set_leader(true);
+        assert!(
+            metrics.to_string().contains("praxis_operator_leader 1"),
+            "the holder should report one"
         );
     }
 
