@@ -1560,10 +1560,13 @@ dependencies = [
 name = "praxis-operator"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "criterion",
  "futures",
  "gateway-api",
+ "http",
+ "http-body-util",
  "k8s-openapi",
  "kube",
  "reqwest",
@@ -1572,6 +1575,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "yaml_serde",

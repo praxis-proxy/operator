@@ -212,6 +212,44 @@ where
 }
 
 // -----------------------------------------------------------------------------
+// Test Construction
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+impl Stores {
+    /// Builds populated stores without touching an API server.
+    ///
+    /// A reflector `Writer` shares its cache with the `Store` rather
+    /// than owning it, so the contents outlive the writers dropped at
+    /// the end of this function. Only `wait_until_ready` would notice
+    /// the missing writer, and nothing reading these stores calls it.
+    pub(crate) fn fake(routes: Vec<HTTPRoute>, grants: Vec<ReferenceGrant>, namespaces: Vec<Namespace>) -> Self {
+        use kube::runtime::watcher::Event;
+
+        let (route_store, mut route_writer) = reflector::store::<HTTPRoute>();
+        let (grant_store, mut grant_writer) = reflector::store::<ReferenceGrant>();
+        let (ns_store, mut ns_writer) = reflector::store::<Namespace>();
+
+        for route in routes {
+            route_writer.apply_watcher_event(&Event::Apply(route));
+        }
+        for grant in grants {
+            grant_writer.apply_watcher_event(&Event::Apply(grant));
+        }
+        for namespace in namespaces {
+            ns_writer.apply_watcher_event(&Event::Apply(namespace));
+        }
+
+        drop((route_writer, grant_writer, ns_writer));
+        Self {
+            routes: route_store,
+            grants: grant_store,
+            namespaces: ns_store,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -219,7 +257,6 @@ where
 mod tests {
     use gateway_api::referencegrants::ReferenceGrantSpec;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use kube::runtime::watcher::Event;
 
     use super::*;
 
@@ -246,23 +283,7 @@ mod tests {
     /// `wait_until_ready` would notice, and these tests read state
     /// directly.
     fn populated(grants: Vec<ReferenceGrant>, namespaces: Vec<Namespace>) -> Stores {
-        let (route_store, route_writer) = reflector::store::<HTTPRoute>();
-        let (grant_store, mut grant_writer) = reflector::store::<ReferenceGrant>();
-        let (ns_store, mut ns_writer) = reflector::store::<Namespace>();
-
-        for g in grants {
-            grant_writer.apply_watcher_event(&Event::Apply(g));
-        }
-        for n in namespaces {
-            ns_writer.apply_watcher_event(&Event::Apply(n));
-        }
-
-        drop((route_writer, grant_writer, ns_writer));
-        Stores {
-            routes: route_store,
-            grants: grant_store,
-            namespaces: ns_store,
-        }
+        Stores::fake(vec![], grants, namespaces)
     }
 
     #[test]
