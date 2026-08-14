@@ -249,16 +249,30 @@ fn extra_constraints(route: &PraxisRoute) -> usize {
 
 /// Builds the `router` filter entry from matched routes.
 ///
-/// Serializes the routes into a YAML mapping under the `routes` key.
+/// Serializes the routes into a YAML mapping under the `routes` key,
+/// and turns on multi-level subdomain matching.
+///
+/// Praxis defaults that off, so `*.example.com` matches
+/// `foo.example.com` and nothing deeper. The Gateway API defines the
+/// wildcard as a suffix match at any depth — `foo.bar.example.com` is
+/// as much a match as `foo.example.com` — and a Gateway serving
+/// `*.example.com` that 404s the deeper name is refusing traffic it
+/// advertised.
 ///
 /// # Errors
 ///
 /// Returns an error if route serialization fails.
 fn build_router_filter(routes: &[&PraxisRoute]) -> yaml_serde::Result<PraxisFilterEntry> {
-    let config = yaml_serde::to_value(yaml_serde::Mapping::from_iter([(
-        yaml_serde::Value::String("routes".to_owned()),
-        yaml_serde::to_value(routes)?,
-    )]))?;
+    let config = yaml_serde::to_value(yaml_serde::Mapping::from_iter([
+        (
+            yaml_serde::Value::String("multi_level_subdomain_matching".to_owned()),
+            yaml_serde::Value::Bool(true),
+        ),
+        (
+            yaml_serde::Value::String("routes".to_owned()),
+            yaml_serde::to_value(routes)?,
+        ),
+    ]))?;
 
     Ok(PraxisFilterEntry {
         filter: "router".to_owned(),
@@ -613,6 +627,29 @@ mod tests {
             routes_seq.len(),
             3,
             "merged listener should include routes from all sections (listener-1, listener-2, listener-3)"
+        );
+    }
+
+    #[test]
+    fn test_router_matches_wildcards_at_any_depth() {
+        let listener = PraxisListener {
+            name: "http".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            protocol: None,
+            filter_chains: vec!["http-chain".to_owned()],
+            hostname: None,
+            merged_section_names: vec![],
+            tls: None,
+        };
+
+        let config = assemble_config(vec![listener], &[], &[], &RouteFilters::default(), &Default::default()).unwrap();
+
+        let router = &config.filter_chains[0].filters[1];
+        assert_eq!(
+            router.config.get("multi_level_subdomain_matching"),
+            Some(&serde_norway::Value::Bool(true)),
+            "Praxis defaults this off, which would 404 foo.bar.example.com on a *.example.com \
+             listener — traffic the Gateway API says the wildcard covers"
         );
     }
 
