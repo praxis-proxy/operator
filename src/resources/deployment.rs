@@ -12,7 +12,7 @@ use k8s_openapi::{
         core::v1::{
             Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, HTTPGetAction,
             PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext,
-            Volume, VolumeMount,
+            TopologySpreadConstraint, Volume, VolumeMount,
         },
     },
     apimachinery::pkg::{
@@ -32,6 +32,16 @@ use crate::context::{ADMIN_PORT, praxis_image};
 
 /// UID the Praxis proxy container runs as (nobody/nfsnobody).
 const PROXY_UID: i64 = 100;
+
+/// Annotation overriding the data-plane replica count.
+const REPLICAS_ANNOTATION: &str = "praxis.sh/replicas";
+
+/// Replicas run when the Gateway does not ask for a specific count.
+///
+/// Two rather than one so a node drain or a rolling config change does
+/// not take the data plane down; a single-replica Gateway is a single
+/// point of failure for every route attached to it.
+const DEFAULT_REPLICAS: i32 = 2;
 
 // -----------------------------------------------------------------------------
 // Deployment Builder
@@ -295,6 +305,7 @@ fn build_pod_template(
         automount_service_account_token: Some(false),
         containers: vec![container],
         termination_grace_period_seconds: Some(15),
+        topology_spread_constraints: Some(spread_constraints(labels)),
         volumes: Some(volumes),
         ..Default::default()
     };
@@ -307,6 +318,41 @@ fn build_pod_template(
         }),
         spec: Some(pod_spec),
     }
+}
+
+/// Returns the replica count for a Gateway's data plane.
+///
+/// Read from the `praxis.sh/replicas` annotation so an operator can size
+/// a Gateway without a CRD of its own; the Gateway API's own extension
+/// point, `spec.infrastructure.parametersRef`, is rejected by this
+/// implementation. A malformed or non-positive value falls back to the
+/// default rather than producing a Deployment that scales to zero.
+fn desired_replicas(gateway: &Gateway) -> i32 {
+    gateway
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(REPLICAS_ANNOTATION))
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|replicas| *replicas > 0)
+        .unwrap_or(DEFAULT_REPLICAS)
+}
+
+/// Spreads data-plane pods across nodes.
+///
+/// Scheduling stays best-effort: on a single-node cluster a `DoNotSchedule`
+/// constraint would leave every replica after the first pending forever.
+fn spread_constraints(labels: &BTreeMap<String, String>) -> Vec<TopologySpreadConstraint> {
+    vec![TopologySpreadConstraint {
+        label_selector: Some(LabelSelector {
+            match_labels: Some(labels.clone()),
+            ..Default::default()
+        }),
+        max_skew: 1,
+        topology_key: "kubernetes.io/hostname".to_owned(),
+        when_unsatisfiable: "ScheduleAnyway".to_owned(),
+        ..Default::default()
+    }]
 }
 
 /// Assembles the final [`Deployment`] object with metadata and spec.
@@ -329,7 +375,7 @@ fn build_deployment_object(
             ..Default::default()
         },
         spec: Some(DeploymentSpec {
-            replicas: Some(1),
+            replicas: Some(desired_replicas(gateway)),
             selector: LabelSelector {
                 match_labels: Some(labels),
                 ..Default::default()
@@ -430,13 +476,65 @@ mod tests {
     }
 
     #[test]
+    fn test_replicas_honour_the_annotation() {
+        let mut gateway = test_gateway();
+        gateway.metadata.annotations = Some(BTreeMap::from([(REPLICAS_ANNOTATION.to_owned(), "5".to_owned())]));
+
+        assert_eq!(
+            desired_replicas(&gateway),
+            5,
+            "an explicit replica count should size the data plane"
+        );
+    }
+
+    #[test]
+    fn test_replicas_reject_nonsense_values() {
+        for value in ["0", "-3", "many", ""] {
+            let mut gateway = test_gateway();
+            gateway.metadata.annotations = Some(BTreeMap::from([(REPLICAS_ANNOTATION.to_owned(), value.to_owned())]));
+
+            assert_eq!(
+                desired_replicas(&gateway),
+                DEFAULT_REPLICAS,
+                "a malformed replica annotation must not scale the data plane to zero: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pods_spread_across_nodes_without_blocking_scheduling() {
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
+
+        let constraints = deployment
+            .spec
+            .and_then(|spec| spec.template.spec)
+            .and_then(|pod| pod.topology_spread_constraints)
+            .expect("spread constraints should be set");
+
+        assert_eq!(
+            constraints[0].topology_key, "kubernetes.io/hostname",
+            "replicas should be spread across nodes"
+        );
+        assert_eq!(
+            constraints[0].when_unsatisfiable, "ScheduleAnyway",
+            "a single-node cluster must still schedule every replica"
+        );
+    }
+
+    #[test]
     fn test_build_deployment_spec() {
         let gateway = test_gateway();
         let ports = vec![("http".to_owned(), 8080)];
         let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
 
         let spec = deployment.spec.expect("spec should be set");
-        assert_eq!(spec.replicas, Some(1), "replicas should be 1");
+        assert_eq!(
+            spec.replicas,
+            Some(DEFAULT_REPLICAS),
+            "a Gateway that asks for nothing should get the redundant default"
+        );
 
         let selector = spec.selector;
         let match_labels = selector.match_labels.expect("match_labels should be set");

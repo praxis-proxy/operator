@@ -5,5 +5,6 @@
 
 pub(crate) mod configmap;
 pub(crate) mod deployment;
+pub(crate) mod disruption;
 pub(crate) mod labels;
 pub(crate) mod service;
