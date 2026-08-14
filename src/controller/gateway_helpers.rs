@@ -45,7 +45,9 @@ use crate::{
     context::CONTROLLER_NAME,
     endpoints,
     error::{OperatorError, Result},
-    gateway_api::{attachment, conditions, hostname, reference_grant, route_status, route_validation, status},
+    gateway_api::{
+        attachment, conditions, hostname, listener_conflict, reference_grant, route_status, route_validation, status,
+    },
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
@@ -171,9 +173,11 @@ pub(super) async fn build_praxis_config(
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
     grants: &[ReferenceGrant],
 ) -> Result<PraxisConfigOutput> {
+    let conflicts = listener_conflict::detect_conflicts(listeners);
     let supported: Vec<_> = listeners
         .iter()
         .filter(|l| l.protocol == "HTTP" || l.protocol == "HTTPS")
+        .filter(|l| !conflicts.contains_key(&l.name))
         .collect();
 
     let listener_hostnames = build_listener_hostname_map(&supported);
@@ -192,7 +196,7 @@ pub(super) async fn build_praxis_config(
     Ok(PraxisConfigOutput {
         config_yaml: serde_yaml::to_string(&config)?,
         listener_ports: collect_listener_ports(&supported),
-        tls_secret_names: collect_tls_secret_names(listeners),
+        tls_secret_names: collect_tls_secret_names(&supported),
     })
 }
 
@@ -449,7 +453,7 @@ fn lcm(a: i64, b: i64) -> i64 {
 }
 
 /// Deduplicates TLS secret names from HTTPS listeners.
-fn collect_tls_secret_names(listeners: &[GatewayListeners]) -> Vec<String> {
+fn collect_tls_secret_names(listeners: &[&GatewayListeners]) -> Vec<String> {
     let mut seen = HashSet::new();
     listeners
         .iter()
@@ -817,13 +821,19 @@ async fn build_listener_statuses(
     client: &kube::Client,
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
 ) -> (Vec<Value>, bool, bool) {
+    let conflicts = listener_conflict::detect_conflicts(listeners);
     let mut statuses = Vec::new();
     let mut any_accepted = false;
     let mut any_rejected = false;
 
     for l in listeners {
-        let protocol_supported = l.protocol == "HTTP" || l.protocol == "HTTPS";
+        if let Some(reason) = conflicts.get(&l.name) {
+            any_rejected = true;
+            statuses.push(conflicted_listener_status(l, generation, *reason));
+            continue;
+        }
 
+        let protocol_supported = l.protocol == "HTTP" || l.protocol == "HTTPS";
         if !protocol_supported {
             any_rejected = true;
             statuses.push(unsupported_listener_status(l, generation));
@@ -837,6 +847,28 @@ async fn build_listener_statuses(
     }
 
     (statuses, any_accepted, any_rejected)
+}
+
+/// Builds a status entry for a listener conflicting with another.
+///
+/// A conflicted listener is not accepted, not programmed, and attaches
+/// no routes: it never reaches the data plane, so claiming otherwise
+/// would misreport what is serving traffic.
+fn conflicted_listener_status(
+    l: &GatewayListeners,
+    generation: i64,
+    reason: listener_conflict::ConflictReason,
+) -> Value {
+    json!({
+        "name": l.name,
+        "attachedRoutes": 0,
+        "supportedKinds": [],
+        "conditions": [
+            conditions::not_accepted(generation, reason.as_str(), reason.message()),
+            conditions::conflicted(generation, reason.as_str(), reason.message()),
+            conditions::not_programmed(generation, reason.as_str(), reason.message()),
+        ],
+    })
 }
 
 /// Builds a status entry for an unsupported-protocol listener.
@@ -1686,9 +1718,10 @@ mod tests {
     #[test]
     fn test_collect_tls_secret_names_deduplicates() {
         let listeners = [https_listener("a", 443, "cert"), https_listener("b", 8443, "cert")];
+        let refs: Vec<_> = listeners.iter().collect();
 
         assert_eq!(
-            collect_tls_secret_names(&listeners),
+            collect_tls_secret_names(&refs),
             vec!["cert".to_owned()],
             "a secret referenced twice is mounted once"
         );
@@ -1697,9 +1730,10 @@ mod tests {
     #[test]
     fn test_collect_tls_secret_names_ignores_http_listeners() {
         let listeners = [listener("http", 80, "HTTP")];
+        let refs: Vec<_> = listeners.iter().collect();
 
         assert!(
-            collect_tls_secret_names(&listeners).is_empty(),
+            collect_tls_secret_names(&refs).is_empty(),
             "plain HTTP listeners have no certificates"
         );
     }

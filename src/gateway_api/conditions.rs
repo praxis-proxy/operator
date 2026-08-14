@@ -74,7 +74,6 @@ pub(crate) fn partially_invalid(generation: i64, message: &str) -> Condition {
 }
 
 /// Returns a `Conflicted: True` condition.
-#[cfg_attr(not(test), expect(dead_code, reason = "available for all condition variants"))]
 pub(crate) fn conflicted(generation: i64, reason: &str, message: &str) -> Condition {
     make_condition("Conflicted", "True", reason, message, generation)
 }
