@@ -319,7 +319,10 @@ fn gateway_programmed_condition(generation: i64, any_accepted: bool, data_plane_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::fixtures::{https_listener, listener, route_with_hostnames};
+    use crate::{
+        controller::fixtures::{https_listener, listener, route_with_hostnames},
+        testing,
+    };
 
     #[test]
     fn test_gateway_programmed_all_ready() {
@@ -433,5 +436,266 @@ mod tests {
             0,
             "a route bound to another section is not attached here"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Status Assembly
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_ready_data_plane_reports_programmed_with_its_address() {
+        let (ctx, journal) = testing::fake_context(
+            vec![service_with_address(), ready_deployment(), gateway_response()],
+            testing::Cached::default(),
+        );
+
+        build_and_apply_gateway_status(&ctx, &gateway(), &[http_listener()], &[])
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        let status = patched_status(&journal);
+        assert_eq!(
+            status.pointer("/addresses/0/value").and_then(Value::as_str),
+            Some("10.0.0.1"),
+            "the load-balancer address is how a client finds the Gateway, so it belongs in status"
+        );
+        assert_eq!(
+            condition_status(&status, "Programmed"),
+            Some("True"),
+            "a Deployment with a ready replica and an address is a programmed data plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_address_without_ready_pods_is_not_programmed() {
+        let (ctx, journal) = testing::fake_context(
+            vec![service_with_address(), gateway_response()],
+            testing::Cached::default(),
+        );
+
+        build_and_apply_gateway_status(&ctx, &gateway(), &[http_listener()], &[])
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        assert_eq!(
+            condition_status(&patched_status(&journal), "Programmed"),
+            Some("False"),
+            "an address in front of no running pods answers nothing, and reporting Programmed \
+             would tell conformance to start sending traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_ready_deployment_without_an_address_is_not_programmed() {
+        let (ctx, journal) =
+            testing::fake_context(vec![ready_deployment(), gateway_response()], testing::Cached::default());
+
+        build_and_apply_gateway_status(&ctx, &gateway(), &[http_listener()], &[])
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        let status = patched_status(&journal);
+        assert_eq!(
+            status.pointer("/addresses").and_then(Value::as_array).map(Vec::len),
+            Some(0),
+            "a Service with no ingress yet yields no addresses, not a missing field"
+        );
+        assert_eq!(
+            condition_status(&status, "Programmed"),
+            Some("False"),
+            "pods with no address in front of them are unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unsupported_protocol_listener_is_rejected_in_status() {
+        let (ctx, journal) = testing::fake_context(vec![gateway_response()], testing::Cached::default());
+        let mut listener = http_listener();
+        listener.protocol = "TCP".to_owned();
+
+        build_and_apply_gateway_status(&ctx, &gateway(), &[listener], &[])
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        let status = patched_status(&journal);
+        assert_eq!(
+            status
+                .pointer("/listeners/0/conditions/0/reason")
+                .and_then(Value::as_str),
+            Some("UnsupportedProtocol"),
+            "the listener has to say why it is not accepted"
+        );
+        assert_eq!(
+            condition_status(&status, "Accepted"),
+            Some("False"),
+            "a Gateway whose only listener was rejected accepts nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_conflicting_pair_of_listeners_is_reported_on_both() {
+        let (ctx, journal) = testing::fake_context(vec![gateway_response()], testing::Cached::default());
+        let mut second = http_listener();
+        second.name = "http-2".to_owned();
+        second.protocol = "HTTPS".to_owned();
+
+        build_and_apply_gateway_status(&ctx, &gateway(), &[http_listener(), second], &[])
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        let status = patched_status(&journal);
+        let conflicted = status
+            .pointer("/listeners")
+            .and_then(Value::as_array)
+            .map(|listeners| {
+                listeners
+                    .iter()
+                    .filter(|l| {
+                        l.pointer("/conditions")
+                            .and_then(Value::as_array)
+                            .is_some_and(|c| c.iter().any(|c| c["type"] == "Conflicted" && c["status"] == "True"))
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+
+        assert_eq!(
+            conflicted, 2,
+            "two protocols on one port is a conflict both listeners are party to, and reporting \
+             it on one leaves the other looking healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unchanged_status_is_not_rewritten() {
+        let (ctx, journal) = testing::fake_context(vec![gateway_response()], testing::Cached::default());
+        let mut gw = gateway();
+
+        build_and_apply_gateway_status(&ctx, &gw, &[http_listener()], &[])
+            .await
+            .expect("the first pass writes");
+        let first = patched_status(&journal);
+        gw.status = serde_json::from_value(first).expect("the computed status is a Gateway status");
+
+        let (ctx, second_journal) = testing::fake_context(vec![gateway_response()], testing::Cached::default());
+        build_and_apply_gateway_status(&ctx, &gw, &[http_listener()], &[])
+            .await
+            .expect("an unchanged status is not a failure");
+
+        assert!(
+            second_journal.matching("/status").is_empty(),
+            "patching an unchanged status wakes this controller's own watch, and an idle Gateway \
+             would reconcile forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_rejected_status_patch_surfaces() {
+        let (client, _) = testing::failing_client();
+
+        let error = apply_gateway_status(&client, &gateway(), &serde_json::json!({ "conditions": [] }))
+            .await
+            .expect_err("a 500 is not success");
+
+        assert!(
+            matches!(error, crate::error::OperatorError::Kube(_)),
+            "a status the API server refused has to be retried, not reported as written: {error}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Returns the `status` sub-object of the patch that was sent.
+    fn patched_status(journal: &testing::Journal) -> Value {
+        journal
+            .matching("/status")
+            .pop()
+            .and_then(|request| request.body)
+            .and_then(|body| body.get("status").cloned())
+            .expect("a status patch should have been sent")
+    }
+
+    /// Returns the status of the named Gateway-level condition.
+    fn condition_status<'a>(status: &'a Value, kind: &str) -> Option<&'a str> {
+        status
+            .pointer("/conditions")?
+            .as_array()?
+            .iter()
+            .find(|c| c["type"] == kind)?
+            .get("status")?
+            .as_str()
+    }
+
+    /// Builds the Gateway these tests report on.
+    fn gateway() -> Gateway {
+        use gateway_api::gateways::GatewaySpec;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_owned()),
+                namespace: Some("infra".to_owned()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "praxis".to_owned(),
+                listeners: vec![http_listener()],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Builds a plain HTTP listener on port 80.
+    fn http_listener() -> GatewayListeners {
+        GatewayListeners {
+            name: "http".to_owned(),
+            port: 80,
+            protocol: "HTTP".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// The child Service, carrying a load-balancer address.
+    fn service_with_address() -> testing::Canned {
+        testing::Canned::ok(
+            "/services/praxis-gw",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": "praxis-gw", "namespace": "infra" },
+                "status": { "loadBalancer": { "ingress": [{ "ip": "10.0.0.1" }] } },
+            }),
+        )
+    }
+
+    /// The child Deployment, with a ready replica.
+    fn ready_deployment() -> testing::Canned {
+        testing::Canned::ok(
+            "/deployments/praxis-gw",
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": { "name": "praxis-gw", "namespace": "infra" },
+                "spec": { "selector": { "matchLabels": {} }, "template": {} },
+                "status": { "readyReplicas": 1 },
+            }),
+        )
+    }
+
+    /// The object the API server hands back from a status apply.
+    fn gateway_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/gateways/gw",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "Gateway",
+                "metadata": { "name": "gw", "namespace": "infra" },
+                "spec": { "gatewayClassName": "praxis", "listeners": [] },
+            }),
+        )
     }
 }
