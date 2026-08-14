@@ -25,6 +25,23 @@ use crate::gateway_api::{hostname::intersect_hostnames, reference_grant::is_refe
 /// takes precedence over `path_prefix`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct PraxisRoute {
+    /// Target cluster name.
+    pub(crate) cluster: String,
+
+    /// Request headers to match (exact match only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) headers: Option<BTreeMap<String, String>>,
+
+    /// Hostname match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<String>,
+
+    /// Listener names this route targets. `None` means all listeners.
+    ///
+    /// Used for per-listener route partitioning; not serialized.
+    #[serde(skip)]
+    pub(crate) listener_names: Vec<Option<String>>,
+
     /// Exact path match. Takes precedence over `path_prefix`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
@@ -32,23 +49,6 @@ pub(crate) struct PraxisRoute {
     /// Path prefix match. Must end with '/'.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) path_prefix: String,
-
-    /// Hostname match.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) host: Option<String>,
-
-    /// Request headers to match (exact match only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) headers: Option<BTreeMap<String, String>>,
-
-    /// Target cluster name.
-    pub(crate) cluster: String,
-
-    /// Listener names this route targets. `None` means all listeners.
-    ///
-    /// Used for per-listener route partitioning; not serialized.
-    #[serde(skip)]
-    pub(crate) listener_names: Vec<Option<String>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -84,11 +84,11 @@ pub(crate) struct BackendRef {
     /// Kubernetes namespace of the backend Service.
     pub(crate) namespace: String,
 
-    /// Backend Service name.
-    pub(crate) service: String,
-
     /// Backend Service port number.
     pub(crate) port: i32,
+
+    /// Backend Service name.
+    pub(crate) service: String,
 
     /// Traffic weight for weighted routing (Gateway API `backendRef.weight`).
     pub(crate) weight: Option<i32>,
@@ -112,7 +112,6 @@ pub(crate) struct BackendRef {
 /// [`intersect_hostnames`]: crate::gateway_api::hostname::intersect_hostnames
 pub(crate) fn convert_routes(
     routes: &[(&HTTPRoute, Vec<Option<String>>)],
-    _gateway_ns: &str,
     listener_hostnames: &HashMap<String, Option<String>>,
     grants: &[ReferenceGrant],
 ) -> (Vec<PraxisRoute>, Vec<BackendRef>) {
@@ -522,7 +521,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, backend_refs) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
             praxis_routes.len(),
@@ -589,7 +588,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(
@@ -650,7 +649,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, backend_refs) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
             praxis_routes.len(),
@@ -699,7 +698,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(
@@ -741,7 +740,7 @@ mod tests {
 
         let grant = make_reference_grant("other-ns", "app-ns", "svc");
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, backend_refs) = convert_routes(&routes, "gateway-ns", &HashMap::new(), &[grant]);
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[grant]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(
@@ -803,7 +802,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
             praxis_routes.len(),
@@ -855,7 +854,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(
@@ -898,7 +897,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &HashMap::new(), &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(praxis_routes[0].path, None, "regex match should have no exact path");
@@ -942,7 +941,7 @@ mod tests {
         listener_map.insert("listener-1".to_owned(), Some("very.specific.com".to_owned()));
 
         let routes = vec![(&route, vec![Some("listener-1".to_owned())])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &listener_map, &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         let hosts: Vec<_> = praxis_routes.iter().filter_map(|r| r.host.as_deref()).collect();
         assert!(
@@ -993,7 +992,7 @@ mod tests {
         listener_map.insert("listener-2".to_owned(), Some("*.wildcard.io".to_owned()));
 
         let routes = vec![(&route, vec![Some("listener-2".to_owned())])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &listener_map, &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         let hosts: Vec<_> = praxis_routes.iter().filter_map(|r| r.host.as_deref()).collect();
         assert!(
@@ -1036,7 +1035,7 @@ mod tests {
         listener_map.insert("listener-1".to_owned(), Some("specific.com".to_owned()));
 
         let routes = vec![(&route, vec![Some("listener-1".to_owned())])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &listener_map, &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         assert_eq!(praxis_routes.len(), 1, "should produce one catch-all route");
         assert_eq!(
@@ -1079,7 +1078,7 @@ mod tests {
         listener_map.insert("listener-1".to_owned(), Some("very.specific.com".to_owned()));
 
         let routes = vec![(&route, vec![Some("listener-1".to_owned())])];
-        let (praxis_routes, _) = convert_routes(&routes, "default", &listener_map, &[]);
+        let (praxis_routes, _) = convert_routes(&routes, &listener_map, &[]);
 
         assert!(
             praxis_routes.is_empty(),
@@ -1134,7 +1133,7 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
-        let (praxis_routes, backend_refs) = convert_routes(&routes, "infra", &HashMap::new(), &[]);
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
             praxis_routes.len(),

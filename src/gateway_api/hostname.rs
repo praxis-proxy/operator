@@ -3,6 +3,8 @@
 
 //! Shared hostname matching for Gateway API route attachment.
 
+use std::collections::BTreeSet;
+
 // -----------------------------------------------------------------------------
 // Hostname Matching
 // -----------------------------------------------------------------------------
@@ -37,12 +39,9 @@ pub(crate) fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
 /// or `None` if the hostnames do not intersect. When a wildcard matches
 /// an exact hostname, the exact hostname is returned.
 ///
-/// ```ignore
-/// assert_eq!(
-///     hostname_intersection("foo.example.com", "*.example.com"),
-///     Some("foo.example.com".to_owned()),
-/// );
-/// ```
+/// A route hostname of `foo.example.com` on a `*.example.com` listener
+/// intersects to `foo.example.com`; `bar.other.com` on the same listener
+/// yields `None`. See `test_intersection_route_exact_listener_wildcard`.
 pub(crate) fn hostname_intersection(route_host: &str, listener_host: &str) -> Option<String> {
     if route_host == listener_host {
         return Some(route_host.to_owned());
@@ -65,23 +64,20 @@ pub(crate) fn hostname_intersection(route_host: &str, listener_host: &str) -> Op
 /// When `listener_hostnames` is empty (listeners without hostname
 /// constraints), all route hostnames pass through unchanged.
 ///
-/// ```ignore
-/// let route = &["non.matching.com".to_owned(), "very.specific.com".to_owned()];
-/// let listeners = &[Some("very.specific.com".to_owned())];
-/// let result = intersect_hostnames(route, listeners);
-/// assert_eq!(result, vec!["very.specific.com"]);
-/// ```
+/// Results keep route-hostname order, which the generated config depends
+/// on. See `test_intersect_filters_non_matching`.
 pub(crate) fn intersect_hostnames(route_hostnames: &[String], listener_hostnames: &[Option<String>]) -> Vec<String> {
     let constrained: Vec<_> = listener_hostnames.iter().filter_map(|h| h.as_deref()).collect();
     if constrained.is_empty() || constrained.len() < listener_hostnames.len() {
         return route_hostnames.to_vec();
     }
 
+    let mut seen = BTreeSet::new();
     let mut result = Vec::new();
     for rh in route_hostnames {
         for lh in &constrained {
             if let Some(intersected) = hostname_intersection(rh, lh) {
-                if !result.contains(&intersected) {
+                if seen.insert(intersected.clone()) {
                     result.push(intersected);
                 }
                 break;

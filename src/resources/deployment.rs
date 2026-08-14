@@ -39,6 +39,9 @@ const PROXY_UID: i64 = 100;
 
 /// Parameters for building a Praxis data-plane [`Deployment`].
 pub(crate) struct DeploymentParams<'a> {
+    /// Child resource name.
+    pub(crate) name: &'a str,
+
     /// SHA-256 hex digest of the `ConfigMap` contents.
     ///
     /// Stored as a pod-template annotation so that config changes trigger a
@@ -47,20 +50,17 @@ pub(crate) struct DeploymentParams<'a> {
     /// detect.
     pub(crate) config_hash: &'a str,
 
-    /// Child resource name.
-    pub(crate) name: &'a str,
+    /// Parent Gateway.
+    pub(crate) gateway: &'a Gateway,
+
+    /// `(listener_name, port)` pairs from Gateway listeners.
+    pub(crate) listener_ports: &'a [(String, i32)],
 
     /// Target namespace.
     pub(crate) namespace: &'a str,
 
-    /// Parent Gateway.
-    pub(crate) gateway: &'a Gateway,
-
     /// Deduplicated TLS secret names from HTTPS listeners.
     pub(crate) tls_secret_names: &'a [String],
-
-    /// `(listener_name, port)` pairs from Gateway listeners.
-    pub(crate) listener_ports: &'a [(String, i32)],
 }
 
 /// Builds a Deployment for the Praxis data-plane.

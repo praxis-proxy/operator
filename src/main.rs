@@ -36,6 +36,10 @@ use tracing::info;
 /// Default tracing directive for the operator crate.
 const DEFAULT_DIRECTIVE: &str = "praxis_operator=info";
 
+/// Label selector restricting owned-resource watches to operator-managed
+/// objects.
+const MANAGED_BY_SELECTOR: &str = "app.kubernetes.io/managed-by=praxis-operator";
+
 // -----------------------------------------------------------------------------
 // Entry Point
 // -----------------------------------------------------------------------------
@@ -44,14 +48,7 @@ const DEFAULT_DIRECTIVE: &str = "praxis_operator=info";
 /// controllers.
 #[tokio::main]
 async fn main() -> error::Result<()> {
-    let directive = DEFAULT_DIRECTIVE
-        .parse()
-        .unwrap_or_else(|_| unreachable!("static directive {DEFAULT_DIRECTIVE} must parse"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(directive))
-        .json()
-        .init();
+    tracing_subscriber::fmt().with_env_filter(env_filter()).json().init();
 
     info!("starting praxis-operator");
     let client = Client::try_default().await?;
@@ -72,6 +69,18 @@ async fn main() -> error::Result<()> {
 // -----------------------------------------------------------------------------
 // Controller Builders
 // -----------------------------------------------------------------------------
+
+/// Builds the tracing filter from `RUST_LOG`, adding the crate default.
+///
+/// A malformed default directive degrades to the environment filter alone
+/// rather than aborting startup.
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    match DEFAULT_DIRECTIVE.parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    }
+}
 
 /// Wires the `GatewayClass` controller.
 ///
@@ -97,12 +106,16 @@ fn build_gc_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
 ///
 /// Watches `Gateway` resources and their owned `Deployment`, `ConfigMap`,
 /// and `Service` children, `HTTPRoute` cross-references, and
-/// `ReferenceGrant` changes.
+/// `ReferenceGrant` changes. Child watches carry the managed-by label
+/// selector so the operator never deserializes unrelated cluster objects.
 fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Future<Output = ()> {
-    Controller::new(Api::<Gateway>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<Deployment>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<ConfigMap>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<Service>::all(client.clone()), watcher::Config::default())
+    let controller = Controller::new(Api::<Gateway>::all(client.clone()), watcher::Config::default());
+    let gateways = controller.store();
+
+    controller
+        .owns(Api::<Deployment>::all(client.clone()), managed_children())
+        .owns(Api::<ConfigMap>::all(client.clone()), managed_children())
+        .owns(Api::<Service>::all(client.clone()), managed_children())
         .watches(
             Api::<HTTPRoute>::all(client.clone()),
             watcher::Config::default(),
@@ -111,7 +124,7 @@ fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
         .watches(
             Api::<ReferenceGrant>::all(client.clone()),
             watcher::Config::default(),
-            |grant| controller::gateway::map_grant_to_gateways(&grant),
+            move |grant| controller::gateway::map_grant_to_gateways(&grant, &gateways.state()),
         )
         .shutdown_on_signal()
         .run(controller::gateway::reconcile, controller::gateway::error_policy, ctx)
@@ -121,6 +134,11 @@ fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
                 Err(e) => tracing::warn!("Gateway reconcile error: {e:?}"),
             }
         })
+}
+
+/// Watcher config scoped to the child resources this operator manages.
+fn managed_children() -> watcher::Config {
+    watcher::Config::default().labels(MANAGED_BY_SELECTOR)
 }
 
 /// Wires the `HTTPRoute` controller.

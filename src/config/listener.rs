@@ -21,10 +21,6 @@ pub(crate) struct PraxisListener {
     /// Bind address (e.g., "0.0.0.0:80").
     pub(crate) address: String,
 
-    /// Protocol (omit for HTTP, "http" for HTTPS with TLS).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) protocol: Option<String>,
-
     /// Filter chain names.
     pub(crate) filter_chains: Vec<String>,
 
@@ -41,6 +37,10 @@ pub(crate) struct PraxisListener {
     /// any of these section names belong to this listener's filter chain.
     #[serde(skip)]
     pub(crate) merged_section_names: Vec<String>,
+
+    /// Protocol (omit for HTTP, "http" for HTTPS with TLS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) protocol: Option<String>,
 
     /// TLS configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,10 +93,10 @@ pub(crate) fn convert_listener(listener: &GatewayListeners, chain_name: &str) ->
     PraxisListener {
         name: listener.name.clone(),
         address,
-        protocol: is_https.then(|| "http".to_owned()),
         filter_chains: vec![chain_name.to_owned()],
         hostname: listener.hostname.clone(),
         merged_section_names: vec![listener.name.clone()],
+        protocol: is_https.then(|| "http".to_owned()),
         tls: if is_https { build_tls_config(listener) } else { None },
     }
 }

@@ -190,16 +190,17 @@ fn collect_route_listener_hostnames(
     route: &PraxisRoute,
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> Vec<String> {
-    let mut seen = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut hostnames = Vec::new();
     for ln in &route.listener_names {
         let Some(section) = ln.as_ref() else { continue };
         if let Some(Some(hostname)) = listener_hostnames.get(section)
-            && !seen.contains(hostname)
+            && seen.insert(hostname.clone())
         {
-            seen.push(hostname.clone());
+            hostnames.push(hostname.clone());
         }
     }
-    seen
+    hostnames
 }
 
 /// Sorts owned routes by specificity (same logic as reference version).

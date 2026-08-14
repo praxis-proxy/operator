@@ -174,3 +174,307 @@ fn resolve_target_port(svc: &Service, service_port: i32) -> i32 {
         })
         .unwrap_or(service_port)
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::allow_attributes,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::default_trait_access,
+    clippy::match_wildcard_for_single_variants,
+    clippy::missing_assert_message,
+    reason = "tests"
+)]
+mod tests {
+    use k8s_openapi::{
+        api::{
+            core::v1::{EndpointAddress, EndpointPort, EndpointSubset, ServicePort, ServiceSpec},
+            discovery::v1::{Endpoint, EndpointConditions},
+        },
+        apimachinery::pkg::util::intstr::IntOrString,
+    };
+    use kube::core::Status;
+
+    use super::*;
+
+    #[test]
+    fn test_resolve_target_port_numeric_target() {
+        let svc = service(&[(80, Some(IntOrString::Int(8080)))]);
+
+        assert_eq!(
+            resolve_target_port(&svc, 80),
+            8080,
+            "a numeric targetPort should be used verbatim"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_port_without_target_falls_back() {
+        let svc = service(&[(80, None)]);
+
+        assert_eq!(
+            resolve_target_port(&svc, 80),
+            80,
+            "an unset targetPort defaults to the service port"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_port_named_target_falls_back() {
+        let svc = service(&[(80, Some(IntOrString::String("http".to_owned())))]);
+
+        assert_eq!(
+            resolve_target_port(&svc, 80),
+            80,
+            "a named targetPort cannot be resolved here and falls back to the service port"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_port_selects_the_matching_service_port() {
+        let svc = service(&[(80, Some(IntOrString::Int(8080))), (443, Some(IntOrString::Int(8443)))]);
+
+        assert_eq!(
+            resolve_target_port(&svc, 443),
+            8443,
+            "the ServicePort matching the requested port should win"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_port_unknown_port_falls_back() {
+        let svc = service(&[(80, Some(IntOrString::Int(8080)))]);
+
+        assert_eq!(
+            resolve_target_port(&svc, 9000),
+            9000,
+            "an unmatched service port falls back to itself"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_port_without_spec() {
+        let svc = Service::default();
+
+        assert_eq!(
+            resolve_target_port(&svc, 80),
+            80,
+            "a Service without a spec falls back to the requested port"
+        );
+    }
+
+    #[test]
+    fn test_is_endpoint_ready_defaults_to_true() {
+        assert!(
+            is_endpoint_ready(&endpoint("10.0.0.1", None)),
+            "an endpoint without conditions is assumed ready"
+        );
+    }
+
+    #[test]
+    fn test_is_endpoint_ready_honours_conditions() {
+        assert!(
+            is_endpoint_ready(&endpoint("10.0.0.1", Some(true))),
+            "a ready endpoint should be used"
+        );
+        assert!(
+            !is_endpoint_ready(&endpoint("10.0.0.1", Some(false))),
+            "an unready endpoint must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_slice_port_prefers_the_matching_port() {
+        let slice = endpoint_slice(&[8080, 9090], &[]);
+
+        assert_eq!(
+            resolve_slice_port(&slice, 9090),
+            9090,
+            "the slice port equal to the target port should be chosen"
+        );
+    }
+
+    #[test]
+    fn test_resolve_slice_port_falls_back_to_the_first_port() {
+        let slice = endpoint_slice(&[8080, 9090], &[]);
+
+        assert_eq!(
+            resolve_slice_port(&slice, 1234),
+            8080,
+            "an unmatched target port falls back to the first slice port"
+        );
+    }
+
+    #[test]
+    fn test_resolve_slice_port_without_ports() {
+        let mut slice = endpoint_slice(&[], &[]);
+        slice.ports = None;
+
+        assert_eq!(
+            resolve_slice_port(&slice, 8080),
+            8080,
+            "a slice without ports falls back to the target port"
+        );
+    }
+
+    #[test]
+    fn test_collect_slice_addresses_skips_unready_endpoints() {
+        let slice = endpoint_slice(&[8080], &[("10.0.0.1", Some(true)), ("10.0.0.2", Some(false))]);
+        let mut out = Vec::new();
+
+        collect_slice_addresses(&slice, 8080, &mut out);
+
+        assert_eq!(
+            out,
+            vec!["10.0.0.1:8080".to_owned()],
+            "only ready endpoints belong in the data-plane config"
+        );
+    }
+
+    #[test]
+    fn test_collect_endpoint_addresses_matches_port() {
+        let ep = endpoints_resource(&[8080, 9090], &["10.0.0.1", "10.0.0.2"]);
+
+        assert_eq!(
+            collect_endpoint_addresses(ep, 9090),
+            vec!["10.0.0.1:9090".to_owned(), "10.0.0.2:9090".to_owned()],
+            "every address should be paired with the matching subset port"
+        );
+    }
+
+    #[test]
+    fn test_collect_endpoint_addresses_falls_back_to_the_first_port() {
+        let ep = endpoints_resource(&[8080, 9090], &["10.0.0.1"]);
+
+        assert_eq!(
+            collect_endpoint_addresses(ep, 1234),
+            vec!["10.0.0.1:8080".to_owned()],
+            "an unmatched target port falls back to the first subset port"
+        );
+    }
+
+    #[test]
+    fn test_collect_endpoint_addresses_without_subsets() {
+        assert!(
+            collect_endpoint_addresses(Endpoints::default(), 80).is_empty(),
+            "an Endpoints resource with no subsets yields no addresses"
+        );
+    }
+
+    #[test]
+    fn test_not_found_to_none_maps_404() {
+        let result = not_found_to_none::<Service>(api_error(404), "service", "apps", "svc");
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a 404 should be reported as an absent resource, not an error"
+        );
+    }
+
+    #[test]
+    fn test_not_found_to_none_propagates_other_errors() {
+        let result = not_found_to_none::<Service>(api_error(403), "service", "apps", "svc");
+
+        assert!(result.is_err(), "a non-404 API error must propagate");
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    /// Builds a Service exposing the given `(port, target_port)` pairs.
+    fn service(ports: &[(i32, Option<IntOrString>)]) -> Service {
+        Service {
+            spec: Some(ServiceSpec {
+                ports: Some(
+                    ports
+                        .iter()
+                        .map(|(port, target)| ServicePort {
+                            port: *port,
+                            target_port: target.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an `EndpointSlice` endpoint with an optional ready condition.
+    fn endpoint(address: &str, ready: Option<bool>) -> Endpoint {
+        Endpoint {
+            addresses: vec![address.to_owned()],
+            conditions: ready.map(|r| EndpointConditions {
+                ready: Some(r),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an `EndpointSlice` with the given ports and endpoints.
+    fn endpoint_slice(ports: &[i32], addresses: &[(&str, Option<bool>)]) -> EndpointSlice {
+        EndpointSlice {
+            address_type: "IPv4".to_owned(),
+            endpoints: addresses.iter().map(|(a, r)| endpoint(a, *r)).collect(),
+            metadata: Default::default(),
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|p| k8s_openapi::api::discovery::v1::EndpointPort {
+                        port: Some(*p),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Builds a classic `Endpoints` resource with one subset.
+    fn endpoints_resource(ports: &[i32], addresses: &[&str]) -> Endpoints {
+        Endpoints {
+            subsets: Some(vec![EndpointSubset {
+                addresses: Some(
+                    addresses
+                        .iter()
+                        .map(|a| EndpointAddress {
+                            ip: (*a).to_owned(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ports: Some(
+                    ports
+                        .iter()
+                        .map(|p| EndpointPort {
+                            port: *p,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a kube API error carrying the given HTTP status code.
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(Status {
+            code,
+            message: "boom".to_owned(),
+            reason: "Boom".to_owned(),
+            ..Default::default()
+        }))
+    }
+}

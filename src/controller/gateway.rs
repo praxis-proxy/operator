@@ -26,6 +26,13 @@ use crate::{
 };
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// API group owning `Gateway` and `HTTPRoute`.
+const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
+
+// -----------------------------------------------------------------------------
 // Reconciler
 // -----------------------------------------------------------------------------
 
@@ -91,11 +98,16 @@ async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
     let routes = list_all_routes(&ctx.client).await?;
     let attached = gateway_helpers::collect_routes(&ctx.client, &gw, &routes).await;
     let ns = gw.namespace().unwrap_or_default();
-    let config_changed = apply_config_if_supported(&ctx.client, &gw, &attached, &ns).await?;
+    let grants = list_all_grants(&ctx.client).await?;
+    let config_changed = apply_config_if_supported(&ctx.client, &gw, &attached, &ns, &grants).await?;
 
     gateway_helpers::build_and_apply_gateway_status(&ctx.client, &gw, &gw.spec.listeners, &attached).await?;
 
-    let can_accept = check_route_acceptance(&ctx.client, &gw, &attached, &ns, config_changed).await?;
+    let can_accept = can_accept_routes(&ctx.client, &gw, &ns, config_changed).await;
+    if can_accept {
+        gateway_helpers::update_route_parent_statuses(&ctx.client, &gw, &attached, &grants).await?;
+    }
+
     let requeue_secs = if can_accept { 15 } else { 2 };
     Ok(Action::requeue(Duration::from_secs(requeue_secs)))
 }
@@ -109,6 +121,7 @@ async fn apply_config_if_supported(
     gw: &Gateway,
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
     ns: &str,
+    grants: &[ReferenceGrant],
 ) -> Result<bool> {
     let has_supported = gw
         .spec
@@ -121,40 +134,28 @@ async fn apply_config_if_supported(
 
     let child = crate::resources::labels::child_name(&gw.name_any());
     let prev_hash = gateway_helpers::current_deployment_hash(client, ns, &child).await;
-    let config = gateway_helpers::build_praxis_config(client, &gw.spec.listeners, attached, ns).await?;
+    let config = gateway_helpers::build_praxis_config(client, &gw.spec.listeners, attached, grants).await?;
     let new_hash = Box::pin(gateway_helpers::apply_child_resources(client, gw, &config)).await?;
+
     let changed = prev_hash.as_deref() != Some(&new_hash);
-    log_config_apply(&gw.name_any(), changed, attached.len());
+    debug!(
+        gateway = %gw.name_any(),
+        config_changed = changed,
+        routes = attached.len(),
+        "config apply result"
+    );
     Ok(changed)
 }
 
-/// Accepts routes when the config is stable and the Deployment is
-/// fully rolled out.
-async fn check_route_acceptance(
-    client: &kube::Client,
-    gw: &Gateway,
-    attached: &[(&HTTPRoute, Vec<Option<String>>)],
-    ns: &str,
-    config_changed: bool,
-) -> Result<bool> {
+/// Returns `true` when the config is stable and the Deployment is fully
+/// rolled out, so attached routes may be marked accepted.
+async fn can_accept_routes(client: &kube::Client, gw: &Gateway, ns: &str, config_changed: bool) -> bool {
     let child = crate::resources::labels::child_name(&gw.name_any());
     let rolled_out = gateway_helpers::is_deployment_rolled_out(client, ns, &child).await;
+
     let can_accept = !config_changed && rolled_out;
-    log_acceptance_decision(&gw.name_any(), can_accept);
-    if can_accept {
-        gateway_helpers::update_route_parent_statuses(client, gw, attached).await?;
-    }
-    Ok(can_accept)
-}
-
-/// Logs the result of a config apply cycle.
-fn log_config_apply(gateway: &str, config_changed: bool, routes: usize) {
-    debug!(gateway, config_changed, routes, "config apply result");
-}
-
-/// Logs the route acceptance decision.
-fn log_acceptance_decision(gateway: &str, can_accept: bool) {
-    debug!(gateway, can_accept, "route acceptance decision");
+    debug!(gateway = %gw.name_any(), can_accept, "route acceptance decision");
+    can_accept
 }
 
 /// Lists all `HTTPRoute` resources across all namespaces.
@@ -165,7 +166,7 @@ async fn list_all_routes(client: &kube::Client) -> Result<Vec<HTTPRoute>> {
 }
 
 /// Lists all `ReferenceGrant` resources across all namespaces.
-pub(super) async fn list_all_grants(client: &kube::Client) -> Result<Vec<ReferenceGrant>> {
+async fn list_all_grants(client: &kube::Client) -> Result<Vec<ReferenceGrant>> {
     let api = Api::<ReferenceGrant>::all(client.clone());
     let list = api.list(&kube::api::ListParams::default()).await?;
     Ok(list.items)
@@ -203,11 +204,6 @@ fn cleanup(gw: &Gateway) {
         tracing::warn!(gateway = %name, "Gateway has no namespace during cleanup");
         String::new()
     });
-    log_cleanup(&ns, &name);
-}
-
-/// Logs a Gateway cleanup event.
-fn log_cleanup(ns: &str, name: &str) {
     info!("cleaning up Gateway {ns}/{name} (owner refs handle child deletion)");
 }
 
@@ -263,33 +259,14 @@ async fn reject_gateway(
     reason: &str,
     message: &str,
 ) -> Result<()> {
-    let ns = gw.namespace().unwrap_or_default();
-    let name = gw.name_any();
-
     let status = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": { "name": name, "namespace": ns },
-        "status": {
-            "conditions": [
-                conditions::not_accepted(generation, reason, message),
-                conditions::not_programmed(
-                    generation, "Invalid", message,
-                ),
-            ],
-        },
+        "conditions": [
+            conditions::not_accepted(generation, reason, message),
+            conditions::not_programmed(generation, "Invalid", message),
+        ],
     });
 
-    let gw_api = Api::<Gateway>::namespaced(client.clone(), &ns);
-    gw_api
-        .patch_status(
-            &name,
-            &PatchParams::apply("praxis-operator").force(),
-            &Patch::Apply(&status),
-        )
-        .await?;
-
-    Ok(())
+    gateway_helpers::apply_gateway_status(client, gw, &status).await
 }
 
 // -----------------------------------------------------------------------------
@@ -309,16 +286,43 @@ pub(crate) fn map_route_to_gateway(route: &HTTPRoute) -> Option<ObjectRef<Gatewa
     find_gateway_parent_ref(parent_refs, route_ns)
 }
 
-/// Maps a [`ReferenceGrant`] change to affected Gateways.
+/// Maps a [`ReferenceGrant`] change to the Gateways it can affect.
 ///
-/// Returns an empty vec because the mapper lacks API access to find
-/// specific Gateways. The Gateway controller's 15-second requeue
-/// ensures convergence after grant changes.
-///
-/// The watch itself ensures the controller is notified of grant
-/// creation/deletion events, which resets the requeue timer.
-pub(crate) fn map_grant_to_gateways(_grant: &ReferenceGrant) -> Vec<ObjectRef<Gateway>> {
-    Vec::new()
+/// `known_gateways` is the controller's own cache, so the mapper needs
+/// no extra API calls. A grant trusting `Gateway` sources only affects
+/// Gateways in the trusted namespace (cross-namespace TLS secrets); a
+/// grant trusting route sources can affect any Gateway, because a route
+/// in the trusted namespace may attach anywhere.
+pub(crate) fn map_grant_to_gateways(
+    grant: &ReferenceGrant,
+    known_gateways: &[Arc<Gateway>],
+) -> Vec<ObjectRef<Gateway>> {
+    let mut refs = Vec::new();
+
+    for gw in known_gateways {
+        let gw_ns = gw.namespace().unwrap_or_default();
+        if grant_affects_namespace(grant, &gw_ns) {
+            refs.push(ObjectRef::new(&gw.name_any()).within(&gw_ns));
+        }
+    }
+
+    debug!(
+        grant = %grant.name_any(),
+        gateways = refs.len(),
+        "mapped ReferenceGrant change to Gateways"
+    );
+    refs
+}
+
+/// Returns `true` when a grant's `from` list can influence Gateways in
+/// `gateway_ns`.
+fn grant_affects_namespace(grant: &ReferenceGrant, gateway_ns: &str) -> bool {
+    grant.spec.from.iter().any(|from| {
+        if from.group != GATEWAY_GROUP {
+            return false;
+        }
+        from.kind != "Gateway" || from.namespace == gateway_ns
+    })
 }
 
 /// Finds the first Gateway parent ref and returns an [`ObjectRef`] for it.
@@ -327,9 +331,9 @@ fn find_gateway_parent_ref(
     route_ns: &str,
 ) -> Option<ObjectRef<Gateway>> {
     for parent in parent_refs {
-        let group = parent.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+        let group = parent.group.as_deref().unwrap_or(GATEWAY_GROUP);
         let kind = parent.kind.as_deref().unwrap_or("Gateway");
-        if group == "gateway.networking.k8s.io" && kind == "Gateway" {
+        if group == GATEWAY_GROUP && kind == "Gateway" {
             let gw_ns = parent.namespace.as_deref().unwrap_or(route_ns);
             return Some(ObjectRef::new(&parent.name).within(gw_ns));
         }
@@ -356,7 +360,10 @@ fn find_gateway_parent_ref(
     reason = "tests"
 )]
 mod tests {
-    use gateway_api::httproutes::{HTTPRoute, HttpRouteParentRefs, HttpRouteSpec};
+    use gateway_api::{
+        httproutes::{HTTPRoute, HttpRouteParentRefs, HttpRouteSpec},
+        referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo},
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
@@ -466,5 +473,101 @@ mod tests {
             !has_parameters_ref(&gw),
             "default gateway should have no parameters ref"
         );
+    }
+
+    #[test]
+    fn test_map_grant_to_gateways_returns_matching_gateway() {
+        let gateways = [gateway("gw", "infra")];
+        let refs = map_grant_to_gateways(&grant("Gateway", "infra"), &gateways);
+
+        assert_eq!(refs.len(), 1, "a Gateway in the trusted namespace should be enqueued");
+        assert_eq!(refs[0].name, "gw", "the enqueued ref should name the Gateway");
+        assert_eq!(
+            refs[0].namespace.as_deref(),
+            Some("infra"),
+            "the enqueued ref should carry the Gateway namespace"
+        );
+    }
+
+    #[test]
+    fn test_map_grant_to_gateways_skips_untrusted_namespaces() {
+        let gateways = [gateway("gw", "other")];
+
+        assert!(
+            map_grant_to_gateways(&grant("Gateway", "infra"), &gateways).is_empty(),
+            "a Gateway-sourced grant must not enqueue Gateways from other namespaces"
+        );
+    }
+
+    #[test]
+    fn test_map_grant_to_gateways_route_source_reaches_every_gateway() {
+        let gateways = [gateway("a", "infra"), gateway("b", "edge")];
+        let refs = map_grant_to_gateways(&grant("HTTPRoute", "apps"), &gateways);
+
+        assert_eq!(
+            refs.len(),
+            2,
+            "a route-sourced grant can affect any Gateway the route attaches to"
+        );
+    }
+
+    #[test]
+    fn test_map_grant_to_gateways_ignores_foreign_groups() {
+        let gateways = [gateway("gw", "infra")];
+        let mut foreign = grant("Gateway", "infra");
+        foreign.spec.from[0].group = "example.com".to_owned();
+
+        assert!(
+            map_grant_to_gateways(&foreign, &gateways).is_empty(),
+            "a grant trusting a non-Gateway-API source is irrelevant to this controller"
+        );
+    }
+
+    #[test]
+    fn test_map_grant_to_gateways_without_gateways_is_empty() {
+        assert!(
+            map_grant_to_gateways(&grant("HTTPRoute", "apps"), &[]).is_empty(),
+            "an empty cache enqueues nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    /// Builds a Gateway cache entry with the given name and namespace.
+    fn gateway(name: &str, namespace: &str) -> Arc<Gateway> {
+        Arc::new(Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_owned()),
+                namespace: Some(namespace.to_owned()),
+                ..Default::default()
+            },
+            spec: Default::default(),
+            status: None,
+        })
+    }
+
+    /// Builds a `ReferenceGrant` trusting `from_kind` sources in `from_ns`.
+    fn grant(from_kind: &str, from_ns: &str) -> ReferenceGrant {
+        ReferenceGrant {
+            metadata: ObjectMeta {
+                name: Some("allow".to_owned()),
+                namespace: Some("data".to_owned()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: GATEWAY_GROUP.to_owned(),
+                    kind: from_kind.to_owned(),
+                    namespace: from_ns.to_owned(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: String::new(),
+                    kind: "Secret".to_owned(),
+                    name: None,
+                }],
+            },
+        }
     }
 }

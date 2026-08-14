@@ -6,34 +6,81 @@
 //! Contains validation, namespace filtering, and label-selector matching
 //! logic used by the main Gateway controller.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use futures::future::try_join_all;
 use gateway_api::{
+    gatewayclasses::GatewayClass,
     gateways::{
-        Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
-        GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions,
+        Gateway, GatewayListeners, GatewayListenersAllowedRoutesKinds, GatewayListenersAllowedRoutesNamespacesFrom,
+        GatewayListenersAllowedRoutesNamespacesSelector,
+        GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewayListenersTlsCertificateRefs,
     },
-    httproutes::HTTPRoute,
+    httproutes::{HTTPRoute, HttpRouteParentRefs},
+    referencegrants::ReferenceGrant,
 };
-use k8s_openapi::api::{
-    apps::v1::Deployment,
-    core::v1::{Namespace, Service, ServicePort},
+use k8s_openapi::{
+    ByteString,
+    api::{
+        apps::v1::{Deployment, DeploymentStatus},
+        core::v1::{Namespace, Secret, Service, ServicePort},
+    },
+    apimachinery::pkg::{apis::meta::v1::Condition, util::intstr::IntOrString},
 };
-use kube::{Api, ResourceExt as _, api::PatchParams};
-use serde_json::json;
-use tracing::{debug, info};
+use kube::{
+    Api, ResourceExt as _,
+    api::{ListParams, ObjectList, Patch, PatchParams},
+};
+use serde_json::{Value, json};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{
-        cluster::build_cluster, filter_conversion::convert_filters, generate::assemble_config,
-        listener::convert_listener, routing::convert_routes,
+        cluster::{PraxisCluster, build_cluster},
+        filter_conversion::convert_filters,
+        generate::assemble_config,
+        listener::{PraxisCertificate, PraxisListener, PraxisTls, convert_listener},
+        routing::{BackendRef, PraxisFilterEntry, PraxisRoute, convert_routes},
     },
     context::CONTROLLER_NAME,
     endpoints,
     error::{OperatorError, Result},
-    gateway_api::{attachment, conditions},
-    resources::{configmap::build_configmap, deployment::build_deployment, labels::child_name, service::build_service},
+    gateway_api::{attachment, conditions, hostname, reference_grant, route_status, status},
+    resources::{
+        configmap::build_configmap,
+        deployment::{DeploymentParams, build_deployment},
+        labels::child_name,
+        service::build_service,
+    },
 };
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Field manager used for every server-side apply the operator issues.
+const FIELD_MANAGER: &str = "praxis-operator";
+
+/// Backend `Service` lookups issued concurrently while resolving clusters.
+const MAX_CONCURRENT_BACKEND_LOOKUPS: usize = 16;
+
+// -----------------------------------------------------------------------------
+// Type Aliases
+// -----------------------------------------------------------------------------
+
+/// A resolved backend: its Gateway API weight and its ready endpoints.
+type ResolvedBackend = (i32, Vec<String>);
+
+/// Ceiling on the least-common-multiple denominator used to spread a
+/// service weight across its endpoints.
+///
+/// Gateway API allows `backendRef.weight` up to 1,000,000; without a
+/// ceiling, coprime endpoint counts drive the denominator high enough to
+/// overflow the weight arithmetic.
+const MAX_LCM_DENOMINATOR: i64 = 1_000_000; // 1e6
+
+/// Largest weight the generated data-plane config can carry.
+const MAX_ENDPOINT_WEIGHT: i64 = 2_147_483_647; // i32::MAX
 
 // -----------------------------------------------------------------------------
 // GatewayClass Validation
@@ -61,37 +108,25 @@ pub(super) async fn validate_gateway_class(client: &kube::Client, gw: &Gateway) 
 }
 
 /// Fetches a `GatewayClass` by name, mapping API errors.
-async fn fetch_gateway_class(
-    client: &kube::Client,
-    gc_name: &str,
-) -> Result<gateway_api::gatewayclasses::GatewayClass> {
-    let api = Api::<gateway_api::gatewayclasses::GatewayClass>::all(client.clone());
+async fn fetch_gateway_class(client: &kube::Client, gc_name: &str) -> Result<GatewayClass> {
+    let api = Api::<GatewayClass>::all(client.clone());
     api.get(gc_name).await.map_err(|e| map_gc_error(e, gc_name))
 }
 
 /// Maps a `GatewayClass` lookup error to an operator error.
 fn map_gc_error(e: kube::Error, gc_name: &str) -> OperatorError {
     if is_api_not_found(&e) {
-        log_gc_not_found(gc_name);
+        debug!("GatewayClass {gc_name} not found");
         return OperatorError::GatewayClassNotFound(gc_name.to_owned());
     }
-    log_gc_lookup_failure(&e);
+
+    debug!(%e, "GatewayClass lookup failed");
     OperatorError::Kube(e)
 }
 
 /// Returns `true` when the error is a 404 API response.
 fn is_api_not_found(e: &kube::Error) -> bool {
     matches!(e, kube::Error::Api(resp) if resp.code == 404)
-}
-
-/// Logs that a `GatewayClass` was not found.
-fn log_gc_not_found(gc_name: &str) {
-    tracing::debug!("GatewayClass {gc_name} not found");
-}
-
-/// Logs a non-404 kube error during `GatewayClass` lookup.
-fn log_gc_lookup_failure(e: &kube::Error) {
-    tracing::debug!(%e, "GatewayClass lookup failed");
 }
 
 // -----------------------------------------------------------------------------
@@ -121,11 +156,11 @@ pub(super) struct PraxisConfigOutput {
     /// Serialized YAML configuration.
     pub(super) config_yaml: String,
 
-    /// TLS secret names referenced by HTTPS listeners (deduplicated).
-    pub(super) tls_secret_names: Vec<String>,
-
     /// Deduplicated `(listener_name, port)` pairs.
     pub(super) listener_ports: Vec<(String, i32)>,
+
+    /// TLS secret names referenced by HTTPS listeners (deduplicated).
+    pub(super) tls_secret_names: Vec<String>,
 }
 
 /// Converts Gateway listeners, attached routes, and resolved endpoints
@@ -134,7 +169,7 @@ pub(super) async fn build_praxis_config(
     client: &kube::Client,
     listeners: &[GatewayListeners],
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
-    ns: &str,
+    grants: &[ReferenceGrant],
 ) -> Result<PraxisConfigOutput> {
     let supported: Vec<_> = listeners
         .iter()
@@ -143,8 +178,7 @@ pub(super) async fn build_praxis_config(
 
     let listener_hostnames = build_listener_hostname_map(&supported);
     let praxis_listeners = merge_listeners_by_port(&supported);
-    let grants = super::gateway::list_all_grants(client).await?;
-    let (praxis_routes, backend_refs) = convert_attached_routes(attached, ns, &listener_hostnames, &grants);
+    let (praxis_routes, backend_refs) = convert_attached_routes(attached, &listener_hostnames, grants);
     let extra_filters = collect_filters(attached);
     let clusters = resolve_clusters(client, &backend_refs).await?;
     let config = assemble_config(
@@ -154,19 +188,18 @@ pub(super) async fn build_praxis_config(
         &extra_filters,
         &listener_hostnames,
     )?;
-    let config_yaml = serde_yaml::to_string(&config)?;
 
     Ok(PraxisConfigOutput {
-        config_yaml,
-        tls_secret_names: collect_tls_secret_names(listeners),
+        config_yaml: serde_yaml::to_string(&config)?,
         listener_ports: collect_listener_ports(&supported),
+        tls_secret_names: collect_tls_secret_names(listeners),
     })
 }
 
 /// Merges Gateway listeners on the same port into a single Praxis
 /// listener, combining TLS certificates from all listeners in the group.
-fn merge_listeners_by_port(supported: &[&GatewayListeners]) -> Vec<crate::config::listener::PraxisListener> {
-    let mut by_port: std::collections::BTreeMap<i32, Vec<&GatewayListeners>> = std::collections::BTreeMap::new();
+fn merge_listeners_by_port(supported: &[&GatewayListeners]) -> Vec<PraxisListener> {
+    let mut by_port: BTreeMap<i32, Vec<&GatewayListeners>> = BTreeMap::new();
     for l in supported {
         by_port.entry(l.port).or_default().push(l);
     }
@@ -185,11 +218,11 @@ fn merge_listeners_by_port(supported: &[&GatewayListeners]) -> Vec<crate::config
 }
 
 /// Merges TLS certificates from all listeners in a port group.
-fn merge_tls_certs(listener: &mut crate::config::listener::PraxisListener, group: &[&GatewayListeners]) {
+fn merge_tls_certs(listener: &mut PraxisListener, group: &[&GatewayListeners]) {
     if group.len() <= 1 {
         return;
     }
-    let mut all_certs: Vec<crate::config::listener::PraxisCertificate> = listener
+    let mut all_certs: Vec<PraxisCertificate> = listener
         .tls
         .as_ref()
         .map(|t| t.certificates.clone())
@@ -200,14 +233,14 @@ fn merge_tls_certs(listener: &mut crate::config::listener::PraxisListener, group
     }
 
     if !all_certs.is_empty() {
-        listener.tls = Some(crate::config::listener::PraxisTls {
+        listener.tls = Some(PraxisTls {
             certificates: all_certs,
         });
     }
 }
 
 /// Collects TLS certificates from a single listener into the cert list.
-fn collect_listener_certs(l: &GatewayListeners, certs: &mut Vec<crate::config::listener::PraxisCertificate>) {
+fn collect_listener_certs(l: &GatewayListeners, certs: &mut Vec<PraxisCertificate>) {
     let Some(tls) = &l.tls else { return };
     let Some(refs) = &tls.certificate_refs else { return };
     for cert_ref in refs {
@@ -215,7 +248,7 @@ fn collect_listener_certs(l: &GatewayListeners, certs: &mut Vec<crate::config::l
             Some(h) => (Some(vec![h.clone()]), None),
             None => (None, Some(true)),
         };
-        certs.push(crate::config::listener::PraxisCertificate {
+        certs.push(PraxisCertificate {
             cert_path: format!("/tls/{}/tls.crt", cert_ref.name),
             key_path: format!("/tls/{}/tls.key", cert_ref.name),
             server_names,
@@ -225,26 +258,22 @@ fn collect_listener_certs(l: &GatewayListeners, certs: &mut Vec<crate::config::l
 }
 
 /// Builds a map from listener section name to its hostname constraint.
-fn build_listener_hostname_map(listeners: &[&GatewayListeners]) -> std::collections::HashMap<String, Option<String>> {
+fn build_listener_hostname_map(listeners: &[&GatewayListeners]) -> HashMap<String, Option<String>> {
     listeners.iter().map(|l| (l.name.clone(), l.hostname.clone())).collect()
 }
 
 /// Converts attached routes to Praxis routes and collects backend refs.
 fn convert_attached_routes(
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
-    ns: &str,
-    listener_hostnames: &std::collections::HashMap<String, Option<String>>,
-    grants: &[gateway_api::referencegrants::ReferenceGrant],
-) -> (
-    Vec<crate::config::routing::PraxisRoute>,
-    Vec<crate::config::routing::BackendRef>,
-) {
+    listener_hostnames: &HashMap<String, Option<String>>,
+    grants: &[ReferenceGrant],
+) -> (Vec<PraxisRoute>, Vec<BackendRef>) {
     let route_refs: Vec<_> = attached.iter().map(|(r, s)| (*r, s.clone())).collect();
-    convert_routes(&route_refs, ns, listener_hostnames, grants)
+    convert_routes(&route_refs, listener_hostnames, grants)
 }
 
 /// Extracts and converts filters from all attached route rules.
-fn collect_filters(attached: &[(&HTTPRoute, Vec<Option<String>>)]) -> Vec<crate::config::routing::PraxisFilterEntry> {
+fn collect_filters(attached: &[(&HTTPRoute, Vec<Option<String>>)]) -> Vec<PraxisFilterEntry> {
     let all_rules: Vec<_> = attached
         .iter()
         .flat_map(|(route, _)| route.spec.rules.as_deref().unwrap_or(&[]))
@@ -258,37 +287,52 @@ fn collect_filters(attached: &[(&HTTPRoute, Vec<Option<String>>)]) -> Vec<crate:
 /// Service-level weights are normalized across endpoints so that the
 /// overall traffic split matches the configured backend weights
 /// regardless of how many pods each service has.
-async fn resolve_clusters(
-    client: &kube::Client,
-    backend_refs: &[crate::config::routing::BackendRef],
-) -> Result<Vec<crate::config::cluster::PraxisCluster>> {
-    let mut cluster_data: std::collections::BTreeMap<String, Vec<_>> = std::collections::BTreeMap::new();
+async fn resolve_clusters(client: &kube::Client, backend_refs: &[BackendRef]) -> Result<Vec<PraxisCluster>> {
+    let resolved = resolve_backends(client, backend_refs).await?;
 
-    for backend in backend_refs {
-        let eps = endpoints::resolve_endpoints(client, &backend.namespace, &backend.service, backend.port).await?;
-        let weight = backend.weight.unwrap_or(1);
+    let mut cluster_data: BTreeMap<String, Vec<ResolvedBackend>> = BTreeMap::new();
+    for (backend, entry) in backend_refs.iter().zip(resolved) {
         cluster_data
             .entry(backend.cluster_name.clone())
             .or_default()
-            .push((weight, eps));
+            .push(entry);
     }
 
-    let clusters = cluster_data
+    Ok(cluster_data
         .into_iter()
         .map(|(name, mut svc)| build_resolved_cluster(&name, &mut svc))
-        .collect();
-    Ok(clusters)
+        .collect())
+}
+
+/// Resolves every backend ref concurrently, preserving input order.
+///
+/// Order matters: it decides where each service's endpoints land in the
+/// generated config, and therefore whether the config hash is stable.
+async fn resolve_backends(client: &kube::Client, backend_refs: &[BackendRef]) -> Result<Vec<ResolvedBackend>> {
+    let mut resolved = Vec::with_capacity(backend_refs.len());
+
+    for chunk in backend_refs.chunks(MAX_CONCURRENT_BACKEND_LOOKUPS) {
+        let lookups = chunk.iter().map(|backend| resolve_backend(client, backend));
+        resolved.extend(try_join_all(lookups).await?);
+    }
+
+    Ok(resolved)
+}
+
+/// Resolves one backend ref into its weight and ready endpoint addresses.
+async fn resolve_backend(client: &kube::Client, backend: &BackendRef) -> Result<ResolvedBackend> {
+    let eps = endpoints::resolve_endpoints(client, &backend.namespace, &backend.service, backend.port).await?;
+    Ok((backend.weight.unwrap_or(1), eps))
 }
 
 /// Builds a single cluster from resolved service endpoint data.
-fn build_resolved_cluster(
-    name: &str,
-    service_data: &mut [(i32, Vec<String>)],
-) -> crate::config::cluster::PraxisCluster {
+fn build_resolved_cluster(name: &str, service_data: &mut [ResolvedBackend]) -> PraxisCluster {
     sort_service_endpoints(service_data);
-    log_cluster_resolution(name, service_data);
+    debug!(cluster = %name, services = service_data.len(), "resolving cluster");
+
     let (eps, weights) = distribute_service_weights(service_data);
     debug!(cluster = %name, endpoints = eps.len(), weights = ?weights, "distributed weights");
+
     let w = if weights.is_empty() { None } else { Some(weights) };
     build_cluster(name, eps, w)
 }
@@ -299,22 +343,9 @@ fn build_resolved_cluster(
 /// arrive in arbitrary order across reconciliations. This changes the
 /// config YAML (and its SHA-256 hash), triggering unnecessary
 /// Deployment rollouts and pod restarts.
-fn sort_service_endpoints(service_data: &mut [(i32, Vec<String>)]) {
+fn sort_service_endpoints(service_data: &mut [ResolvedBackend]) {
     for (_, eps) in service_data.iter_mut() {
         eps.sort();
-    }
-}
-
-/// Logs per-service endpoint data for a cluster being resolved.
-fn log_cluster_resolution(name: &str, service_data: &[(i32, Vec<String>)]) {
-    debug!(cluster = %name, services = service_data.len(), "resolving cluster");
-    log_service_entries(name, service_data);
-}
-
-/// Logs individual service entries within a cluster.
-fn log_service_entries(name: &str, service_data: &[(i32, Vec<String>)]) {
-    for (i, (w, eps)) in service_data.iter().enumerate() {
-        debug!(cluster = %name, svc = i, weight = w, eps = eps.len(), "service data");
     }
 }
 
@@ -325,22 +356,22 @@ fn log_service_entries(name: &str, service_data: &[(i32, Vec<String>)]) {
 /// common multiple of all endpoint counts. The final weights are
 /// reduced by their GCD to minimise the round-robin cycle length,
 /// which improves distribution accuracy for small request batches.
-fn distribute_service_weights(service_data: &[(i32, Vec<String>)]) -> (Vec<String>, Vec<i32>) {
+///
+/// All arithmetic runs in `i64` and saturates. The release profile
+/// combines `overflow-checks` with `panic = "abort"`, so an overflow
+/// here would kill the operator rather than mis-route a request.
+fn distribute_service_weights(service_data: &[ResolvedBackend]) -> (Vec<String>, Vec<i32>) {
+    let lcm_denominator = endpoint_count_lcm(service_data);
     let mut all_endpoints = Vec::new();
     let mut all_weights = Vec::new();
-
-    let lcm_denom = service_data
-        .iter()
-        .filter(|(_, eps)| !eps.is_empty())
-        .map(|(_, eps)| i32::try_from(eps.len()).unwrap_or(i32::MAX))
-        .fold(1, lcm);
 
     for (service_weight, endpoints) in service_data {
         if endpoints.is_empty() {
             continue;
         }
-        let n = i32::try_from(endpoints.len()).unwrap_or(i32::MAX);
-        let ep_weight = (service_weight * lcm_denom) / n;
+
+        let count = endpoint_count(endpoints);
+        let ep_weight = i64::from(*service_weight).saturating_mul(lcm_denominator) / count;
         for ep in endpoints {
             all_endpoints.push(ep.clone());
             all_weights.push(ep_weight);
@@ -348,11 +379,25 @@ fn distribute_service_weights(service_data: &[(i32, Vec<String>)]) -> (Vec<Strin
     }
 
     reduce_weights_by_gcd(&mut all_weights);
-    (all_endpoints, all_weights)
+    (all_endpoints, scale_weights_into_range(&all_weights))
+}
+
+/// Least common multiple of every non-empty endpoint count.
+fn endpoint_count_lcm(service_data: &[ResolvedBackend]) -> i64 {
+    service_data
+        .iter()
+        .filter(|(_, eps)| !eps.is_empty())
+        .map(|(_, eps)| endpoint_count(eps))
+        .fold(1, lcm)
+}
+
+/// Returns an endpoint count as a positive `i64`.
+fn endpoint_count(endpoints: &[String]) -> i64 {
+    i64::try_from(endpoints.len()).unwrap_or(i64::MAX).max(1)
 }
 
 /// Divides all positive weights by their GCD to minimise cycle length.
-fn reduce_weights_by_gcd(weights: &mut [i32]) {
+fn reduce_weights_by_gcd(weights: &mut [i64]) {
     let g = weights.iter().copied().filter(|w| *w > 0).fold(0, gcd);
     if g > 1 {
         for w in weights.iter_mut() {
@@ -363,22 +408,44 @@ fn reduce_weights_by_gcd(weights: &mut [i32]) {
     }
 }
 
+/// Scales weights down until each one fits the config's `i32` field.
+///
+/// Positive weights stay positive so an endpoint is never silently
+/// dropped from the load-balancing rotation.
+fn scale_weights_into_range(weights: &[i64]) -> Vec<i32> {
+    let largest = weights.iter().copied().max().unwrap_or(0);
+    let divisor = (largest.saturating_add(MAX_ENDPOINT_WEIGHT - 1) / MAX_ENDPOINT_WEIGHT).max(1);
+
+    weights.iter().map(|w| scale_weight(*w, divisor)).collect()
+}
+
+/// Scales a single weight into `i32` range.
+fn scale_weight(weight: i64, divisor: i64) -> i32 {
+    let scaled = weight / divisor;
+    let floored = if weight > 0 { scaled.max(1) } else { scaled };
+    i32::try_from(floored).unwrap_or(i32::MAX)
+}
+
 /// Greatest common divisor (Euclidean algorithm).
-fn gcd(mut a: i32, mut b: i32) -> i32 {
+fn gcd(mut a: i64, mut b: i64) -> i64 {
     while b != 0 {
         let t = b;
         b = a % b;
         a = t;
     }
-    a.abs()
+    a.saturating_abs()
 }
 
-/// Least common multiple.
-fn lcm(a: i32, b: i32) -> i32 {
+/// Least common multiple, capped at [`MAX_LCM_DENOMINATOR`].
+fn lcm(a: i64, b: i64) -> i64 {
     if a == 0 || b == 0 {
         return 0;
     }
-    (a * b).abs() / gcd(a, b)
+
+    (a / gcd(a, b))
+        .checked_mul(b)
+        .map_or(MAX_LCM_DENOMINATOR, i64::saturating_abs)
+        .min(MAX_LCM_DENOMINATOR)
 }
 
 /// Deduplicates TLS secret names from HTTPS listeners.
@@ -425,13 +492,13 @@ pub(super) async fn apply_child_resources(
     super::gateway::apply_resource(client, &ns, &cm).await?;
 
     let config_hash = sha256_hex(&config_output.config_yaml);
-    let deploy = build_deployment(&crate::resources::deployment::DeploymentParams {
-        config_hash: &config_hash,
+    let deploy = build_deployment(&DeploymentParams {
         name: &child,
-        namespace: &ns,
+        config_hash: &config_hash,
         gateway: gw,
-        tls_secret_names: &config_output.tls_secret_names,
         listener_ports: &config_output.listener_ports,
+        namespace: &ns,
+        tls_secret_names: &config_output.tls_secret_names,
     })?;
     super::gateway::apply_resource(client, &ns, &deploy).await?;
 
@@ -444,7 +511,6 @@ pub(super) async fn apply_child_resources(
 
 /// Converts `(name, port)` pairs into Kubernetes `ServicePort` entries.
 fn build_service_ports(listener_ports: &[(String, i32)]) -> Vec<ServicePort> {
-    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     listener_ports
         .iter()
         .map(|(name, port)| ServicePort {
@@ -463,13 +529,8 @@ fn build_service_ports(listener_ports: &[(String, i32)]) -> Vec<ServicePort> {
 
 /// Returns a hex-encoded SHA-256 digest of `data`.
 fn sha256_hex(data: &str) -> String {
-    use std::fmt::Write as _;
     let digest = <sha2::Sha256 as sha2::Digest>::digest(data.as_bytes());
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    format!("{digest:x}")
 }
 
 // -----------------------------------------------------------------------------
@@ -497,25 +558,16 @@ pub(super) async fn build_and_apply_gateway_status(
         build_listener_statuses(listeners, generation, &ns, client, attached).await;
 
     let data_plane_ready = deployment_ready && !addresses.is_empty();
-    let accepted = gateway_accepted_condition(generation, any_accepted, any_rejected);
-    let programmed = gateway_programmed_condition(generation, any_accepted, data_plane_ready);
     let status = gateway_status_json(&GatewayStatusParts {
-        name: &name,
-        ns: &ns,
+        accepted: &gateway_accepted_condition(generation, any_accepted, any_rejected),
         addresses: &addresses,
         listener_statuses: &listener_statuses,
-        accepted: &accepted,
-        programmed: &programmed,
+        programmed: &gateway_programmed_condition(generation, any_accepted, data_plane_ready),
     });
 
-    apply_gateway_status(client, &ns, &name, &status).await?;
-    log_gateway_reconciled(&ns, &name);
-    Ok(())
-}
-
-/// Logs successful Gateway reconciliation.
-fn log_gateway_reconciled(ns: &str, name: &str) {
+    apply_gateway_status(client, gw, &status).await?;
     info!("Gateway {ns}/{name} reconciled successfully");
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -533,14 +585,13 @@ pub(super) async fn update_route_parent_statuses(
     client: &kube::Client,
     gw: &Gateway,
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
+    grants: &[ReferenceGrant],
 ) -> Result<()> {
     let gw_ns = gw.namespace().unwrap_or_default();
     let gw_name = gw.name_any();
-    let grants = super::gateway::list_all_grants(client).await?;
 
     for (route, _) in attached {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let route_name = route.name_any();
+        let route_ns = route_status::route_namespace(route);
         let generation = route.metadata.generation.unwrap_or(0);
         let Some(parent_refs) = &route.spec.parent_refs else {
             continue;
@@ -554,12 +605,12 @@ pub(super) async fn update_route_parent_statuses(
             &gw_ns,
             generation,
             client,
-            &grants,
+            grants,
         )
         .await;
 
         if !statuses.is_empty() {
-            apply_route_status(client, route_ns, &route_name, statuses).await?;
+            route_status::apply_parent_statuses(client, route, &statuses).await?;
         }
     }
     Ok(())
@@ -569,229 +620,96 @@ pub(super) async fn update_route_parent_statuses(
 #[expect(clippy::too_many_arguments, reason = "route status needs full context")]
 async fn build_route_statuses(
     route: &HTTPRoute,
-    parent_refs: &[gateway_api::httproutes::HttpRouteParentRefs],
+    parent_refs: &[HttpRouteParentRefs],
     route_ns: &str,
     gw_name: &str,
     gw_ns: &str,
     generation: i64,
     client: &kube::Client,
-    grants: &[gateway_api::referencegrants::ReferenceGrant],
-) -> Vec<serde_json::Value> {
+    grants: &[ReferenceGrant],
+) -> Vec<Value> {
     let mut statuses = Vec::new();
     for parent_ref in parent_refs {
-        if !is_ref_targeting_gateway(parent_ref, gw_name, gw_ns, route_ns) {
+        if !route_status::is_ref_targeting_gateway(parent_ref, gw_name, gw_ns, route_ns) {
             continue;
         }
-        let resolved = resolve_route_backends(route, route_ns, client, grants).await;
+
+        let resolved = route_status::check_backend_refs(route, route_ns, client, grants).await;
         let accepted_cond = conditions::accepted(generation, "route accepted");
-        let resolved_cond = resolved_refs_condition(&resolved, generation);
-        statuses.push(route_parent_json(parent_ref, gw_ns, &accepted_cond, &resolved_cond));
+        let resolved_cond = route_status::resolved_refs_condition(&resolved, generation);
+        statuses.push(route_status::parent_status_json(
+            parent_ref,
+            gw_ns,
+            &accepted_cond,
+            &resolved_cond,
+        ));
     }
     statuses
 }
 
-/// Returns `true` when `parent_ref` targets the named Gateway.
-fn is_ref_targeting_gateway(
-    parent_ref: &gateway_api::httproutes::HttpRouteParentRefs,
-    gw_name: &str,
-    gw_ns: &str,
-    route_ns: &str,
-) -> bool {
-    let group = parent_ref.group.as_deref().unwrap_or("gateway.networking.k8s.io");
-    let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
-    if group != "gateway.networking.k8s.io" || kind != "Gateway" {
-        return false;
-    }
-    let ref_ns = parent_ref.namespace.as_deref().unwrap_or(route_ns);
-    parent_ref.name == gw_name && ref_ns == gw_ns
-}
-
-/// Checks all backend refs in a route for validity.
-async fn resolve_route_backends(
-    route: &HTTPRoute,
-    route_ns: &str,
-    client: &kube::Client,
-    grants: &[gateway_api::referencegrants::ReferenceGrant],
-) -> std::result::Result<(), RouteResolveFailure> {
-    let Some(rules) = &route.spec.rules else { return Ok(()) };
-    for rule in rules {
-        let Some(backends) = &rule.backend_refs else { continue };
-        for backend in backends {
-            validate_route_backend(backend, route_ns, client, grants).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Reason a backend ref could not be resolved.
-enum RouteResolveFailure {
-    /// Unsupported group or kind.
-    InvalidKind,
-
-    /// Cross-namespace ref denied by `ReferenceGrant`.
-    RefNotPermitted,
-
-    /// Backend `Service` does not exist.
-    BackendNotFound,
-}
-
-/// Validates a single backend ref.
-async fn validate_route_backend(
-    backend: &gateway_api::httproutes::HttpRouteRulesBackendRefs,
-    route_ns: &str,
-    client: &kube::Client,
-    grants: &[gateway_api::referencegrants::ReferenceGrant],
-) -> std::result::Result<(), RouteResolveFailure> {
-    let group = backend.group.as_deref().unwrap_or("");
-    let kind = backend.kind.as_deref().unwrap_or("Service");
-    if !group.is_empty() || kind != "Service" {
-        return Err(RouteResolveFailure::InvalidKind);
-    }
-
-    let backend_ns = backend.namespace.as_deref().unwrap_or(route_ns);
-    if backend_ns != route_ns
-        && !crate::gateway_api::reference_grant::is_reference_allowed(
-            route_ns,
-            "gateway.networking.k8s.io",
-            "HTTPRoute",
-            backend_ns,
-            "",
-            "Service",
-            Some(&backend.name),
-            grants,
-        )
-    {
-        return Err(RouteResolveFailure::RefNotPermitted);
-    }
-
-    let svc_api = Api::<Service>::namespaced(client.clone(), backend_ns);
-    if svc_api.get(&backend.name).await.is_ok() {
-        Ok(())
-    } else {
-        Err(RouteResolveFailure::BackendNotFound)
-    }
-}
-
-/// Builds the `ResolvedRefs` condition from a resolution result.
-fn resolved_refs_condition(
-    result: &std::result::Result<(), RouteResolveFailure>,
-    generation: i64,
-) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
-    match result {
-        Ok(()) => conditions::resolved_refs(generation, "all backend refs resolved"),
-        Err(RouteResolveFailure::InvalidKind) => {
-            conditions::unresolved_refs(generation, "InvalidKind", "unsupported backend ref kind")
-        },
-        Err(RouteResolveFailure::RefNotPermitted) => conditions::unresolved_refs(
-            generation,
-            "RefNotPermitted",
-            "cross-namespace backend ref not permitted",
-        ),
-        Err(RouteResolveFailure::BackendNotFound) => {
-            conditions::unresolved_refs(generation, "BackendNotFound", "backend service not found")
-        },
-    }
-}
-
-/// Builds a route parent status JSON entry.
-fn route_parent_json(
-    parent_ref: &gateway_api::httproutes::HttpRouteParentRefs,
-    gw_ns: &str,
-    accepted: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
-    resolved: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
-) -> serde_json::Value {
-    let mut ref_json = json!({
-        "group": "gateway.networking.k8s.io",
-        "kind": "Gateway",
-        "name": parent_ref.name,
-        "namespace": gw_ns,
-    });
-    if let Some(section) = &parent_ref.section_name
-        && let Some(obj) = ref_json.as_object_mut()
-    {
-        obj.insert("sectionName".to_owned(), json!(section));
-    }
-    json!({
-        "parentRef": ref_json,
-        "controllerName": CONTROLLER_NAME,
-        "conditions": [accepted, resolved],
-    })
-}
-
-/// Patches an [`HTTPRoute`]'s status via server-side apply.
-async fn apply_route_status(
-    client: &kube::Client,
-    ns: &str,
-    name: &str,
-    parent_statuses: Vec<serde_json::Value>,
-) -> Result<()> {
-    let status = json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "HTTPRoute",
-        "metadata": { "name": name, "namespace": ns },
-        "status": { "parents": parent_statuses },
-    });
-    let route_api = Api::<HTTPRoute>::namespaced(client.clone(), ns);
-    route_api
-        .patch_status(
-            name,
-            &PatchParams::apply("praxis-operator").force(),
-            &kube::api::Patch::Apply(&status),
-        )
-        .await?;
-    Ok(())
-}
-
 /// Components used to build the Gateway status JSON payload.
 struct GatewayStatusParts<'a> {
-    /// Gateway name.
-    name: &'a str,
-
-    /// Gateway namespace.
-    ns: &'a str,
+    /// Gateway-level `Accepted` condition.
+    accepted: &'a Condition,
 
     /// Load-balancer addresses.
-    addresses: &'a [serde_json::Value],
+    addresses: &'a [Value],
 
     /// Per-listener status entries.
-    listener_statuses: &'a [serde_json::Value],
-
-    /// Gateway-level `Accepted` condition.
-    accepted: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
+    listener_statuses: &'a [Value],
 
     /// Gateway-level `Programmed` condition.
-    programmed: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
+    programmed: &'a Condition,
 }
 
-/// Constructs the Gateway status JSON payload.
-fn gateway_status_json(parts: &GatewayStatusParts<'_>) -> serde_json::Value {
+/// Constructs the `status` sub-object of the Gateway status patch.
+fn gateway_status_json(parts: &GatewayStatusParts<'_>) -> Value {
     json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": { "name": parts.name, "namespace": parts.ns },
-        "status": {
-            "addresses": parts.addresses,
-            "conditions": [parts.accepted, parts.programmed],
-            "listeners": parts.listener_statuses,
-        },
+        "addresses": parts.addresses,
+        "conditions": [parts.accepted, parts.programmed],
+        "listeners": parts.listener_statuses,
     })
 }
 
 /// Patches the Gateway status via server-side apply.
-async fn apply_gateway_status(client: &kube::Client, ns: &str, name: &str, status: &serde_json::Value) -> Result<()> {
-    let gw_api = Api::<Gateway>::namespaced(client.clone(), ns);
-    gw_api
+///
+/// Carries condition transition times forward and returns without
+/// contacting the API server when the computed status already matches
+/// the live object. Writing an unchanged status re-triggers the
+/// controller's own watch, which would keep an idle Gateway reconciling
+/// forever.
+pub(super) async fn apply_gateway_status(client: &kube::Client, gw: &Gateway, status_json: &Value) -> Result<()> {
+    let ns = gw.namespace().unwrap_or_default();
+    let name = gw.name_any();
+
+    let observed = serde_json::to_value(&gw.status)?;
+    let mut desired = status_json.clone();
+    status::preserve_condition_times(&mut desired, &observed);
+
+    if status::is_status_unchanged(&desired, &observed) {
+        debug!("Gateway {ns}/{name} status unchanged, skipping patch");
+        return Ok(());
+    }
+
+    let payload = json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "Gateway",
+        "metadata": { "name": name, "namespace": ns },
+        "status": desired,
+    });
+
+    Api::<Gateway>::namespaced(client.clone(), &ns)
         .patch_status(
-            name,
-            &PatchParams::apply("praxis-operator").force(),
-            &kube::api::Patch::Apply(status),
+            &name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&payload),
         )
         .await?;
     Ok(())
 }
 
 /// Queries the child Service for load-balancer ingress IP addresses.
-async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> Vec<serde_json::Value> {
+async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> Vec<Value> {
     Api::<Service>::namespaced(client.clone(), ns)
         .get(child)
         .await
@@ -861,7 +779,7 @@ pub(super) async fn is_deployment_rolled_out(client: &kube::Client, ns: &str, ch
 
 /// Returns `true` when the `Progressing` condition has reason
 /// `NewReplicaSetAvailable`.
-fn is_new_rs_available(status: &k8s_openapi::api::apps::v1::DeploymentStatus) -> bool {
+fn is_new_rs_available(status: &DeploymentStatus) -> bool {
     status
         .conditions
         .as_ref()
@@ -878,7 +796,7 @@ async fn build_listener_statuses(
     gateway_ns: &str,
     client: &kube::Client,
     attached: &[(&HTTPRoute, Vec<Option<String>>)],
-) -> (Vec<serde_json::Value>, bool, bool) {
+) -> (Vec<Value>, bool, bool) {
     let mut statuses = Vec::new();
     let mut any_accepted = false;
     let mut any_rejected = false;
@@ -902,7 +820,7 @@ async fn build_listener_statuses(
 }
 
 /// Builds a status entry for an unsupported-protocol listener.
-fn unsupported_listener_status(l: &GatewayListeners, generation: i64) -> serde_json::Value {
+fn unsupported_listener_status(l: &GatewayListeners, generation: i64) -> Value {
     json!({
         "name": l.name,
         "attachedRoutes": 0,
@@ -937,9 +855,7 @@ fn count_attached_routes(attached: &[(&HTTPRoute, Vec<Option<String>>)], listene
             }
             match &listener.hostname {
                 None => true,
-                Some(lh) => route_hostnames
-                    .iter()
-                    .any(|rh| crate::gateway_api::hostname::hostname_matches(rh, lh)),
+                Some(lh) => route_hostnames.iter().any(|rh| hostname::hostname_matches(rh, lh)),
             }
         })
         .count()
@@ -952,7 +868,7 @@ async fn accepted_listener_status(
     gateway_ns: &str,
     client: &kube::Client,
     count: usize,
-) -> serde_json::Value {
+) -> Value {
     let (supported_kinds, resolved_refs_condition) = listener_resolved_refs(l, generation, gateway_ns, client).await;
 
     let refs_resolved = resolved_refs_condition.status == "True";
@@ -976,11 +892,7 @@ async fn accepted_listener_status(
 }
 
 /// Returns the `Accepted` condition for the Gateway.
-fn gateway_accepted_condition(
-    generation: i64,
-    any_accepted: bool,
-    any_rejected: bool,
-) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+fn gateway_accepted_condition(generation: i64, any_accepted: bool, any_rejected: bool) -> Condition {
     if !any_accepted {
         conditions::not_accepted(
             generation,
@@ -1004,11 +916,7 @@ fn gateway_accepted_condition(
 ///
 /// Requires accepted listeners, a ready Deployment, and at least one
 /// load-balancer address before reporting `True`.
-fn gateway_programmed_condition(
-    generation: i64,
-    any_accepted: bool,
-    data_plane_ready: bool,
-) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+fn gateway_programmed_condition(generation: i64, any_accepted: bool, data_plane_ready: bool) -> Condition {
     if !any_accepted {
         return conditions::not_programmed(generation, "Invalid", "no valid listeners");
     }
@@ -1031,10 +939,7 @@ async fn listener_resolved_refs(
     generation: i64,
     gateway_ns: &str,
     client: &kube::Client,
-) -> (
-    Vec<serde_json::Value>,
-    k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition,
-) {
+) -> (Vec<Value>, Condition) {
     let (supported, kinds_invalid) = validate_route_kinds(listener);
 
     if kinds_invalid {
@@ -1054,7 +959,7 @@ async fn listener_resolved_refs(
 /// Validates the configured `allowedRoutes.kinds` on a listener.
 ///
 /// Returns `(supported_kinds_json, has_invalid_kinds)`.
-fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<serde_json::Value>, bool) {
+fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<Value>, bool) {
     let configured = listener.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref());
     let Some(kinds) = configured else {
         return (httproute_supported_kinds(), false);
@@ -1071,12 +976,12 @@ fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<serde_json::Value>,
 }
 
 /// Returns the default `supportedKinds` JSON for `HTTPRoute`.
-fn httproute_supported_kinds() -> Vec<serde_json::Value> {
+fn httproute_supported_kinds() -> Vec<Value> {
     vec![json!({"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"})]
 }
 
 /// Checks whether a route kind ref is `HTTPRoute` in the Gateway API group.
-fn is_httproute_kind(k: &gateway_api::gateways::GatewayListenersAllowedRoutesKinds) -> bool {
+fn is_httproute_kind(k: &GatewayListenersAllowedRoutesKinds) -> bool {
     let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
     group == "gateway.networking.k8s.io" && k.kind == "HTTPRoute"
 }
@@ -1090,7 +995,7 @@ async fn validate_tls_cert_refs(
     generation: i64,
     gateway_ns: &str,
     client: &kube::Client,
-) -> Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+) -> Option<Condition> {
     let cert_refs = listener.tls.as_ref()?.certificate_refs.as_ref()?;
 
     for cert_ref in cert_refs {
@@ -1113,7 +1018,7 @@ async fn validate_tls_cert_refs(
 }
 
 /// Returns `true` when the cert ref points to a core `Secret`.
-fn is_secret_cert_ref(cert_ref: &gateway_api::gateways::GatewayListenersTlsCertificateRefs) -> bool {
+fn is_secret_cert_ref(cert_ref: &GatewayListenersTlsCertificateRefs) -> bool {
     let group = cert_ref.group.as_deref().unwrap_or("");
     let kind = cert_ref.kind.as_deref().unwrap_or("Secret");
     group.is_empty() && kind == "Secret"
@@ -1129,7 +1034,7 @@ async fn check_cross_ns_grant(
     gateway_ns: &str,
     secret_ns: &str,
     secret_name: &str,
-) -> Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+) -> Option<Condition> {
     if secret_ns == gateway_ns {
         return None;
     }
@@ -1157,20 +1062,15 @@ async fn check_cross_ns_grant(
 async fn list_reference_grants(
     client: &kube::Client,
     ns: &str,
-) -> std::result::Result<Vec<gateway_api::referencegrants::ReferenceGrant>, kube::Error> {
-    let api = Api::<gateway_api::referencegrants::ReferenceGrant>::namespaced(client.clone(), ns);
-    let list = api.list(&kube::api::ListParams::default()).await?;
+) -> std::result::Result<Vec<ReferenceGrant>, kube::Error> {
+    let api = Api::<ReferenceGrant>::namespaced(client.clone(), ns);
+    let list = api.list(&ListParams::default()).await?;
     Ok(list.items)
 }
 
 /// Checks whether a Gateway-to-Secret cross-namespace ref is allowed.
-fn is_secret_ref_granted(
-    gateway_ns: &str,
-    secret_ns: &str,
-    secret_name: &str,
-    grants: &[gateway_api::referencegrants::ReferenceGrant],
-) -> bool {
-    crate::gateway_api::reference_grant::is_reference_allowed(
+fn is_secret_ref_granted(gateway_ns: &str, secret_ns: &str, secret_name: &str, grants: &[ReferenceGrant]) -> bool {
+    reference_grant::is_reference_allowed(
         gateway_ns,
         "gateway.networking.k8s.io",
         "Gateway",
@@ -1190,8 +1090,8 @@ async fn check_secret_contents(
     generation: i64,
     secret_ns: &str,
     secret_name: &str,
-) -> Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
-    let secret_api = Api::<k8s_openapi::api::core::v1::Secret>::namespaced(client.clone(), secret_ns);
+) -> Option<Condition> {
+    let secret_api = Api::<Secret>::namespaced(client.clone(), secret_ns);
 
     let Ok(secret) = secret_api.get(secret_name).await else {
         return Some(conditions::unresolved_refs(
@@ -1204,10 +1104,7 @@ async fn check_secret_contents(
 }
 
 /// Validates that a Secret's data contains well-formed TLS PEM entries.
-fn validate_tls_secret_data(
-    data: Option<&std::collections::BTreeMap<String, k8s_openapi::ByteString>>,
-    generation: i64,
-) -> Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+fn validate_tls_secret_data(data: Option<&BTreeMap<String, ByteString>>, generation: i64) -> Option<Condition> {
     let has_keys = data.is_some_and(|d| d.contains_key("tls.crt") && d.contains_key("tls.key"));
     if !has_keys {
         return Some(conditions::unresolved_refs(
@@ -1230,7 +1127,7 @@ fn validate_tls_secret_data(
 }
 
 /// Checks whether a Secret data entry starts with a PEM header.
-fn is_pem_entry(data: &std::collections::BTreeMap<String, k8s_openapi::ByteString>, key: &str) -> bool {
+fn is_pem_entry(data: &BTreeMap<String, ByteString>, key: &str) -> bool {
     data.get(key)
         .is_some_and(|v| String::from_utf8_lossy(&v.0).starts_with("-----BEGIN "))
 }
@@ -1262,16 +1159,11 @@ async fn filter_routes_by_allowed_namespaces<'a>(
 }
 
 /// Fetches all namespaces from the cluster, returning `None` on error.
-async fn fetch_all_namespaces(client: &kube::Client) -> Option<kube::api::ObjectList<Namespace>> {
-    match Api::<Namespace>::all(client.clone())
-        .list(&kube::api::ListParams::default())
-        .await
-    {
+async fn fetch_all_namespaces(client: &kube::Client) -> Option<ObjectList<Namespace>> {
+    match Api::<Namespace>::all(client.clone()).list(&ListParams::default()).await {
         Ok(list) => Some(list),
         Err(e) => {
-            tracing::warn!(
-                %e, "failed to list namespaces for route filtering"
-            );
+            warn!(%e, "failed to list namespaces for route filtering");
             None
         },
     }
@@ -1283,9 +1175,9 @@ fn route_allowed_by_any_listener(
     section_names: &[Option<String>],
     listeners: &[GatewayListeners],
     gateway_ns: &str,
-    all_namespaces: Option<&kube::api::ObjectList<Namespace>>,
+    all_namespaces: Option<&ObjectList<Namespace>>,
 ) -> bool {
-    let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    let route_ns = route_status::route_namespace(route);
     section_names.iter().any(|section| {
         let matching: Vec<&GatewayListeners> = match section {
             Some(name) => listeners.iter().filter(|l| l.name == *name).collect(),
@@ -1304,7 +1196,7 @@ fn is_namespace_allowed(
     listener: &GatewayListeners,
     route_ns: &str,
     gateway_ns: &str,
-    all_namespaces: Option<&kube::api::ObjectList<Namespace>>,
+    all_namespaces: Option<&ObjectList<Namespace>>,
 ) -> bool {
     let from = listener
         .allowed_routes
@@ -1325,7 +1217,7 @@ fn is_namespace_allowed(
 fn namespace_matches_selector(
     listener: &GatewayListeners,
     route_ns: &str,
-    all_namespaces: Option<&kube::api::ObjectList<Namespace>>,
+    all_namespaces: Option<&ObjectList<Namespace>>,
 ) -> bool {
     let selector = listener
         .allowed_routes
@@ -1349,10 +1241,7 @@ fn namespace_matches_selector(
 /// Checks whether a namespace's labels satisfy a label selector.
 ///
 /// Evaluates both `matchLabels` and `matchExpressions`.
-fn matches_label_selector(
-    ns_obj: &Namespace,
-    selector: &gateway_api::gateways::GatewayListenersAllowedRoutesNamespacesSelector,
-) -> bool {
+fn matches_label_selector(ns_obj: &Namespace, selector: &GatewayListenersAllowedRoutesNamespacesSelector) -> bool {
     let ns_labels = ns_obj.metadata.labels.as_ref();
 
     if let Some(match_labels) = &selector.match_labels {
@@ -1382,7 +1271,7 @@ fn matches_label_selector(
 /// Evaluates a single label-selector match expression against a label set.
 fn evaluate_match_expression(
     expr: &GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions,
-    labels: &std::collections::BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
 ) -> bool {
     let key = &expr.key;
     let op = expr.operator.as_str();
@@ -1418,6 +1307,16 @@ fn evaluate_match_expression(
     reason = "tests"
 )]
 mod tests {
+    use gateway_api::{
+        gateways::{GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces, GatewayListenersTls},
+        httproutes::HttpRouteSpec,
+    };
+    use k8s_openapi::{
+        api::apps::v1::DeploymentCondition,
+        apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
+        jiff::Timestamp,
+    };
+
     use super::*;
 
     #[test]
@@ -1475,5 +1374,696 @@ mod tests {
             cond.reason, "ListenersNotValid",
             "reason should indicate some listeners are invalid"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Weight Distribution
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_gcd_basics() {
+        assert_eq!(gcd(0, 0), 0, "gcd of zeros is zero");
+        assert_eq!(gcd(12, 0), 12, "gcd with zero returns the other operand");
+        assert_eq!(gcd(12, 18), 6, "gcd(12, 18) is 6");
+        assert_eq!(gcd(17, 5), 1, "coprime operands have gcd 1");
+    }
+
+    #[test]
+    fn test_gcd_of_extremes_does_not_overflow() {
+        assert_eq!(
+            gcd(i64::MIN, 0),
+            i64::MAX,
+            "gcd must saturate rather than overflow on i64::MIN"
+        );
+    }
+
+    #[test]
+    fn test_lcm_basics() {
+        assert_eq!(lcm(0, 5), 0, "lcm with zero is zero");
+        assert_eq!(lcm(4, 6), 12, "lcm(4, 6) is 12");
+        assert_eq!(lcm(lcm(lcm(7, 11), 13), 17), 17_017, "coprime counts multiply out");
+    }
+
+    #[test]
+    fn test_lcm_is_capped() {
+        assert_eq!(
+            lcm(MAX_LCM_DENOMINATOR, 999_983),
+            MAX_LCM_DENOMINATOR,
+            "the denominator must never exceed its ceiling"
+        );
+    }
+
+    #[test]
+    fn test_lcm_of_large_coprimes_does_not_overflow() {
+        assert!(
+            lcm(i64::MAX, i64::MAX - 1) <= MAX_LCM_DENOMINATOR,
+            "an lcm that cannot be represented must fall back to the ceiling"
+        );
+    }
+
+    #[test]
+    fn test_distribute_weights_single_service_is_uniform() {
+        let data = [(1, endpoints(&["10.0.0.1:80", "10.0.0.2:80"]))];
+        let (eps, weights) = distribute_service_weights(&data);
+
+        assert_eq!(eps.len(), 2, "every endpoint should be emitted");
+        assert_eq!(weights, vec![1, 1], "a single service splits evenly across its pods");
+    }
+
+    #[test]
+    fn test_distribute_weights_respects_service_ratio() {
+        let data = [(3, endpoints(&["10.0.0.1:80"])), (1, endpoints(&["10.0.1.1:80"]))];
+        let (_, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            weights,
+            vec![3, 1],
+            "endpoint weights should mirror the backend weights"
+        );
+    }
+
+    #[test]
+    fn test_distribute_weights_normalises_uneven_replica_counts() {
+        let data = [
+            (1, endpoints(&["10.0.0.1:80", "10.0.0.2:80"])),
+            (1, endpoints(&["10.0.1.1:80"])),
+        ];
+        let (_, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            weights,
+            vec![1, 1, 2],
+            "a one-pod service must carry the same total share as a two-pod service"
+        );
+    }
+
+    #[test]
+    fn test_distribute_weights_skips_services_without_endpoints() {
+        let data = [(5, endpoints(&[])), (1, endpoints(&["10.0.1.1:80"]))];
+        let (eps, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            eps,
+            vec!["10.0.1.1:80".to_owned()],
+            "an empty service contributes nothing"
+        );
+        assert_eq!(weights, vec![1], "only the resolved service is weighted");
+    }
+
+    #[test]
+    fn test_distribute_weights_survives_adversarial_endpoint_counts() {
+        let data = [
+            (1_000_000, endpoints(&["10.0.0.1:80"; 7])),
+            (1_000_000, endpoints(&["10.0.1.1:80"; 11])),
+            (1_000_000, endpoints(&["10.0.2.1:80"; 13])),
+            (1_000_000, endpoints(&["10.0.3.1:80"; 17])),
+        ];
+
+        let (eps, weights) = distribute_service_weights(&data);
+
+        assert_eq!(eps.len(), 48, "every pod of every backend should be emitted");
+        assert_eq!(weights.len(), 48, "each endpoint needs a weight");
+        assert!(
+            weights.iter().all(|w| *w > 0),
+            "coprime pod counts at the maximum Gateway API weight must not zero out or abort"
+        );
+    }
+
+    #[test]
+    fn test_distribute_weights_saturates_at_the_config_ceiling() {
+        let data = [
+            (i32::MAX, endpoints(&["10.0.0.1:80"])),
+            (1, endpoints(&["10.0.1.1:80"])),
+        ];
+
+        let (_, weights) = distribute_service_weights(&data);
+
+        assert!(
+            weights.iter().all(|w| *w > 0),
+            "extreme weights must stay representable instead of overflowing"
+        );
+    }
+
+    #[test]
+    fn test_reduce_weights_by_gcd() {
+        let mut weights = vec![4, 8, 12];
+        reduce_weights_by_gcd(&mut weights);
+
+        assert_eq!(weights, vec![1, 2, 3], "weights should be reduced by their gcd");
+    }
+
+    #[test]
+    fn test_reduce_weights_ignores_zero_weights() {
+        let mut weights = vec![0, 4, 8];
+        reduce_weights_by_gcd(&mut weights);
+
+        assert_eq!(weights, vec![0, 1, 2], "a zero weight must stay zero");
+    }
+
+    #[test]
+    fn test_scale_weight_keeps_positive_weights_positive() {
+        assert_eq!(scale_weight(1, 1_000), 1, "a positive weight never scales to zero");
+        assert_eq!(scale_weight(0, 1_000), 0, "a zero weight stays zero");
+        assert_eq!(scale_weight(2_000, 1_000), 2, "scaling divides by the divisor");
+    }
+
+    #[test]
+    fn test_scale_weights_into_range_fits_i32() {
+        let weights = [i64::from(i32::MAX) * 4, i64::from(i32::MAX) * 2];
+        let scaled = scale_weights_into_range(&weights);
+
+        assert_eq!(scaled.len(), 2, "every weight should be scaled");
+        assert!(
+            scaled.iter().all(|w| *w > 0),
+            "scaling must keep every endpoint in the rotation"
+        );
+    }
+
+    #[test]
+    fn test_sort_service_endpoints_is_deterministic() {
+        let mut data = [(1, endpoints(&["10.0.0.3:80", "10.0.0.1:80", "10.0.0.2:80"]))];
+        sort_service_endpoints(&mut data);
+
+        assert_eq!(
+            data[0].1,
+            endpoints(&["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"]),
+            "endpoint order must be stable so the config hash does not churn"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_count_never_returns_zero() {
+        assert_eq!(endpoint_count(&[]), 1, "an empty list must not produce a zero divisor");
+        assert_eq!(
+            endpoint_count(&endpoints(&["a", "b"])),
+            2,
+            "count should match the list"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Config Hashing
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_of_empty_string() {
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "SHA-256 of the empty string is a known constant"
+        );
+    }
+
+    #[test]
+    fn test_sha256_hex_is_stable_and_lowercase() {
+        let digest = sha256_hex("listeners: []\n");
+
+        assert_eq!(digest.len(), 64, "a SHA-256 digest is 64 hex characters");
+        assert_eq!(digest, sha256_hex("listeners: []\n"), "hashing must be deterministic");
+        assert!(
+            digest.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "the digest should be lowercase hex"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Listener Aggregation
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_listener_ports_deduplicates_by_port() {
+        let listeners = [listener("http", 80, "HTTP"), listener("http-2", 80, "HTTP")];
+        let refs: Vec<&GatewayListeners> = listeners.iter().collect();
+
+        assert_eq!(
+            collect_listener_ports(&refs),
+            vec![("http".to_owned(), 80)],
+            "listeners sharing a port collapse into one Service port"
+        );
+    }
+
+    #[test]
+    fn test_collect_listener_ports_keeps_distinct_ports() {
+        let listeners = [listener("http", 80, "HTTP"), listener("https", 443, "HTTPS")];
+        let refs: Vec<&GatewayListeners> = listeners.iter().collect();
+
+        assert_eq!(
+            collect_listener_ports(&refs),
+            vec![("http".to_owned(), 80), ("https".to_owned(), 443)],
+            "distinct ports should each appear"
+        );
+    }
+
+    #[test]
+    fn test_collect_tls_secret_names_deduplicates() {
+        let listeners = [https_listener("a", 443, "cert"), https_listener("b", 8443, "cert")];
+
+        assert_eq!(
+            collect_tls_secret_names(&listeners),
+            vec!["cert".to_owned()],
+            "a secret referenced twice is mounted once"
+        );
+    }
+
+    #[test]
+    fn test_collect_tls_secret_names_ignores_http_listeners() {
+        let listeners = [listener("http", 80, "HTTP")];
+
+        assert!(
+            collect_tls_secret_names(&listeners).is_empty(),
+            "plain HTTP listeners have no certificates"
+        );
+    }
+
+    #[test]
+    fn test_merge_listeners_by_port_groups_section_names() {
+        let listeners = [listener("http", 80, "HTTP"), listener("http-alt", 80, "HTTP")];
+        let refs: Vec<&GatewayListeners> = listeners.iter().collect();
+        let merged = merge_listeners_by_port(&refs);
+
+        assert_eq!(merged.len(), 1, "listeners on the same port merge into one");
+        assert_eq!(
+            merged[0].merged_section_names,
+            vec!["http".to_owned(), "http-alt".to_owned()],
+            "the merged listener must remember every section it serves"
+        );
+    }
+
+    #[test]
+    fn test_merge_listeners_by_port_keeps_distinct_ports_separate() {
+        let listeners = [listener("http", 80, "HTTP"), listener("alt", 8080, "HTTP")];
+        let refs: Vec<&GatewayListeners> = listeners.iter().collect();
+
+        assert_eq!(
+            merge_listeners_by_port(&refs).len(),
+            2,
+            "listeners on distinct ports stay separate"
+        );
+    }
+
+    #[test]
+    fn test_merge_tls_certs_combines_certificates() {
+        let first = https_listener("a", 443, "cert-a");
+        let second = https_listener("b", 443, "cert-b");
+        let refs: Vec<&GatewayListeners> = vec![&first, &second];
+        let mut merged = convert_listener(&first, "a-chain");
+
+        merge_tls_certs(&mut merged, &refs);
+
+        assert_eq!(
+            merged.tls.map(|t| t.certificates.len()),
+            Some(2),
+            "both listeners' certificates should serve the shared port"
+        );
+    }
+
+    #[test]
+    fn test_build_service_ports_maps_names_and_targets() {
+        let ports = build_service_ports(&[("http".to_owned(), 80)]);
+
+        assert_eq!(ports.len(), 1, "one listener port yields one Service port");
+        assert_eq!(ports[0].name, Some("http".to_owned()), "the listener name is reused");
+        assert_eq!(ports[0].port, 80, "the listener port is exposed");
+        assert_eq!(
+            ports[0].target_port,
+            Some(IntOrString::Int(80)),
+            "the data plane listens on the same port"
+        );
+        assert_eq!(ports[0].protocol, Some("TCP".to_owned()), "HTTP listeners are TCP");
+    }
+
+    #[test]
+    fn test_count_attached_routes_matches_hostname() {
+        let listener = https_listener("https", 443, "cert");
+        let route = route_with_hostnames(&["a.example.com"]);
+        let attached = vec![(&route, vec![None])];
+
+        assert_eq!(
+            count_attached_routes(&attached, &listener),
+            0,
+            "a route whose hostname misses the listener must not be counted"
+        );
+    }
+
+    #[test]
+    fn test_count_attached_routes_counts_unconstrained_routes() {
+        let listener = listener("http", 80, "HTTP");
+        let route = route_with_hostnames(&[]);
+        let attached = vec![(&route, vec![None])];
+
+        assert_eq!(
+            count_attached_routes(&attached, &listener),
+            1,
+            "a route without hostnames attaches to any listener"
+        );
+    }
+
+    #[test]
+    fn test_count_attached_routes_respects_section_name() {
+        let listener = listener("http", 80, "HTTP");
+        let route = route_with_hostnames(&[]);
+        let attached = vec![(&route, vec![Some("https".to_owned())])];
+
+        assert_eq!(
+            count_attached_routes(&attached, &listener),
+            0,
+            "a route bound to another section is not attached here"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Listener Validation
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_route_kinds_defaults_to_httproute() {
+        let (supported, invalid) = validate_route_kinds(&listener("http", 80, "HTTP"));
+
+        assert_eq!(supported.len(), 1, "HTTPRoute is supported by default");
+        assert!(!invalid, "an unspecified kind list is never invalid");
+    }
+
+    #[test]
+    fn test_validate_route_kinds_flags_unsupported_kinds() {
+        let mut l = listener("http", 80, "HTTP");
+        l.allowed_routes = Some(GatewayListenersAllowedRoutes {
+            kinds: Some(vec![GatewayListenersAllowedRoutesKinds {
+                group: None,
+                kind: "TCPRoute".to_owned(),
+            }]),
+            ..Default::default()
+        });
+
+        let (supported, invalid) = validate_route_kinds(&l);
+
+        assert!(supported.is_empty(), "an unsupported-only list supports nothing");
+        assert!(invalid, "TCPRoute is not implemented and must be reported");
+    }
+
+    #[test]
+    fn test_is_secret_cert_ref_accepts_core_secret() {
+        assert!(
+            is_secret_cert_ref(&GatewayListenersTlsCertificateRefs {
+                name: "cert".to_owned(),
+                ..Default::default()
+            }),
+            "an unqualified certificateRef defaults to a core Secret"
+        );
+    }
+
+    #[test]
+    fn test_is_secret_cert_ref_rejects_other_kinds() {
+        assert!(
+            !is_secret_cert_ref(&GatewayListenersTlsCertificateRefs {
+                name: "cert".to_owned(),
+                kind: Some("ConfigMap".to_owned()),
+                ..Default::default()
+            }),
+            "only Secrets can carry TLS material"
+        );
+    }
+
+    #[test]
+    fn test_validate_tls_secret_data_accepts_pem() {
+        let data = secret_data("-----BEGIN CERTIFICATE-----", "-----BEGIN PRIVATE KEY-----");
+
+        assert!(
+            validate_tls_secret_data(Some(&data), 1).is_none(),
+            "a well-formed TLS secret produces no failure condition"
+        );
+    }
+
+    #[test]
+    fn test_validate_tls_secret_data_rejects_missing_keys() {
+        let condition = validate_tls_secret_data(None, 1);
+
+        assert_eq!(
+            condition.map(|c| c.message),
+            Some("malformed secret".to_owned()),
+            "a secret without tls.crt and tls.key is malformed"
+        );
+    }
+
+    #[test]
+    fn test_validate_tls_secret_data_rejects_non_pem() {
+        let data = secret_data("not a certificate", "not a key");
+        let condition = validate_tls_secret_data(Some(&data), 1);
+
+        assert_eq!(
+            condition.map(|c| c.message),
+            Some("invalid PEM data".to_owned()),
+            "non-PEM contents must be reported"
+        );
+    }
+
+    #[test]
+    fn test_is_pem_entry() {
+        let data = secret_data("-----BEGIN CERTIFICATE-----", "garbage");
+
+        assert!(is_pem_entry(&data, "tls.crt"), "a PEM header should be recognised");
+        assert!(!is_pem_entry(&data, "tls.key"), "non-PEM data should be rejected");
+        assert!(!is_pem_entry(&data, "missing"), "an absent key is not PEM");
+    }
+
+    // -----------------------------------------------------------------------------
+    // Deployment Readiness
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_is_new_rs_available_true() {
+        let status = deployment_status("Progressing", "True", "NewReplicaSetAvailable");
+
+        assert!(
+            is_new_rs_available(&status),
+            "NewReplicaSetAvailable marks a finished rollout"
+        );
+    }
+
+    #[test]
+    fn test_is_new_rs_available_rejects_in_progress_rollout() {
+        let status = deployment_status("Progressing", "True", "ReplicaSetUpdated");
+
+        assert!(
+            !is_new_rs_available(&status),
+            "an updating ReplicaSet is not a finished rollout"
+        );
+    }
+
+    #[test]
+    fn test_is_new_rs_available_without_conditions() {
+        assert!(
+            !is_new_rs_available(&DeploymentStatus::default()),
+            "a Deployment with no conditions has not rolled out"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Namespace Filtering
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_is_namespace_allowed_defaults_to_same() {
+        let l = listener("http", 80, "HTTP");
+
+        assert!(
+            is_namespace_allowed(&l, "infra", "infra", None),
+            "the default policy allows only the Gateway's own namespace"
+        );
+        assert!(
+            !is_namespace_allowed(&l, "apps", "infra", None),
+            "the default policy rejects other namespaces"
+        );
+    }
+
+    #[test]
+    fn test_is_namespace_allowed_all() {
+        let l = listener_with_namespace_policy(GatewayListenersAllowedRoutesNamespacesFrom::All);
+
+        assert!(
+            is_namespace_allowed(&l, "apps", "infra", None),
+            "the All policy accepts every namespace"
+        );
+    }
+
+    #[test]
+    fn test_is_namespace_allowed_selector_without_namespaces_is_denied() {
+        let l = listener_with_namespace_policy(GatewayListenersAllowedRoutesNamespacesFrom::Selector);
+
+        assert!(
+            !is_namespace_allowed(&l, "apps", "infra", None),
+            "a selector policy cannot be evaluated without the namespace list"
+        );
+    }
+
+    #[test]
+    fn test_matches_label_selector_match_labels() {
+        let ns = namespace("apps", &[("team", "core")]);
+        let selector = GatewayListenersAllowedRoutesNamespacesSelector {
+            match_labels: Some([("team".to_owned(), "core".to_owned())].into_iter().collect()),
+            match_expressions: None,
+        };
+
+        assert!(
+            matches_label_selector(&ns, &selector),
+            "matching labels should satisfy the selector"
+        );
+    }
+
+    #[test]
+    fn test_matches_label_selector_rejects_missing_label() {
+        let ns = namespace("apps", &[]);
+        let selector = GatewayListenersAllowedRoutesNamespacesSelector {
+            match_labels: Some([("team".to_owned(), "core".to_owned())].into_iter().collect()),
+            match_expressions: None,
+        };
+
+        assert!(
+            !matches_label_selector(&ns, &selector),
+            "an unlabelled namespace cannot satisfy matchLabels"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_match_expression_operators() {
+        let labels: BTreeMap<String, String> = [("team".to_owned(), "core".to_owned())].into_iter().collect();
+
+        assert!(
+            evaluate_match_expression(&expression("team", "In", &["core", "infra"]), &labels),
+            "In should match a listed value"
+        );
+        assert!(
+            !evaluate_match_expression(&expression("team", "In", &["infra"]), &labels),
+            "In should reject an unlisted value"
+        );
+        assert!(
+            evaluate_match_expression(&expression("team", "NotIn", &["infra"]), &labels),
+            "NotIn should accept an unlisted value"
+        );
+        assert!(
+            evaluate_match_expression(&expression("team", "Exists", &[]), &labels),
+            "Exists should match a present key"
+        );
+        assert!(
+            evaluate_match_expression(&expression("tier", "DoesNotExist", &[]), &labels),
+            "DoesNotExist should match an absent key"
+        );
+        assert!(
+            !evaluate_match_expression(&expression("team", "Bogus", &[]), &labels),
+            "an unknown operator must not match"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------------
+
+    /// Builds endpoint address strings from string slices.
+    fn endpoints(addrs: &[&str]) -> Vec<String> {
+        addrs.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    /// Builds a Gateway listener with the given name, port, and protocol.
+    fn listener(name: &str, port: i32, protocol: &str) -> GatewayListeners {
+        GatewayListeners {
+            name: name.to_owned(),
+            port,
+            protocol: protocol.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Builds an HTTPS listener referencing a TLS secret, scoped by hostname.
+    fn https_listener(name: &str, port: i32, secret: &str) -> GatewayListeners {
+        GatewayListeners {
+            hostname: Some(format!("{name}.example.com")),
+            tls: Some(GatewayListenersTls {
+                certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                    name: secret.to_owned(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..listener(name, port, "HTTPS")
+        }
+    }
+
+    /// Builds a listener carrying an explicit `allowedRoutes.namespaces.from`.
+    fn listener_with_namespace_policy(from: GatewayListenersAllowedRoutesNamespacesFrom) -> GatewayListeners {
+        GatewayListeners {
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                    from: Some(from),
+                    selector: None,
+                }),
+                ..Default::default()
+            }),
+            ..listener("http", 80, "HTTP")
+        }
+    }
+
+    /// Builds an `HTTPRoute` carrying the given hostnames.
+    fn route_with_hostnames(hostnames: &[&str]) -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_owned()),
+                namespace: Some("apps".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                hostnames: Some(hostnames.iter().map(|h| (*h).to_owned()).collect()),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Builds Secret data with the given `tls.crt` and `tls.key` contents.
+    fn secret_data(cert: &str, key: &str) -> BTreeMap<String, ByteString> {
+        [
+            ("tls.crt".to_owned(), ByteString(cert.as_bytes().to_vec())),
+            ("tls.key".to_owned(), ByteString(key.as_bytes().to_vec())),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Builds a `DeploymentStatus` carrying a single condition.
+    fn deployment_status(type_: &str, status: &str, reason: &str) -> DeploymentStatus {
+        DeploymentStatus {
+            conditions: Some(vec![DeploymentCondition {
+                last_transition_time: Some(Time(Timestamp::UNIX_EPOCH)),
+                last_update_time: Some(Time(Timestamp::UNIX_EPOCH)),
+                message: None,
+                reason: Some(reason.to_owned()),
+                status: status.to_owned(),
+                type_: type_.to_owned(),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a `Namespace` with the given labels.
+    fn namespace(name: &str, labels: &[(&str, &str)]) -> Namespace {
+        Namespace {
+            metadata: ObjectMeta {
+                name: Some(name.to_owned()),
+                labels: Some(labels.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Builds a label-selector match expression.
+    fn expression(
+        key: &str,
+        operator: &str,
+        values: &[&str],
+    ) -> GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+        GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+            key: key.to_owned(),
+            operator: operator.to_owned(),
+            values: Some(values.iter().map(|v| (*v).to_owned()).collect()),
+        }
     }
 }
