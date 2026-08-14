@@ -79,7 +79,10 @@ async fn main() -> error::Result<()> {
 ///
 /// [`OperatorError::LeadershipLost`]: error::OperatorError::LeadershipLost
 async fn run_controllers(client: &Client, identity: &str, health: &observability::server::Health) -> error::Result<()> {
-    let ctx = Arc::new(context::Context { client: client.clone() });
+    let ctx = Arc::new(context::Context {
+        client: client.clone(),
+        recorder: kube::runtime::events::Recorder::new(client.clone(), context::reporter()),
+    });
     let gc = build_gc_controller(client, Arc::clone(&ctx));
     let gw = build_gw_controller(client, Arc::clone(&ctx));
     let rt = build_route_controller(client, ctx);

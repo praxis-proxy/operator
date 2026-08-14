@@ -3,7 +3,10 @@
 
 //! Shared controller context.
 
-use kube::Client;
+use kube::{
+    Client,
+    runtime::events::{Recorder, Reporter},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -40,6 +43,17 @@ pub(crate) fn praxis_image() -> String {
 pub(crate) struct Context {
     /// Kubernetes API client.
     pub(crate) client: Client,
+
+    /// Publishes Kubernetes events for user-visible decisions.
+    pub(crate) recorder: Recorder,
+}
+
+/// Builds the event reporter identifying this operator.
+pub(crate) fn reporter() -> Reporter {
+    Reporter {
+        controller: "praxis-operator".to_owned(),
+        instance: std::env::var("POD_NAME").ok(),
+    }
 }
 
 impl std::fmt::Debug for Context {
