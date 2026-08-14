@@ -20,6 +20,9 @@ pub mod observability;
 pub mod resources;
 pub mod stores;
 
+#[cfg(test)]
+mod testing;
+
 use std::{future::Future, sync::Arc};
 
 use ::gateway_api::{

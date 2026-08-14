@@ -216,6 +216,20 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
+    use crate::testing;
+
+    /// The object the API server hands back from a status apply.
+    fn accepted_class_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/gatewayclasses/praxis",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "GatewayClass",
+                "metadata": { "name": "praxis" },
+                "spec": { "controllerName": CONTROLLER_NAME },
+            }),
+        )
+    }
 
     #[test]
     fn test_is_our_controller_accepts_matching_name() {
@@ -277,6 +291,111 @@ mod tests {
         assert!(
             SUPPORTED_FEATURES.contains(&"Gateway") && SUPPORTED_FEATURES.contains(&"HTTPRoute"),
             "the two core kinds this operator reconciles must be advertised"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Reconciliation
+    // -----------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_reconcile_accepts_a_class_naming_this_controller() {
+        let (ctx, journal) = testing::fake_context(vec![accepted_class_response()], testing::Cached::default());
+
+        let action = reconcile(Arc::new(gateway_class(CONTROLLER_NAME)), ctx)
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        let patch = journal
+            .matching("/gatewayclasses/praxis/status")
+            .pop()
+            .expect("an owned class should have its status written");
+        assert_eq!(patch.method, "PATCH", "status is written by server-side apply");
+        assert_eq!(
+            patch
+                .body
+                .as_ref()
+                .and_then(|b| b.pointer("/status/conditions/0/status")),
+            Some(&serde_json::Value::String("True".to_owned())),
+            "an owned class is accepted"
+        );
+        assert_eq!(
+            action,
+            Action::await_change(),
+            "a class has nothing to requeue for once its status is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_writes_nothing_for_another_controller() {
+        let (ctx, journal) = testing::fake_context(vec![], testing::Cached::default());
+
+        reconcile(Arc::new(gateway_class("example.com/other")), ctx)
+            .await
+            .expect("ignoring a class is not a failure");
+
+        assert!(
+            journal.requests().is_empty(),
+            "writing to another controller's GatewayClass would fight it for the status"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_skips_the_patch_when_the_status_already_matches() {
+        let (ctx, journal) = testing::fake_context(vec![], testing::Cached::default());
+        let mut class = gateway_class(CONTROLLER_NAME);
+        class.metadata.generation = Some(1);
+
+        // Feed back exactly what the reconciler would compute, as the
+        // API server would hold it after a first pass.
+        let desired = build_accepted_status(1).expect("a class status is strings and conditions");
+        class.status = serde_json::from_value(desired).expect("the computed status is a class status");
+
+        reconcile(Arc::new(class), ctx)
+            .await
+            .expect("an unchanged status is not a failure");
+
+        assert!(
+            journal.requests().is_empty(),
+            "re-patching an unchanged status wakes this controller's own watch, and the loop only \
+             ends because the second pass compares equal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_surfaces_an_api_failure() {
+        let (client, _) = testing::failing_client();
+        let recorder = kube::runtime::events::Recorder::new(client.clone(), crate::context::reporter());
+        let ctx = Arc::new(Context {
+            client,
+            recorder,
+            stores: crate::stores::Stores::fake(vec![], vec![], vec![]),
+        });
+
+        let error = reconcile(Arc::new(gateway_class(CONTROLLER_NAME)), ctx)
+            .await
+            .expect_err("a 500 from the API server is not success");
+
+        assert!(
+            matches!(error, OperatorError::Kube(_)),
+            "the failure has to reach error_policy as itself, or the class is never retried: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_policy_requeues_rather_than_dropping_the_class() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+        let action = error_policy(
+            Arc::new(gateway_class(CONTROLLER_NAME)),
+            &OperatorError::MissingObjectKey(".metadata.uid"),
+            ctx,
+        );
+
+        assert_eq!(
+            action,
+            Action::requeue(Duration::from_secs(30)),
+            "a class left un-accepted blocks every Gateway that names it, so the failure has to be \
+             retried rather than dropped"
         );
     }
 
