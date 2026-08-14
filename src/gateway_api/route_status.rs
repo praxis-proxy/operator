@@ -253,6 +253,65 @@ pub(crate) async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRou
     Ok(())
 }
 
+/// Drops this controller's parent entries naming the given Gateway.
+///
+/// Called when a Gateway is being deleted. Without it the route keeps
+/// advertising an `Accepted` parent that no longer exists, and nothing
+/// ever revisits the entry because the Gateway that owned it is gone.
+/// Entries written by other controllers, and entries for other parents,
+/// are left untouched.
+pub(crate) async fn clear_parent_statuses(
+    client: &kube::Client,
+    route: &HTTPRoute,
+    gw_name: &str,
+    gw_ns: &str,
+) -> Result<()> {
+    let ns = route_namespace(route);
+    let name = route.name_any();
+
+    let observed = observed_parents(route)?;
+    let retained: Vec<Value> = observed
+        .iter()
+        .filter(|entry| !is_our_entry_for(entry, gw_name, gw_ns))
+        .cloned()
+        .collect();
+
+    if retained.len() == observed.len() {
+        return Ok(());
+    }
+
+    let payload = json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": { "name": name, "namespace": ns },
+        "status": { "parents": retained },
+    });
+
+    debug!("clearing parent status for deleted Gateway {gw_ns}/{gw_name} from HTTPRoute {ns}/{name}");
+    Api::<HTTPRoute>::namespaced(client.clone(), ns)
+        .patch_status(
+            &name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&payload),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Returns `true` when a status entry is ours and names the Gateway.
+fn is_our_entry_for(entry: &Value, gw_name: &str, gw_ns: &str) -> bool {
+    if entry.get("controllerName").and_then(Value::as_str) != Some(CONTROLLER_NAME) {
+        return false;
+    }
+
+    let Some(parent) = entry.get("parentRef") else {
+        return false;
+    };
+
+    parent.get("name").and_then(Value::as_str) == Some(gw_name)
+        && parent.get("namespace").and_then(Value::as_str) == Some(gw_ns)
+}
+
 // -----------------------------------------------------------------------------
 // Utility Functions
 // -----------------------------------------------------------------------------
@@ -707,5 +766,71 @@ mod tests {
             spec: HttpRouteSpec::default(),
             status,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Parent Status Clearing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_our_entry_for_matches_our_gateway() {
+        let entry = json!({
+            "controllerName": CONTROLLER_NAME,
+            "parentRef": { "name": "gw", "namespace": "infra" },
+        });
+
+        assert!(
+            is_our_entry_for(&entry, "gw", "infra"),
+            "an entry this controller wrote for the named Gateway should be cleared"
+        );
+    }
+
+    #[test]
+    fn test_is_our_entry_for_ignores_other_controllers() {
+        let entry = json!({
+            "controllerName": "other.example.com/controller",
+            "parentRef": { "name": "gw", "namespace": "infra" },
+        });
+
+        assert!(
+            !is_our_entry_for(&entry, "gw", "infra"),
+            "another controller's entry must never be removed, even for the same parent"
+        );
+    }
+
+    #[test]
+    fn test_is_our_entry_for_ignores_other_gateways() {
+        let entry = json!({
+            "controllerName": CONTROLLER_NAME,
+            "parentRef": { "name": "other-gw", "namespace": "infra" },
+        });
+
+        assert!(
+            !is_our_entry_for(&entry, "gw", "infra"),
+            "entries for a different Gateway must survive"
+        );
+    }
+
+    #[test]
+    fn test_is_our_entry_for_distinguishes_namespaces() {
+        let entry = json!({
+            "controllerName": CONTROLLER_NAME,
+            "parentRef": { "name": "gw", "namespace": "other-ns" },
+        });
+
+        assert!(
+            !is_our_entry_for(&entry, "gw", "infra"),
+            "a same-named Gateway in another namespace is a different parent"
+        );
+    }
+
+    #[test]
+    fn test_is_our_entry_for_rejects_a_malformed_entry() {
+        let entry = json!({ "controllerName": CONTROLLER_NAME });
+
+        assert!(
+            !is_our_entry_for(&entry, "gw", "infra"),
+            "an entry without a parentRef cannot be matched and must be left alone"
+        );
     }
 }

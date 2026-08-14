@@ -22,7 +22,7 @@ use super::gateway_helpers;
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
-    gateway_api::conditions,
+    gateway_api::{conditions, route_status},
 };
 
 // -----------------------------------------------------------------------------
@@ -52,7 +52,7 @@ pub(crate) async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Act
             match event {
                 Event::Apply(gw) => Box::pin(apply(gw, &ctx)).await,
                 Event::Cleanup(gw) => {
-                    cleanup(&gw);
+                    cleanup(&gw, &ctx.client).await;
                     Ok(Action::await_change())
                 },
             }
@@ -222,13 +222,40 @@ fn has_requested_addresses(gw: &Gateway) -> bool {
 // -----------------------------------------------------------------------------
 
 /// Cleanup path: owner references handle child deletion automatically.
-fn cleanup(gw: &Gateway) {
+async fn cleanup(gw: &Gateway, client: &kube::Client) {
     let name = gw.name_any();
     let ns = gw.namespace().unwrap_or_else(|| {
         tracing::warn!(gateway = %name, "Gateway has no namespace during cleanup");
         String::new()
     });
     info!("cleaning up Gateway {ns}/{name} (owner refs handle child deletion)");
+
+    clear_route_parent_statuses(client, &name, &ns).await;
+}
+
+/// Removes this Gateway's entries from every route that referenced it.
+///
+/// Child resources are reclaimed by owner references, but route status
+/// is not owned by the Gateway, so a stale `Accepted` entry naming a
+/// deleted parent would survive indefinitely.
+///
+/// Failures are logged rather than propagated: a Gateway must always be
+/// able to finish deleting, and a route left with a stale entry is a
+/// smaller problem than a finalizer that never releases.
+async fn clear_route_parent_statuses(client: &kube::Client, gw_name: &str, gw_ns: &str) {
+    let routes = match list_all_routes(client).await {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::warn!(%e, "could not list routes to clear parent status for {gw_ns}/{gw_name}");
+            return;
+        },
+    };
+
+    for route in &routes {
+        if let Err(e) = route_status::clear_parent_statuses(client, route, gw_name, gw_ns).await {
+            tracing::warn!(%e, route = route.name_any(), "could not clear parent status");
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
