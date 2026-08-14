@@ -19,9 +19,13 @@ WORKDIR /src
 # compiles all dependencies without the real source code.
 # See: https://shaneutt.com/blog/rust-fast-small-docker-image-builds/
 
+# The manifest declares an explicit [[bench]], so cargo refuses to parse
+# it unless that file exists. Stub it alongside src/ or this layer fails
+# before a single dependency is compiled.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src \
+RUN mkdir -p src benches \
     && printf '//! stub\nfn main() {}\n' > src/main.rs \
+    && printf 'fn main() {}\n' > benches/config_generation.rs \
     && cargo build --release --locked \
     && rm -rf src
 
@@ -33,6 +37,7 @@ RUN mkdir src \
 # project crate recompiles; all dependencies are cached.
 
 COPY src src
+COPY benches benches
 RUN touch src/main.rs \
     && cargo build --release --locked \
     && cp target/release/praxis-operator /usr/local/bin/
