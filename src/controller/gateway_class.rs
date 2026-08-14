@@ -17,6 +17,7 @@ use crate::{
     context::{CONTROLLER_NAME, Context},
     error::{OperatorError, Result},
     gateway_api::{conditions, status},
+    observability::metrics,
 };
 
 // -----------------------------------------------------------------------------
@@ -94,9 +95,11 @@ async fn accept_gateway_class(gc: &GatewayClass, name: &str, ctx: &Context) -> R
     status::preserve_condition_times(&mut desired, &observed);
 
     if status::is_status_unchanged(&desired, &observed) {
+        metrics::global().record_status_skipped();
         debug!("GatewayClass {name} status unchanged, skipping patch");
         return Ok(());
     }
+    metrics::global().record_status_written();
 
     let payload = serde_json::json!({
         "apiVersion": "gateway.networking.k8s.io/v1",

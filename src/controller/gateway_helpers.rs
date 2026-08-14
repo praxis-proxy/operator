@@ -49,6 +49,7 @@ use crate::{
         attachment, conditions, hostname, listener_conflict, reference_grant, route_status, route_validation, status,
     },
     listing,
+    observability::metrics,
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
@@ -712,9 +713,11 @@ pub(super) async fn apply_gateway_status(client: &kube::Client, gw: &Gateway, st
     status::preserve_condition_times(&mut desired, &observed);
 
     if status::is_status_unchanged(&desired, &observed) {
+        metrics::global().record_status_skipped();
         debug!("Gateway {ns}/{name} status unchanged, skipping patch");
         return Ok(());
     }
+    metrics::global().record_status_written();
 
     let payload = json!({
         "apiVersion": "gateway.networking.k8s.io/v1",

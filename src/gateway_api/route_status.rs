@@ -24,6 +24,7 @@ use crate::{
     context::CONTROLLER_NAME,
     error::Result,
     gateway_api::{conditions, reference_grant, status},
+    observability::metrics,
 };
 
 // -----------------------------------------------------------------------------
@@ -232,9 +233,11 @@ pub(crate) async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRou
     status::preserve_condition_times(&mut desired, &observed);
 
     if status::is_status_unchanged(&desired, &observed) {
+        metrics::global().record_status_skipped();
         debug!("HTTPRoute {ns}/{name} parent status unchanged, skipping patch");
         return Ok(());
     }
+    metrics::global().record_status_written();
 
     let payload = json!({
         "apiVersion": "gateway.networking.k8s.io/v1",
