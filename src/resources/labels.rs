@@ -24,6 +24,49 @@ pub fn standard_labels(instance: &str) -> BTreeMap<String, String> {
     labels
 }
 
+/// Label naming the Gateway a generated resource was created for.
+///
+/// Standardised by the Gateway API so that tooling can find an
+/// implementation's generated objects without knowing its naming
+/// scheme. Conformance uses it as a list selector.
+pub const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
+
+/// Returns the labels every generated resource carries, beyond the
+/// selector.
+///
+/// Deliberately separate from [`standard_labels`]: that set is the
+/// `Deployment` and `Service` selector, which Kubernetes will not let
+/// the operator change once created. Anything that can vary with the
+/// Gateway spec — the operator-declared labels below — has to stay out
+/// of it, or the first Gateway to edit `spec.infrastructure` would
+/// leave the operator unable to apply its own `Deployment`.
+pub fn descriptive_labels(gateway: &gateway_api::gateways::Gateway) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::from([(GATEWAY_NAME_LABEL.to_owned(), gateway.name_any())]);
+    labels.extend(infrastructure_labels(gateway));
+    labels
+}
+
+/// Returns the labels the Gateway asks generated resources to carry.
+pub fn infrastructure_labels(gateway: &gateway_api::gateways::Gateway) -> BTreeMap<String, String> {
+    gateway
+        .spec
+        .infrastructure
+        .as_ref()
+        .and_then(|infra| infra.labels.clone())
+        .unwrap_or_default()
+}
+
+/// Returns the annotations the Gateway asks generated resources to
+/// carry.
+pub fn infrastructure_annotations(gateway: &gateway_api::gateways::Gateway) -> BTreeMap<String, String> {
+    gateway
+        .spec
+        .infrastructure
+        .as_ref()
+        .and_then(|infra| infra.annotations.clone())
+        .unwrap_or_default()
+}
+
 /// Returns the child resource name for a given Gateway name.
 ///
 /// Prefixes the gateway name with `praxis-` to form the deployment and service

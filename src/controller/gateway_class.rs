@@ -67,6 +67,7 @@ use crate::{
 /// [`validate_route`]: crate::gateway_api::route_validation::validate_route
 const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
+    "GatewayInfrastructurePropagation",
     "GatewayPort8080",
     "HTTPRoute",
     "HTTPRouteHostRewrite",
