@@ -23,7 +23,9 @@ use super::namespace_filter;
 use crate::{
     context::{CONTROLLER_NAME, Context},
     error::{OperatorError, Result},
-    gateway_api::{conditions, hostname, route_status, status_types::RouteParentStatus},
+    gateway_api::{
+        attachment::listener_matches_parent_ref, conditions, hostname, route_status, status_types::RouteParentStatus,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -165,11 +167,11 @@ fn validate_listener_attachment(
     generation: i64,
     ctx: &Context,
 ) -> Option<Condition> {
-    if !section_name_valid(gw, parent_ref) {
+    if !parent_ref_selects_a_listener(gw, parent_ref) {
         return Some(conditions::not_accepted(
             generation,
             "NoMatchingParent",
-            "no listener matches sectionName",
+            "no listener matches the parentRef",
         ));
     }
     if !namespace_allowed(route, gw, parent_ref, ctx) {
@@ -189,12 +191,19 @@ fn validate_listener_attachment(
     None
 }
 
-/// Returns `true` when the `parentRef` section name matches a listener.
-fn section_name_valid(gw: &Gateway, parent_ref: &HttpRouteParentRefs) -> bool {
-    parent_ref
-        .section_name
-        .as_ref()
-        .is_none_or(|s| gw.spec.listeners.iter().any(|l| l.name == *s))
+/// Returns `true` when some listener satisfies everything the
+/// `parentRef` asks for.
+///
+/// A `parentRef` may narrow by `sectionName`, by `port`, or by both,
+/// and the constraints are not independent: they have to hold of the
+/// same listener. A ref naming a listener and a port that listener
+/// does not serve selects nothing, exactly as one naming a listener
+/// that does not exist does.
+fn parent_ref_selects_a_listener(gw: &Gateway, parent_ref: &HttpRouteParentRefs) -> bool {
+    gw.spec
+        .listeners
+        .iter()
+        .any(|l| listener_matches_parent_ref(l, parent_ref))
 }
 
 /// Returns `true` when the route's namespace is allowed by listeners.
@@ -281,32 +290,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_section_name_valid_without_section_name() {
+    fn test_a_parent_ref_naming_nothing_selects_every_listener() {
         let gw = gateway(vec![listener("http", None)]);
 
         assert!(
-            section_name_valid(&gw, &parent_ref(None)),
+            parent_ref_selects_a_listener(&gw, &parent_ref(None)),
             "a parentRef without a sectionName attaches to every listener"
         );
     }
 
     #[test]
-    fn test_section_name_valid_matching_listener() {
+    fn test_a_section_name_naming_a_listener_selects_it() {
         let gw = gateway(vec![listener("http", None), listener("https", None)]);
 
         assert!(
-            section_name_valid(&gw, &parent_ref(Some("https"))),
+            parent_ref_selects_a_listener(&gw, &parent_ref(Some("https"))),
             "a sectionName naming an existing listener is valid"
         );
     }
 
     #[test]
-    fn test_section_name_valid_rejects_unknown_listener() {
+    fn test_a_section_name_naming_no_listener_selects_nothing() {
         let gw = gateway(vec![listener("http", None)]);
 
         assert!(
-            !section_name_valid(&gw, &parent_ref(Some("grpc"))),
+            !parent_ref_selects_a_listener(&gw, &parent_ref(Some("grpc"))),
             "a sectionName with no matching listener is invalid"
+        );
+    }
+
+    #[test]
+    fn test_a_port_no_listener_serves_selects_nothing() {
+        let gw = gateway(vec![listener("http", None)]);
+        let mut parent = parent_ref(None);
+        parent.port = Some(81);
+
+        assert!(
+            !parent_ref_selects_a_listener(&gw, &parent),
+            "the Gateway API rejects a parentRef whose port no listener serves"
+        );
+    }
+
+    #[test]
+    fn test_a_section_name_and_port_must_hold_of_one_listener() {
+        let gw = gateway(vec![listener("http", None)]);
+        let mut parent = parent_ref(Some("http"));
+        parent.port = Some(81);
+
+        assert!(
+            !parent_ref_selects_a_listener(&gw, &parent),
+            "the two constraints are ANDed, so naming a listener and a port it does not serve \
+             selects nothing at all"
         );
     }
 

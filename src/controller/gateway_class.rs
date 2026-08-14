@@ -64,6 +64,9 @@ use crate::{
 /// the `Host` header untouched, so setting that header is the hostname
 /// rewrite.
 ///
+/// The port features come from `parentRefs[].port`, which the
+/// operator now resolves to listeners rather than ignoring.
+///
 /// The two timeout features are claimed with a caveat worth stating.
 /// Praxis's `timeout` filter compares elapsed time in the response
 /// phase, so it converts a late response into a 504 but does not abort
@@ -93,7 +96,9 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRoute307RedirectStatusCode",
     "HTTPRoute308RedirectStatusCode",
     "HTTPRouteBackendTimeout",
+    "HTTPRouteDestinationPortMatching",
     "HTTPRouteHostRewrite",
+    "HTTPRouteParentRefPort",
     "HTTPRoutePathRewrite",
     "HTTPRouteRequestHeaderModification",
     "HTTPRouteRequestTimeout",
