@@ -892,24 +892,25 @@ async fn accepted_listener_status(
 }
 
 /// Returns the `Accepted` condition for the Gateway.
+///
+/// `ListenersNotValid` is only a valid reason alongside `Accepted:
+/// False`, so a Gateway with a mix of valid and invalid listeners
+/// reports `Accepted`/`Accepted` and carries the partial failure in the
+/// message; the per-listener conditions describe which ones failed.
 fn gateway_accepted_condition(generation: i64, any_accepted: bool, any_rejected: bool) -> Condition {
     if !any_accepted {
-        conditions::not_accepted(
+        return conditions::not_accepted(
             generation,
             "ListenersNotValid",
             "no listeners have a supported protocol",
-        )
-    } else if any_rejected {
-        conditions::make_condition(
-            "Accepted",
-            "True",
-            "ListenersNotValid",
-            "some listeners are invalid",
-            generation,
-        )
-    } else {
-        conditions::accepted(generation, "Gateway accepted")
+        );
     }
+
+    if any_rejected {
+        return conditions::accepted(generation, "Gateway accepted, but some listeners are invalid");
+    }
+
+    conditions::accepted(generation, "Gateway accepted")
 }
 
 /// Returns the `Programmed` condition for the Gateway.
@@ -1371,8 +1372,13 @@ mod tests {
         let cond = gateway_accepted_condition(1, true, true);
         assert_eq!(cond.status, "True", "should be True when some listeners are accepted");
         assert_eq!(
-            cond.reason, "ListenersNotValid",
-            "reason should indicate some listeners are invalid"
+            cond.reason, "Accepted",
+            "Accepted: True must not carry ListenersNotValid, which is a False-only reason"
+        );
+        assert!(
+            cond.message.contains("some listeners are invalid"),
+            "the partial failure belongs in the message: {}",
+            cond.message
         );
     }
 
