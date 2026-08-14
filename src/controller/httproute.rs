@@ -151,8 +151,8 @@ async fn lookup_parent_gateway(gw_name: &str, gw_ns: &str, route_ns: &str, ctx: 
 /// Lists all [`ReferenceGrant`] resources in the cluster.
 async fn list_reference_grants(ctx: &Context) -> Vec<ReferenceGrant> {
     let grant_api = Api::<ReferenceGrant>::all(ctx.client.clone());
-    match grant_api.list(&kube::api::ListParams::default()).await {
-        Ok(list) => list.items,
+    match crate::listing::list_all(&grant_api).await {
+        Ok(grants) => grants,
         Err(e) => {
             warn!(%e, "failed to list ReferenceGrants");
             Vec::new()

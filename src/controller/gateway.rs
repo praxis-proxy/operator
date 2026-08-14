@@ -23,6 +23,7 @@ use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
     gateway_api::{conditions, route_status},
+    listing,
 };
 
 // -----------------------------------------------------------------------------
@@ -160,16 +161,12 @@ async fn can_accept_routes(client: &kube::Client, gw: &Gateway, ns: &str, config
 
 /// Lists all `HTTPRoute` resources across all namespaces.
 async fn list_all_routes(client: &kube::Client) -> Result<Vec<HTTPRoute>> {
-    let api = Api::<HTTPRoute>::all(client.clone());
-    let list = api.list(&kube::api::ListParams::default()).await?;
-    Ok(list.items)
+    listing::list_all(&Api::<HTTPRoute>::all(client.clone())).await
 }
 
 /// Lists all `ReferenceGrant` resources across all namespaces.
 async fn list_all_grants(client: &kube::Client) -> Result<Vec<ReferenceGrant>> {
-    let api = Api::<ReferenceGrant>::all(client.clone());
-    let list = api.list(&kube::api::ListParams::default()).await?;
-    Ok(list.items)
+    listing::list_all(&Api::<ReferenceGrant>::all(client.clone())).await
 }
 
 /// Rejects a Gateway whose spec this operator cannot honour.

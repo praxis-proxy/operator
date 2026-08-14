@@ -29,7 +29,7 @@ use k8s_openapi::{
 };
 use kube::{
     Api, ResourceExt as _,
-    api::{ListParams, ObjectList, Patch, PatchParams},
+    api::{Patch, PatchParams},
 };
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -48,6 +48,7 @@ use crate::{
     gateway_api::{
         attachment, conditions, hostname, listener_conflict, reference_grant, route_status, route_validation, status,
     },
+    listing,
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
@@ -1112,13 +1113,9 @@ async fn check_cross_ns_grant(
 }
 
 /// Lists `ReferenceGrant` resources in the given namespace.
-async fn list_reference_grants(
-    client: &kube::Client,
-    ns: &str,
-) -> std::result::Result<Vec<ReferenceGrant>, kube::Error> {
+async fn list_reference_grants(client: &kube::Client, ns: &str) -> Result<Vec<ReferenceGrant>> {
     let api = Api::<ReferenceGrant>::namespaced(client.clone(), ns);
-    let list = api.list(&ListParams::default()).await?;
-    Ok(list.items)
+    listing::list_all(&api).await
 }
 
 /// Checks whether a Gateway-to-Secret cross-namespace ref is allowed.
@@ -1205,16 +1202,16 @@ async fn filter_routes_by_allowed_namespaces<'a>(
     attached
         .iter()
         .filter(|(route, section_names)| {
-            route_allowed_by_any_listener(route, section_names, listeners, gateway_ns, all_namespaces.as_ref())
+            route_allowed_by_any_listener(route, section_names, listeners, gateway_ns, all_namespaces.as_deref())
         })
         .cloned()
         .collect()
 }
 
 /// Fetches all namespaces from the cluster, returning `None` on error.
-async fn fetch_all_namespaces(client: &kube::Client) -> Option<ObjectList<Namespace>> {
-    match Api::<Namespace>::all(client.clone()).list(&ListParams::default()).await {
-        Ok(list) => Some(list),
+async fn fetch_all_namespaces(client: &kube::Client) -> Option<Vec<Namespace>> {
+    match listing::list_all(&Api::<Namespace>::all(client.clone())).await {
+        Ok(namespaces) => Some(namespaces),
         Err(e) => {
             warn!(%e, "failed to list namespaces for route filtering");
             None
@@ -1228,7 +1225,7 @@ fn route_allowed_by_any_listener(
     section_names: &[Option<String>],
     listeners: &[GatewayListeners],
     gateway_ns: &str,
-    all_namespaces: Option<&ObjectList<Namespace>>,
+    all_namespaces: Option<&[Namespace]>,
 ) -> bool {
     let route_ns = route_status::route_namespace(route);
     section_names.iter().any(|section| {
@@ -1249,7 +1246,7 @@ fn is_namespace_allowed(
     listener: &GatewayListeners,
     route_ns: &str,
     gateway_ns: &str,
-    all_namespaces: Option<&ObjectList<Namespace>>,
+    all_namespaces: Option<&[Namespace]>,
 ) -> bool {
     let from = listener
         .allowed_routes
@@ -1270,7 +1267,7 @@ fn is_namespace_allowed(
 fn namespace_matches_selector(
     listener: &GatewayListeners,
     route_ns: &str,
-    all_namespaces: Option<&ObjectList<Namespace>>,
+    all_namespaces: Option<&[Namespace]>,
 ) -> bool {
     let selector = listener
         .allowed_routes
@@ -1285,7 +1282,7 @@ fn namespace_matches_selector(
         return false;
     };
 
-    all_ns.items.iter().any(|ns_obj| {
+    all_ns.iter().any(|ns_obj| {
         let ns_name = ns_obj.metadata.name.as_deref().unwrap_or("");
         ns_name == route_ns && matches_label_selector(ns_obj, selector)
     })
