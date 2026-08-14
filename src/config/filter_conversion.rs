@@ -6,6 +6,7 @@
 use gateway_api::httproutes::{
     HttpRouteRules, HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
     HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesFiltersResponseHeaderModifier, HttpRouteRulesFiltersType,
+    HttpRouteRulesFiltersUrlRewrite, HttpRouteRulesFiltersUrlRewritePath, HttpRouteRulesFiltersUrlRewritePathType,
     HttpRouteRulesMatches, HttpRouteRulesMatchesPathType,
 };
 use serde::Serialize;
@@ -160,21 +161,46 @@ fn rule_has_redirect(rule: &HttpRouteRules) -> bool {
     })
 }
 
+/// What a rule's filters need to know about the rule that carries them.
+struct RuleContext<'a> {
+    /// The Praxis `conditions` list gating every filter of this rule.
+    condition: &'a Option<yaml_serde::Value>,
+
+    /// The `PathPrefix` value the rule matched on, if it matched one.
+    ///
+    /// `ReplacePrefixMatch` replaces exactly this much of the request
+    /// path, so the rewrite cannot be built without it.
+    prefix: Option<&'a str>,
+}
+
 /// Converts filters from a single rule into conditional filter entries.
 fn convert_rule_filters(rule: &HttpRouteRules, condition: &Option<yaml_serde::Value>, filters: &mut RouteFilters) {
     let Some(rule_filters) = &rule.filters else {
         return;
     };
 
+    let ctx = RuleContext {
+        condition,
+        prefix: matched_prefix(rule),
+    };
     let mut header_config = HeaderFilterConfig::default();
     let mut has_header_mods = false;
 
     for filter in rule_filters {
-        has_header_mods |= dispatch_filter(filter, condition, &mut header_config, filters);
+        has_header_mods |= dispatch_filter(filter, &ctx, &mut header_config, filters);
     }
 
     if has_header_mods {
         emit_conditional_header_filter(&header_config, condition, &mut filters.transforming);
+    }
+}
+
+/// Returns the `PathPrefix` value the rule's first match uses.
+fn matched_prefix(rule: &HttpRouteRules) -> Option<&str> {
+    let path = rule.matches.as_deref().and_then(<[_]>::first)?.path.as_ref()?;
+    match path.r#type {
+        Some(HttpRouteRulesMatchesPathType::PathPrefix) => path.value.as_deref(),
+        _ => None,
     }
 }
 
@@ -183,7 +209,7 @@ fn convert_rule_filters(rule: &HttpRouteRules, condition: &Option<yaml_serde::Va
 /// Returns `true` if header config was modified.
 fn dispatch_filter(
     filter: &HttpRouteRulesFilters,
-    condition: &Option<yaml_serde::Value>,
+    ctx: &RuleContext<'_>,
     header_config: &mut HeaderFilterConfig,
     filters: &mut RouteFilters,
 ) -> bool {
@@ -192,10 +218,11 @@ fn dispatch_filter(
         HttpRouteRulesFiltersType::ResponseHeaderModifier => dispatch_response_header(filter, header_config),
         HttpRouteRulesFiltersType::RequestRedirect => {
             if let Some(redirect) = &filter.request_redirect {
-                emit_conditional_redirect(redirect, condition, &mut filters.terminating);
+                emit_conditional_redirect(redirect, ctx.condition, &mut filters.terminating);
             }
             false
         },
+        HttpRouteRulesFiltersType::UrlRewrite => dispatch_url_rewrite(filter, ctx, header_config, filters),
         other => {
             warn!(?other, "unsupported filter type, ignoring");
             false
@@ -204,6 +231,46 @@ fn dispatch_filter(
 }
 
 type Predicate = yaml_serde::Mapping;
+/// Dispatches a `URLRewrite` filter.
+///
+/// Returns `true` when the hostname rewrite put a `Host` header into
+/// the rule's header config.
+fn dispatch_url_rewrite(
+    filter: &HttpRouteRulesFilters,
+    ctx: &RuleContext<'_>,
+    header_config: &mut HeaderFilterConfig,
+    filters: &mut RouteFilters,
+) -> bool {
+    let Some(rewrite) = &filter.url_rewrite else {
+        return false;
+    };
+
+    if let Some(path) = &rewrite.path {
+        emit_conditional_path_rewrite(path, ctx, &mut filters.transforming);
+    }
+    rewrite_host(rewrite, header_config)
+}
+
+/// Records a hostname rewrite as a `Host` request header override.
+///
+/// Praxis has no dedicated host rewrite, but it also never replaces the
+/// `Host` header on the way upstream, so setting it is the rewrite. The
+/// filter runs after the router — see [`RouteFilters`] — which is what
+/// keeps the new hostname out of route selection.
+fn rewrite_host(rewrite: &HttpRouteRulesFiltersUrlRewrite, header_config: &mut HeaderFilterConfig) -> bool {
+    let Some(hostname) = rewrite.hostname.as_deref() else {
+        return false;
+    };
+
+    header_config
+        .request_set
+        .get_or_insert_with(Vec::new)
+        .push(HeaderEntry {
+            name: "host".to_owned(),
+            value: hostname.to_owned(),
+        });
+    true
+}
 
 /// How a rule ranks against a sibling when both could match a request.
 ///
@@ -538,6 +605,157 @@ fn build_redirect_location(redirect: &gateway_api::httproutes::HttpRouteRulesFil
     }
 }
 
+// -----------------------------------------------------------------------------
+// Path Rewrite
+// -----------------------------------------------------------------------------
+
+/// Emits a conditional `path_rewrite` filter for a `URLRewrite` path.
+///
+/// Every entry carries `allow_rewrite_override`. Praxis rejects a chain
+/// holding more than one rewrite filter unless the later ones opt in,
+/// and a Gateway whose routes rewrite two different prefixes produces
+/// exactly that — even though the `conditions` make the two mutually
+/// exclusive at request time. Setting the flag on all of them beats
+/// tracking which one happens to be emitted first; it is inert on the
+/// first entry, which the check never inspects.
+fn emit_conditional_path_rewrite(
+    path: &HttpRouteRulesFiltersUrlRewritePath,
+    ctx: &RuleContext<'_>,
+    filters: &mut Vec<PraxisFilterEntry>,
+) {
+    let Some(mut config) = path_rewrite_config(path, ctx.prefix) else {
+        return;
+    };
+    config.insert(
+        yaml_serde::Value::String("allow_rewrite_override".to_owned()),
+        yaml_serde::Value::Bool(true),
+    );
+
+    let config = inject_conditions(yaml_serde::Value::Mapping(config), ctx.condition);
+    filters.push(PraxisFilterEntry {
+        filter: "path_rewrite".to_owned(),
+        config,
+    });
+}
+
+/// Builds the `path_rewrite` config for one `URLRewrite` path modifier.
+///
+/// Returns `None` when the rewrite names no replacement, or when a
+/// `ReplacePrefixMatch` reaches here on a rule with no prefix to
+/// replace. [`validate_route`] rejects that rule before the config is
+/// generated, so this is the belt to that braces.
+///
+/// [`validate_route`]: crate::gateway_api::route_validation::validate_route
+fn path_rewrite_config(
+    path: &HttpRouteRulesFiltersUrlRewritePath,
+    prefix: Option<&str>,
+) -> Option<yaml_serde::Mapping> {
+    match path.r#type {
+        HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath => {
+            Some(replace_full_path(path.replace_full_path.as_deref()?))
+        },
+        HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch => {
+            let Some(prefix) = prefix else {
+                warn!("ReplacePrefixMatch on a rule with no PathPrefix match, ignoring");
+                return None;
+            };
+            Some(replace_prefix_match(prefix, path.replace_prefix_match.as_deref()?))
+        },
+    }
+}
+
+/// Builds the config that replaces the whole request path.
+///
+/// Praxis offers no "set the path" operation, so this is a regex
+/// replace of everything. The query string is not part of what the
+/// pattern sees; `path_rewrite` re-attaches it afterwards.
+fn replace_full_path(replacement: &str) -> yaml_serde::Mapping {
+    replace_operation("^.*$", &escape_replacement(replacement))
+}
+
+/// Builds the config that replaces the prefix the rule matched on.
+///
+/// Gateway API replaces whole path segments: `/prefix/one/two` under a
+/// `/prefix/one` match and a `/one` replacement becomes `/one/two`, and
+/// the bare `/prefix/one` becomes `/one`. A trailing slash is
+/// insignificant on both sides.
+///
+/// Replacing with `/` is the one case a single regex cannot cover,
+/// because the remainder is empty for the bare prefix and a
+/// replacement of `${1}` would leave an empty path. Praxis's
+/// `strip_prefix` has precisely the Gateway API semantics there,
+/// including yielding `/` for that case, so it handles it instead.
+fn replace_prefix_match(prefix: &str, replacement: &str) -> yaml_serde::Mapping {
+    let prefix = prefix.trim_end_matches('/');
+    let replacement = replacement.trim_end_matches('/');
+
+    if replacement.is_empty() {
+        let mut config = yaml_serde::Mapping::new();
+        config.insert(
+            yaml_serde::Value::String("strip_prefix".to_owned()),
+            yaml_serde::Value::String(prefix.to_owned()),
+        );
+        return config;
+    }
+
+    let pattern = format!("^{}(/.*)?$", escape_pattern(prefix));
+    let replacement = format!("{}${{1}}", escape_replacement(replacement));
+    replace_operation(&pattern, &replacement)
+}
+
+/// Builds a `path_rewrite` `replace` operation.
+fn replace_operation(pattern: &str, replacement: &str) -> yaml_serde::Mapping {
+    let mut replace = yaml_serde::Mapping::new();
+    replace.insert(
+        yaml_serde::Value::String("pattern".to_owned()),
+        yaml_serde::Value::String(pattern.to_owned()),
+    );
+    replace.insert(
+        yaml_serde::Value::String("replacement".to_owned()),
+        yaml_serde::Value::String(replacement.to_owned()),
+    );
+
+    let mut config = yaml_serde::Mapping::new();
+    config.insert(
+        yaml_serde::Value::String("replace".to_owned()),
+        yaml_serde::Value::Mapping(replace),
+    );
+    config
+}
+
+/// Escapes a literal so a regular expression matches it verbatim.
+///
+/// A path prefix routinely contains `.` and `-`, and an unescaped `.`
+/// in the pattern matches any character — `/v1.api` would rewrite
+/// `/v1Xapi` as well. Only the characters the `regex` crate treats as
+/// meta are escaped; backslash-escaping an arbitrary character is an
+/// error there, not a no-op.
+fn escape_pattern(literal: &str) -> String {
+    /// Characters `regex::is_meta_character` reports, and the only ones
+    /// that crate accepts a backslash in front of.
+    const META: &[char] = &[
+        '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '#', '&', '-', '~',
+    ];
+
+    let mut escaped = String::with_capacity(literal.len());
+    for ch in literal.chars() {
+        if META.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Escapes a replacement string so every `$` in it stays literal.
+///
+/// The `regex` crate reads `$1` and `$name` in a replacement as capture
+/// group references, and a rewrite target is a path the route author
+/// chose, which may contain a dollar sign.
+fn escape_replacement(literal: &str) -> String {
+    literal.replace('$', "$$")
+}
+
 /// Emits a conditional header filter entry.
 fn emit_conditional_header_filter(
     config: &HeaderFilterConfig,
@@ -861,6 +1079,152 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // URL Rewrite
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replace_prefix_match_keeps_the_remainder() {
+        let config = replace_prefix_match("/prefix/one", "/one");
+        let replace = config
+            .get("replace")
+            .expect("a non-empty replacement is a regex replace");
+
+        assert_eq!(
+            replace["pattern"],
+            yaml_serde::Value::String("^/prefix/one(/.*)?$".to_owned()),
+            "the group has to be optional so the bare prefix rewrites too"
+        );
+        assert_eq!(
+            replace["replacement"],
+            yaml_serde::Value::String("/one${1}".to_owned()),
+            "whatever followed the prefix is carried across unchanged"
+        );
+    }
+
+    #[test]
+    fn test_replace_prefix_match_ignores_trailing_slashes() {
+        let with_slashes = replace_prefix_match("/prefix/", "/one/");
+        let without = replace_prefix_match("/prefix", "/one");
+
+        assert_eq!(
+            with_slashes, without,
+            "Gateway API treats a trailing slash as insignificant on both the match and the \
+             replacement, and keeping one would emit //"
+        );
+    }
+
+    #[test]
+    fn test_replace_prefix_match_with_a_bare_slash_strips() {
+        let config = replace_prefix_match("/strip-prefix", "/");
+
+        assert_eq!(
+            config.get("strip_prefix"),
+            Some(&yaml_serde::Value::String("/strip-prefix".to_owned())),
+            "a regex replacement of ${{1}} would leave the bare prefix with an empty path, which \
+             Praxis rejects; strip_prefix yields / for that case and matches the spec elsewhere"
+        );
+    }
+
+    #[test]
+    fn test_replace_full_path_discards_everything() {
+        let config = replace_full_path("/one");
+        let replace = config.get("replace").expect("a full-path rewrite is a regex replace");
+
+        assert_eq!(
+            replace["pattern"],
+            yaml_serde::Value::String("^.*$".to_owned()),
+            "the whole path goes, however long"
+        );
+        assert_eq!(
+            replace["replacement"],
+            yaml_serde::Value::String("/one".to_owned()),
+            "the replacement is the new path verbatim"
+        );
+    }
+
+    #[test]
+    fn test_a_prefix_is_matched_literally() {
+        let config = replace_prefix_match("/v1.api", "/v2");
+        let replace = config
+            .get("replace")
+            .expect("a non-empty replacement is a regex replace");
+
+        assert_eq!(
+            replace["pattern"],
+            yaml_serde::Value::String("^/v1\\.api(/.*)?$".to_owned()),
+            "an unescaped dot matches any character, so /v1Xapi would be rewritten too"
+        );
+    }
+
+    #[test]
+    fn test_a_dollar_in_a_replacement_stays_literal() {
+        let config = replace_full_path("/cost/$total");
+        let replace = config.get("replace").expect("a full-path rewrite is a regex replace");
+
+        assert_eq!(
+            replace["replacement"],
+            yaml_serde::Value::String("/cost/$$total".to_owned()),
+            "the regex crate reads $total as a capture group reference and would substitute nothing"
+        );
+    }
+
+    #[test]
+    fn test_host_rewrite_sets_the_host_header_after_the_router() {
+        let rules = vec![rule_with_rewrite(
+            HttpRouteRulesMatchesPathType::PathPrefix,
+            "/one",
+            HttpRouteRulesFiltersUrlRewrite {
+                hostname: Some("one.example.org".to_owned()),
+                path: None,
+            },
+        )];
+
+        let filters = convert_filters(&rules);
+        let yaml = yaml_serde::to_string(&filters.transforming[0].config).unwrap();
+
+        assert_eq!(
+            filters.transforming[0].filter, "headers",
+            "a host rewrite is a header set"
+        );
+        assert!(
+            yaml.contains("request_set") && yaml.contains("one.example.org"),
+            "the rewritten hostname has to reach the upstream as the Host header: {yaml}"
+        );
+        assert!(
+            filters.terminating.is_empty(),
+            "setting Host before the router would change which route matched"
+        );
+    }
+
+    #[test]
+    fn test_path_rewrite_allows_overriding_a_sibling_rewrite() {
+        let rules = vec![
+            rule_with_rewrite(
+                HttpRouteRulesMatchesPathType::PathPrefix,
+                "/one",
+                rewrite_to_prefix("/first"),
+            ),
+            rule_with_rewrite(
+                HttpRouteRulesMatchesPathType::PathPrefix,
+                "/two",
+                rewrite_to_prefix("/second"),
+            ),
+        ];
+
+        let filters = convert_filters(&rules);
+
+        assert_eq!(filters.transforming.len(), 2, "each rule rewrites its own traffic");
+        for entry in &filters.transforming {
+            assert_eq!(
+                entry.config.get("allow_rewrite_override"),
+                Some(&yaml_serde::Value::Bool(true)),
+                "Praxis refuses a chain with two rewrite filters unless the later ones opt in, \
+                 even when their conditions make them mutually exclusive"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Condition Scoping
     // -----------------------------------------------------------------------
 
@@ -1028,6 +1392,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------
+
+    /// Builds a `ReplacePrefixMatch` rewrite to the given prefix.
+    fn rewrite_to_prefix(replacement: &str) -> HttpRouteRulesFiltersUrlRewrite {
+        HttpRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                replace_full_path: None,
+                replace_prefix_match: Some(replacement.to_owned()),
+            }),
+        }
+    }
+
+    /// Builds a rule with one path match and one `URLRewrite` filter.
+    fn rule_with_rewrite(
+        kind: HttpRouteRulesMatchesPathType,
+        value: &str,
+        rewrite: HttpRouteRulesFiltersUrlRewrite,
+    ) -> HttpRouteRules {
+        let mut rule = rule_with_path(kind, value);
+        rule.backend_refs = Some(dummy_backend_refs());
+        rule.filters = Some(vec![HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::UrlRewrite,
+            url_rewrite: Some(rewrite),
+            ..Default::default()
+        }]);
+        rule
+    }
 
     /// Scopes a rule that has no siblings to be scoped against.
     fn lone_rule_condition(rule: &HttpRouteRules) -> Option<yaml_serde::Value> {

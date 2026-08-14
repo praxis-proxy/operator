@@ -35,14 +35,14 @@ use crate::{
 /// an over-claim turns a passing run into a false negative elsewhere.
 /// Kept sorted, which `test_supported_features_are_sorted_and_unique`
 /// enforces.
-/// Deliberately absent: `HTTPRouteHostRewrite` and `HTTPRoutePathRewrite`
-/// (the `URLRewrite` filter), `HTTPRouteRequestMirror` and
+/// Deliberately absent: `HTTPRouteRequestMirror` and
 /// `HTTPRouteRequestMultipleMirrors` (the `RequestMirror` filter),
 /// `HTTPRouteMethodMatching` and `HTTPRouteQueryParamMatching`. Every
-/// one is rejected by [`validate_route`] — the filters because they are
-/// not implemented, the two match kinds because `praxis_core::config::Route`
-/// has no field to carry them. Advertising any of them would direct
-/// conformance tooling at suites that cannot pass.
+/// one is rejected by [`validate_route`] — the filter because Praxis
+/// registers none that mirrors a request, the two match kinds because
+/// `praxis_core::config::Route` has no field to carry them.
+/// Advertising any of them would direct conformance tooling at suites
+/// that cannot pass.
 ///
 /// `HTTPRouteResponseHeaderModification` was claimed here and withdrawn.
 /// Claiming it is what made conformance run
@@ -58,11 +58,19 @@ use crate::{
 /// features are claimed again on that basis, and the conformance suites
 /// they gate are no longer skipped.
 ///
+/// The two rewrite features rest on the same release. Praxis registers
+/// a `path_rewrite` filter whose `strip_prefix` and regex `replace`
+/// operations cover both Gateway API path modifiers, and it forwards
+/// the `Host` header untouched, so setting that header is the hostname
+/// rewrite.
+///
 /// [`validate_route`]: crate::gateway_api::route_validation::validate_route
 const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
     "GatewayPort8080",
     "HTTPRoute",
+    "HTTPRouteHostRewrite",
+    "HTTPRoutePathRewrite",
     "HTTPRouteRequestHeaderModification",
     "HTTPRouteResponseHeaderModification",
     "ReferenceGrant",

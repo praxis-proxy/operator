@@ -10,19 +10,23 @@
 //! every unsupported construct is surfaced here and the rule is excluded
 //! from the generated config.
 //!
-//! Two categories are refused. Regular-expression matching this
-//! operator does not implement, and match fields the Praxis route
-//! schema has no field for at all: `praxis_core::config::Route` carries
-//! only a path match, host, headers and cluster, so a method or
-//! query-parameter constraint has nowhere to go. Emitting one anyway
-//! would be dropped during deserialization and the route would quietly
-//! serve every method.
+//! Three categories are refused. Regular-expression matching this
+//! operator does not implement; match fields the Praxis route schema
+//! has no field for at all — `praxis_core::config::Route` carries only
+//! a path match, host, headers and cluster, so a method or
+//! query-parameter constraint has nowhere to go, and emitting one
+//! anyway would see it dropped during deserialization and the route
+//! quietly serve every method; and filters the config generator does
+//! not produce, together with the one rewrite the Gateway API itself
+//! declares invalid — a `ReplacePrefixMatch` on a rule that matches no
+//! prefix.
 
 use std::collections::BTreeMap;
 
 use gateway_api::httproutes::{
-    HTTPRoute, HttpRouteRules, HttpRouteRulesFiltersType, HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParamsType,
+    HTTPRoute, HttpRouteRules, HttpRouteRulesFiltersType, HttpRouteRulesFiltersUrlRewritePathType,
+    HttpRouteRulesMatches, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesPathType,
+    HttpRouteRulesMatchesQueryParamsType,
 };
 
 // -----------------------------------------------------------------------------
@@ -40,6 +44,9 @@ pub enum RuleRejection {
 
     /// A match field the Praxis route schema has no equivalent for.
     UnsupportedMatchField(&'static str),
+
+    /// A `ReplacePrefixMatch` rewrite on a rule that matches no prefix.
+    PrefixRewriteWithoutPrefixMatch,
 }
 
 impl RuleRejection {
@@ -52,6 +59,9 @@ impl RuleRejection {
             Self::UnsupportedFilter(kind) => format!("filter type {kind} is not supported"),
             Self::UnsupportedMatchField(field) => {
                 format!("{field} matching is not supported by the Praxis route schema")
+            },
+            Self::PrefixRewriteWithoutPrefixMatch => {
+                "URLRewrite ReplacePrefixMatch requires a PathPrefix match on the same rule".to_owned()
             },
         }
     }
@@ -128,6 +138,7 @@ fn reject_rule(rule: &HttpRouteRules) -> Option<RuleRejection> {
         .iter()
         .find_map(reject_match)
         .or_else(|| reject_filters(rule))
+        .or_else(|| reject_rewrites(rule))
 }
 
 /// Returns the reason a match cannot be honoured, if any.
@@ -194,7 +205,41 @@ fn is_supported_filter(kind: &HttpRouteRulesFiltersType) -> bool {
         HttpRouteRulesFiltersType::RequestHeaderModifier
             | HttpRouteRulesFiltersType::ResponseHeaderModifier
             | HttpRouteRulesFiltersType::RequestRedirect
+            | HttpRouteRulesFiltersType::UrlRewrite
     )
+}
+
+/// Returns the reason a rule's rewrites cannot be honoured, if any.
+///
+/// `ReplacePrefixMatch` names no prefix of its own: it replaces
+/// whatever the rule matched on. The Gateway API requires an
+/// implementation to refuse the rule outright when there is no
+/// `PathPrefix` match to take that from, rather than guess at one.
+fn reject_rewrites(rule: &HttpRouteRules) -> Option<RuleRejection> {
+    let prefixed = matches!(
+        rule.matches
+            .as_deref()
+            .and_then(<[_]>::first)
+            .and_then(|m| m.path.as_ref())
+            .and_then(|p| p.r#type.as_ref()),
+        Some(HttpRouteRulesMatchesPathType::PathPrefix)
+    );
+    if prefixed {
+        return None;
+    }
+
+    rule.filters
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|f| f.url_rewrite.as_ref())
+        .find(|rewrite| {
+            rewrite
+                .path
+                .as_ref()
+                .is_some_and(|p| p.r#type == HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch)
+        })
+        .map(|_| RuleRejection::PrefixRewriteWithoutPrefixMatch)
 }
 
 // -----------------------------------------------------------------------------
@@ -205,8 +250,8 @@ fn is_supported_filter(kind: &HttpRouteRulesFiltersType) -> bool {
 #[expect(clippy::default_trait_access, reason = "tests")]
 mod tests {
     use gateway_api::httproutes::{
-        HttpRouteRulesFilters, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesPath,
-        HttpRouteRulesMatchesQueryParams, HttpRouteSpec,
+        HttpRouteRulesFilters, HttpRouteRulesFiltersUrlRewrite, HttpRouteRulesFiltersUrlRewritePath,
+        HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesQueryParams, HttpRouteSpec,
     };
 
     use super::*;
@@ -283,18 +328,92 @@ mod tests {
     fn test_unsupported_filter_is_rejected() {
         let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::Exact, "/api");
         rule.filters = Some(vec![HttpRouteRulesFilters {
-            r#type: HttpRouteRulesFiltersType::UrlRewrite,
+            r#type: HttpRouteRulesFiltersType::RequestMirror,
             ..Default::default()
         }]);
         let validation = validate_route(&route_with(vec![rule]));
 
         assert!(
             validation.is_rejected(0),
-            "URLRewrite is not implemented and must be rejected rather than ignored"
+            "RequestMirror is not implemented and must be rejected rather than ignored"
         );
         assert!(
             validation.message().is_some_and(|m| m.contains("not supported")),
             "the rejection message should name the unsupported construct"
+        );
+    }
+
+    #[test]
+    fn test_host_rewrite_is_accepted() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::Exact, "/api");
+        rule.filters = Some(vec![url_rewrite(HttpRouteRulesFiltersUrlRewrite {
+            hostname: Some("one.example.org".to_owned()),
+            path: None,
+        })]);
+
+        assert!(
+            !validate_route(&route_with(vec![rule])).is_rejected(0),
+            "a hostname rewrite needs no path match and is served by setting the Host header"
+        );
+    }
+
+    #[test]
+    fn test_full_path_rewrite_is_accepted_without_a_prefix_match() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::Exact, "/api");
+        rule.filters = Some(vec![url_rewrite(HttpRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplaceFullPath,
+                replace_full_path: Some("/one".to_owned()),
+                replace_prefix_match: None,
+            }),
+        })]);
+
+        assert!(
+            !validate_route(&route_with(vec![rule])).is_rejected(0),
+            "ReplaceFullPath discards the whole path, so it does not care what the rule matched on"
+        );
+    }
+
+    #[test]
+    fn test_prefix_rewrite_without_a_prefix_match_is_rejected() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::Exact, "/api");
+        rule.filters = Some(vec![url_rewrite(HttpRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                replace_full_path: None,
+                replace_prefix_match: Some("/one".to_owned()),
+            }),
+        })]);
+        let validation = validate_route(&route_with(vec![rule]));
+
+        assert!(
+            validation.is_rejected(0),
+            "ReplacePrefixMatch replaces what the rule matched on, and an Exact match leaves it \
+             nothing to replace — the Gateway API requires refusing the rule, not guessing"
+        );
+        assert!(
+            validation.message().is_some_and(|m| m.contains("PathPrefix")),
+            "the message should say what the rule is missing"
+        );
+    }
+
+    #[test]
+    fn test_prefix_rewrite_with_a_prefix_match_is_accepted() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/api");
+        rule.filters = Some(vec![url_rewrite(HttpRouteRulesFiltersUrlRewrite {
+            hostname: None,
+            path: Some(HttpRouteRulesFiltersUrlRewritePath {
+                r#type: HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch,
+                replace_full_path: None,
+                replace_prefix_match: Some("/one".to_owned()),
+            }),
+        })]);
+
+        assert!(
+            !validate_route(&route_with(vec![rule])).is_rejected(0),
+            "the prefix the rewrite replaces is right there on the rule"
         );
     }
 
@@ -388,6 +507,15 @@ mod tests {
                 ..Default::default()
             },
             status: None,
+        }
+    }
+
+    /// Wraps a `URLRewrite` body in a rule filter.
+    fn url_rewrite(rewrite: HttpRouteRulesFiltersUrlRewrite) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::UrlRewrite,
+            url_rewrite: Some(rewrite),
+            ..Default::default()
         }
     }
 
