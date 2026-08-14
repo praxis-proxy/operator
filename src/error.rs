@@ -9,7 +9,7 @@
 
 /// Errors produced during operator reconciliation.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OperatorError {
+pub enum OperatorError {
     /// Kubernetes API call failed.
     #[error("kubernetes api: {0}")]
     Kube(#[from] kube::Error),
@@ -40,4 +40,4 @@ pub(crate) enum OperatorError {
 }
 
 /// Reconciliation result alias.
-pub(crate) type Result<T, E = OperatorError> = std::result::Result<T, E>;
+pub type Result<T, E = OperatorError> = std::result::Result<T, E>;

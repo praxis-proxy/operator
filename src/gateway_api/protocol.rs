@@ -14,7 +14,7 @@
 
 /// A listener protocol this operator recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListenerProtocol {
+pub enum ListenerProtocol {
     /// Cleartext HTTP.
     Http,
 
@@ -28,7 +28,7 @@ impl ListenerProtocol {
     /// Returns `None` for protocols this operator does not serve, which
     /// the caller reports as `UnsupportedProtocol` rather than silently
     /// ignoring.
-    pub(crate) fn parse(protocol: &str) -> Option<Self> {
+    pub fn parse(protocol: &str) -> Option<Self> {
         match protocol {
             "HTTP" => Some(Self::Http),
             "HTTPS" => Some(Self::Https),
@@ -37,12 +37,22 @@ impl ListenerProtocol {
     }
 
     /// Returns whether this operator can serve `protocol`.
-    pub(crate) fn is_supported(protocol: &str) -> bool {
+    ///
+    /// ```
+    /// use praxis_operator::gateway_api::protocol::ListenerProtocol;
+    ///
+    /// assert!(ListenerProtocol::is_supported("HTTPS"));
+    /// assert!(!ListenerProtocol::is_supported("TCP"));
+    ///
+    /// // The Gateway API spells protocols in upper case.
+    /// assert!(!ListenerProtocol::is_supported("https"));
+    /// ```
+    pub fn is_supported(protocol: &str) -> bool {
         Self::parse(protocol).is_some()
     }
 
     /// Returns whether `protocol` terminates TLS.
-    pub(crate) fn terminates_tls(protocol: &str) -> bool {
+    pub fn terminates_tls(protocol: &str) -> bool {
         Self::parse(protocol) == Some(Self::Https)
     }
 }

@@ -3,8 +3,8 @@
 
 //! Kubernetes resource builders for managed data-plane objects.
 
-pub(crate) mod configmap;
-pub(crate) mod deployment;
-pub(crate) mod disruption;
-pub(crate) mod labels;
-pub(crate) mod service;
+pub mod configmap;
+pub mod deployment;
+pub mod disruption;
+pub mod labels;
+pub mod service;

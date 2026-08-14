@@ -27,31 +27,31 @@ use crate::gateway_api::{
 /// (exact match) or `path_prefix` (prefix match). When `path` is set it
 /// takes precedence over `path_prefix`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisRoute {
+pub struct PraxisRoute {
     /// Target cluster name.
-    pub(crate) cluster: String,
+    pub cluster: String,
 
     /// Request headers to match (exact match only).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) headers: Option<BTreeMap<String, String>>,
+    pub headers: Option<BTreeMap<String, String>>,
 
     /// Hostname match.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) host: Option<String>,
+    pub host: Option<String>,
 
     /// Listener names this route targets. `None` means all listeners.
     ///
     /// Used for per-listener route partitioning; not serialized.
     #[serde(skip)]
-    pub(crate) listener_names: Vec<Option<String>>,
+    pub listener_names: Vec<Option<String>>,
 
     /// Exact path match. Takes precedence over `path_prefix`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) path: Option<String>,
+    pub path: Option<String>,
 
     /// Path prefix match. Must end with '/'.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) path_prefix: String,
+    pub path_prefix: String,
 }
 
 // -----------------------------------------------------------------------------
@@ -62,9 +62,9 @@ pub(crate) struct PraxisRoute {
 ///
 /// Represents a filter in a filter chain with its configuration.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisFilterEntry {
+pub struct PraxisFilterEntry {
     /// Filter name.
-    pub(crate) filter: String,
+    pub filter: String,
 
     /// Filter configuration (flattened into parent).
     #[serde(flatten)]
@@ -80,21 +80,21 @@ pub(crate) struct PraxisFilterEntry {
 /// Carries enough metadata for the gateway controller to resolve Kubernetes
 /// `Service` endpoints into cluster `IP:port` pairs.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BackendRef {
+pub struct BackendRef {
     /// Cluster name (format: `namespace~service~port`).
-    pub(crate) cluster_name: String,
+    pub cluster_name: String,
 
     /// Kubernetes namespace of the backend Service.
-    pub(crate) namespace: String,
+    pub namespace: String,
 
     /// Backend Service port number.
-    pub(crate) port: i32,
+    pub port: i32,
 
     /// Backend Service name.
-    pub(crate) service: String,
+    pub service: String,
 
     /// Traffic weight for weighted routing (Gateway API `backendRef.weight`).
-    pub(crate) weight: Option<i32>,
+    pub weight: Option<i32>,
 }
 
 // -----------------------------------------------------------------------------
@@ -113,7 +113,7 @@ pub(crate) struct BackendRef {
 /// targeted listener are retained.
 ///
 /// [`intersect_hostnames`]: crate::gateway_api::hostname::intersect_hostnames
-pub(crate) fn convert_routes(
+pub fn convert_routes(
     routes: &[AttachedRoute<'_>],
     listener_hostnames: &HashMap<String, Option<String>>,
     grants: &[ReferenceGrant],

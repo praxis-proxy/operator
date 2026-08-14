@@ -31,7 +31,7 @@ use gateway_api::httproutes::{
 
 /// Why a single `HTTPRoute` rule cannot be honoured.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuleRejection {
+pub enum RuleRejection {
     /// A match or filter used a regular expression.
     RegularExpression(&'static str),
 
@@ -44,7 +44,7 @@ pub(crate) enum RuleRejection {
 
 impl RuleRejection {
     /// Returns a human-readable explanation for a status message.
-    pub(crate) fn message(&self) -> String {
+    pub fn message(&self) -> String {
         match self {
             Self::RegularExpression(field) => {
                 format!("RegularExpression {field} matching is not supported")
@@ -63,7 +63,7 @@ impl RuleRejection {
 
 /// The rules of one `HTTPRoute` that cannot be honoured, keyed by index.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RouteValidation {
+pub struct RouteValidation {
     /// Rejected rule indices and the reason for each.
     rejected: BTreeMap<usize, RuleRejection>,
 
@@ -74,7 +74,7 @@ pub(crate) struct RouteValidation {
 impl RouteValidation {
     /// Returns `true` when the rule at `index` must be excluded from the
     /// generated config.
-    pub(crate) fn is_rejected(&self, index: usize) -> bool {
+    pub fn is_rejected(&self, index: usize) -> bool {
         self.rejected.contains_key(&index)
     }
 
@@ -82,19 +82,19 @@ impl RouteValidation {
     ///
     /// A route declaring no rules at all is not fully rejected; it simply
     /// contributes nothing.
-    pub(crate) fn is_fully_rejected(&self) -> bool {
+    pub fn is_fully_rejected(&self) -> bool {
         self.total > 0 && self.rejected.len() == self.total
     }
 
     /// Returns `true` when some, but not all, rules were rejected.
-    pub(crate) fn is_partially_rejected(&self) -> bool {
+    pub fn is_partially_rejected(&self) -> bool {
         !self.rejected.is_empty() && !self.is_fully_rejected()
     }
 
     /// Returns a status message naming the first rejection.
     ///
     /// Returns `None` when every rule is supported.
-    pub(crate) fn message(&self) -> Option<String> {
+    pub fn message(&self) -> Option<String> {
         let (index, rejection) = self.rejected.iter().next()?;
         Some(format!("rule {index}: {}", rejection.message()))
     }
@@ -105,7 +105,7 @@ impl RouteValidation {
 // -----------------------------------------------------------------------------
 
 /// Finds every rule of `route` that this operator cannot honour.
-pub(crate) fn validate_route(route: &HTTPRoute) -> RouteValidation {
+pub fn validate_route(route: &HTTPRoute) -> RouteValidation {
     let rules = route.spec.rules.as_deref().unwrap_or(&[]);
 
     let rejected = rules

@@ -45,24 +45,19 @@ const DEFAULT_NAMESPACE: &str = "default";
 // -----------------------------------------------------------------------------
 
 /// Returns the namespace of an [`HTTPRoute`], defaulting to `"default"`.
-pub(crate) fn route_namespace(route: &HTTPRoute) -> &str {
+pub fn route_namespace(route: &HTTPRoute) -> &str {
     route.metadata.namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE)
 }
 
 /// Returns `true` when a `parentRef` targets a `Gateway` resource.
-pub(crate) fn is_gateway_parent_ref(parent_ref: &HttpRouteParentRefs) -> bool {
+pub fn is_gateway_parent_ref(parent_ref: &HttpRouteParentRefs) -> bool {
     let group = parent_ref.group.as_deref().unwrap_or(GATEWAY_GROUP);
     let kind = parent_ref.kind.as_deref().unwrap_or("Gateway");
     group == GATEWAY_GROUP && kind == "Gateway"
 }
 
 /// Returns `true` when `parent_ref` targets the named Gateway.
-pub(crate) fn is_ref_targeting_gateway(
-    parent_ref: &HttpRouteParentRefs,
-    gw_name: &str,
-    gw_ns: &str,
-    route_ns: &str,
-) -> bool {
+pub fn is_ref_targeting_gateway(parent_ref: &HttpRouteParentRefs, gw_name: &str, gw_ns: &str, route_ns: &str) -> bool {
     if !is_gateway_parent_ref(parent_ref) {
         return false;
     }
@@ -77,7 +72,7 @@ pub(crate) fn is_ref_targeting_gateway(
 
 /// Reason a backend ref could not be resolved.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ResolveFailure {
+pub enum ResolveFailure {
     /// Unsupported group or kind.
     InvalidKind,
 
@@ -89,10 +84,17 @@ pub(crate) enum ResolveFailure {
 }
 
 /// Outcome of checking every backend ref in a route.
-pub(crate) type ResolveResult = std::result::Result<(), ResolveFailure>;
+pub type ResolveResult = std::result::Result<(), ResolveFailure>;
 
 /// Checks all backend refs in a route for validity.
-pub(crate) async fn check_backend_refs(
+///
+/// # Errors
+///
+/// Returns the first [`ResolveFailure`] encountered: an unsupported
+/// backend kind, a cross-namespace ref no [`ReferenceGrant`] permits,
+/// or a `Service` that does not exist. The failure maps directly to
+/// the `ResolvedRefs` reason reported on the route.
+pub async fn check_backend_refs(
     route: &HTTPRoute,
     route_ns: &str,
     client: &kube::Client,
@@ -114,7 +116,7 @@ pub(crate) async fn check_backend_refs(
 }
 
 /// Builds the `ResolvedRefs` condition from a resolution outcome.
-pub(crate) fn resolved_refs_condition(result: &ResolveResult, generation: i64) -> Condition {
+pub fn resolved_refs_condition(result: &ResolveResult, generation: i64) -> Condition {
     match result {
         Ok(()) => conditions::resolved_refs(generation, "all backend refs resolved"),
         Err(ResolveFailure::InvalidKind) => {
@@ -132,7 +134,12 @@ pub(crate) fn resolved_refs_condition(result: &ResolveResult, generation: i64) -
 }
 
 /// Rejects backend refs that are not `core/Service`.
-pub(crate) fn validate_backend_kind(backend: &HttpRouteRulesBackendRefs) -> ResolveResult {
+///
+/// # Errors
+///
+/// Returns [`ResolveFailure::InvalidKind`] when the ref names any
+/// group other than core, or any kind other than `Service`.
+pub fn validate_backend_kind(backend: &HttpRouteRulesBackendRefs) -> ResolveResult {
     let group = backend.group.as_deref().unwrap_or("");
     let kind = backend.kind.as_deref().unwrap_or("Service");
     if !group.is_empty() || kind != "Service" {
@@ -143,7 +150,13 @@ pub(crate) fn validate_backend_kind(backend: &HttpRouteRulesBackendRefs) -> Reso
 }
 
 /// Rejects cross-namespace refs not covered by a [`ReferenceGrant`].
-pub(crate) fn validate_cross_namespace(
+///
+/// # Errors
+///
+/// Returns [`ResolveFailure::RefNotPermitted`] when the backend lives
+/// in another namespace and no grant in that namespace allows the
+/// reference. Same-namespace refs never fail.
+pub fn validate_cross_namespace(
     backend: &HttpRouteRulesBackendRefs,
     route_ns: &str,
     grants: &[ReferenceGrant],
@@ -179,7 +192,7 @@ pub(crate) fn validate_cross_namespace(
 // -----------------------------------------------------------------------------
 
 /// Builds the `status.parents` entry for a single `parentRef`.
-pub(crate) fn parent_status_json(
+pub fn parent_status_json(
     parent_ref: &HttpRouteParentRefs,
     gw_ns: &str,
     accepted: &Condition,
@@ -192,11 +205,7 @@ pub(crate) fn parent_status_json(
 ///
 /// Used when a route carries more than the usual `Accepted` and
 /// `ResolvedRefs` pair, such as a `PartiallyInvalid` route.
-pub(crate) fn parent_status_with_conditions(
-    parent_ref: &HttpRouteParentRefs,
-    gw_ns: &str,
-    conditions: &[Condition],
-) -> Value {
+pub fn parent_status_with_conditions(parent_ref: &HttpRouteParentRefs, gw_ns: &str, conditions: &[Condition]) -> Value {
     let mut ref_json = json!({
         "group": GATEWAY_GROUP,
         "kind": "Gateway",
@@ -224,7 +233,13 @@ pub(crate) fn parent_status_with_conditions(
 /// for every other parent — including those written by the other
 /// controller — are preserved in place, so the two writers no longer
 /// overwrite each other's list.
-pub(crate) async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRoute, computed: &[Value]) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns an error if the live status cannot be deserialized or if
+/// the status patch is rejected. When the merged status equals what is
+/// already stored no patch is sent, so an unchanged route cannot fail.
+pub async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRoute, computed: &[Value]) -> Result<()> {
     let ns = route_namespace(route);
     let name = route.name_any();
 
@@ -263,12 +278,13 @@ pub(crate) async fn apply_parent_statuses(client: &kube::Client, route: &HTTPRou
 /// ever revisits the entry because the Gateway that owned it is gone.
 /// Entries written by other controllers, and entries for other parents,
 /// are left untouched.
-pub(crate) async fn clear_parent_statuses(
-    client: &kube::Client,
-    route: &HTTPRoute,
-    gw_name: &str,
-    gw_ns: &str,
-) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns an error if the live status cannot be deserialized or if
+/// the status patch is rejected. When no entry names the Gateway no
+/// patch is sent, so the call is a no-op that cannot fail.
+pub async fn clear_parent_statuses(client: &kube::Client, route: &HTTPRoute, gw_name: &str, gw_ns: &str) -> Result<()> {
     let ns = route_namespace(route);
     let name = route.name_any();
 

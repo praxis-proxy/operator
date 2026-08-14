@@ -54,7 +54,7 @@ const FIELD_MANAGER: &str = "praxis-operator";
 /// Prefers the pod name supplied by the downward API so the holder is
 /// identifiable with `kubectl get lease`; falls back to the hostname,
 /// then to the process id.
-pub(crate) fn identity() -> String {
+pub fn identity() -> String {
     std::env::var("POD_NAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -80,7 +80,7 @@ fn lease_namespace() -> String {
 ///
 /// Returns an error only when the API rejects a lease write for a reason
 /// other than another replica holding it; contention is retried.
-pub(crate) async fn acquire(client: &Client, identity: &str) -> Result<()> {
+pub async fn acquire(client: &Client, identity: &str) -> Result<()> {
     let api: Api<Lease> = Api::namespaced(client.clone(), &lease_namespace());
 
     loop {
@@ -102,7 +102,7 @@ pub(crate) async fn acquire(client: &Client, identity: &str) -> Result<()> {
 /// the lease. The caller is expected to stop reconciling and exit so the
 /// Deployment restarts it as a follower, which is simpler to reason
 /// about than resuming mid-flight.
-pub(crate) async fn renew_until_lost(client: &Client, identity: &str) -> Result<()> {
+pub async fn renew_until_lost(client: &Client, identity: &str) -> Result<()> {
     let api: Api<Lease> = Api::namespaced(client.clone(), &lease_namespace());
 
     loop {

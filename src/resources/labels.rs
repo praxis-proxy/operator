@@ -16,7 +16,7 @@ use kube::ResourceExt as _;
 ///
 /// Includes `app.kubernetes.io/name`, `app.kubernetes.io/instance`, and
 /// `app.kubernetes.io/managed-by`.
-pub(crate) fn standard_labels(instance: &str) -> BTreeMap<String, String> {
+pub fn standard_labels(instance: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("app.kubernetes.io/name".to_owned(), "praxis".to_owned());
     labels.insert("app.kubernetes.io/instance".to_owned(), instance.to_owned());
@@ -28,7 +28,7 @@ pub(crate) fn standard_labels(instance: &str) -> BTreeMap<String, String> {
 ///
 /// Prefixes the gateway name with `praxis-` to form the deployment and service
 /// names.
-pub(crate) fn child_name(gateway_name: &str) -> String {
+pub fn child_name(gateway_name: &str) -> String {
     format!("praxis-{gateway_name}")
 }
 
@@ -42,7 +42,7 @@ pub(crate) fn child_name(gateway_name: &str) -> String {
 /// Returns [`OperatorError::MissingObjectKey`] when the Gateway has no UID.
 ///
 /// [`OperatorError::MissingObjectKey`]: crate::error::OperatorError::MissingObjectKey
-pub(crate) fn owner_reference(gateway: &gateway_api::gateways::Gateway) -> crate::error::Result<OwnerReference> {
+pub fn owner_reference(gateway: &gateway_api::gateways::Gateway) -> crate::error::Result<OwnerReference> {
     Ok(OwnerReference {
         api_version: "gateway.networking.k8s.io/v1".to_owned(),
         block_owner_deletion: Some(true),

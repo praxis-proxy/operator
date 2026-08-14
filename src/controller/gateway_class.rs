@@ -58,7 +58,12 @@ const SUPPORTED_FEATURES: &[&str] = &[
 ///
 /// Only processes `GatewayClasses` whose `controller_name` matches this
 /// operator. Unrelated `GatewayClasses` are ignored via [`Action::await_change`].
-pub(crate) async fn reconcile(gc: Arc<GatewayClass>, ctx: Arc<Context>) -> Result<Action> {
+///
+/// # Errors
+///
+/// Returns an error if patching the `GatewayClass` status fails. The
+/// error reaches [`error_policy`], which requeues with backoff.
+pub async fn reconcile(gc: Arc<GatewayClass>, ctx: Arc<Context>) -> Result<Action> {
     let name = gc.name_any();
     info!("reconciling GatewayClass {name}");
 
@@ -143,7 +148,7 @@ fn build_accepted_status(generation: i64) -> serde_json::Value {
 /// Error policy for `GatewayClass` reconciliation failures.
 ///
 /// Logs the error and requeues after 30 seconds.
-pub(crate) fn error_policy(_gc: Arc<GatewayClass>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
+pub fn error_policy(_gc: Arc<GatewayClass>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     error!(%error, "GatewayClass reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }

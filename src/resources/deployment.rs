@@ -48,9 +48,9 @@ const DEFAULT_REPLICAS: i32 = 2;
 // -----------------------------------------------------------------------------
 
 /// Parameters for building a Praxis data-plane [`Deployment`].
-pub(crate) struct DeploymentParams<'a> {
+pub struct DeploymentParams<'a> {
     /// Child resource name.
-    pub(crate) name: &'a str,
+    pub name: &'a str,
 
     /// SHA-256 hex digest of the `ConfigMap` contents.
     ///
@@ -58,19 +58,19 @@ pub(crate) struct DeploymentParams<'a> {
     /// rolling restart. Required because Kubernetes `ConfigMap` volume mounts
     /// use atomic symlink swaps that `inotify`-based file watchers cannot
     /// detect.
-    pub(crate) config_hash: &'a str,
+    pub config_hash: &'a str,
 
     /// Parent Gateway.
-    pub(crate) gateway: &'a Gateway,
+    pub gateway: &'a Gateway,
 
     /// `(listener_name, port)` pairs from Gateway listeners.
-    pub(crate) listener_ports: &'a [(String, i32)],
+    pub listener_ports: &'a [(String, i32)],
 
     /// Target namespace.
-    pub(crate) namespace: &'a str,
+    pub namespace: &'a str,
 
     /// Deduplicated TLS secret names from HTTPS listeners.
-    pub(crate) tls_secret_names: &'a [String],
+    pub tls_secret_names: &'a [String],
 }
 
 /// Builds a Deployment for the Praxis data-plane.
@@ -89,7 +89,7 @@ pub(crate) struct DeploymentParams<'a> {
 /// # Errors
 ///
 /// Returns an error if the Gateway has no UID.
-pub(crate) fn build_deployment(params: &DeploymentParams<'_>) -> crate::error::Result<Deployment> {
+pub fn build_deployment(params: &DeploymentParams<'_>) -> crate::error::Result<Deployment> {
     let instance = params.gateway.name_any();
     let labels = standard_labels(&instance);
     let pod_annotations = BTreeMap::from([("praxis.sh/config-hash".to_owned(), params.config_hash.to_owned())]);

@@ -13,16 +13,16 @@ use serde::Serialize;
 ///
 /// Represents a backend cluster with endpoints and load balancing strategy.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub(crate) struct PraxisCluster {
+pub struct PraxisCluster {
     /// Cluster name.
-    pub(crate) name: String,
+    pub name: String,
 
     /// Cluster endpoints.
-    pub(crate) endpoints: Vec<PraxisEndpoint>,
+    pub endpoints: Vec<PraxisEndpoint>,
 
     /// Load balancing strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) load_balancer_strategy: Option<String>,
+    pub load_balancer_strategy: Option<String>,
 }
 
 /// Praxis endpoint configuration.
@@ -30,7 +30,7 @@ pub(crate) struct PraxisCluster {
 /// Can be a simple address string or a weighted address.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
-pub(crate) enum PraxisEndpoint {
+pub enum PraxisEndpoint {
     /// Simple endpoint address.
     Simple(String),
     /// Weighted endpoint with address and weight.
@@ -52,8 +52,19 @@ pub(crate) enum PraxisEndpoint {
 ///
 /// Uses `~` as separator because it cannot appear in Kubernetes namespace
 /// or service names (DNS subdomain charset), preventing ambiguity.
-#[cfg_attr(not(test), expect(dead_code, reason = "utility function used in tests"))]
-pub(crate) fn cluster_name(namespace: &str, service: &str, port: i32) -> String {
+///
+/// ```
+/// use praxis_operator::config::cluster::cluster_name;
+///
+/// assert_eq!(cluster_name("default", "echo", 8080), "default~echo~8080");
+///
+/// // The format is only injective because `~` is outside the DNS
+/// // subdomain charset. Feed it a name containing the separator and
+/// // two distinct backends do collide — which is why the API server's
+/// // own validation is what makes this key safe:
+/// assert_eq!(cluster_name("a", "b~c", 80), cluster_name("a~b", "c", 80));
+/// ```
+pub fn cluster_name(namespace: &str, service: &str, port: i32) -> String {
     format!("{namespace}~{service}~{port}")
 }
 
@@ -61,7 +72,7 @@ pub(crate) fn cluster_name(namespace: &str, service: &str, port: i32) -> String 
 ///
 /// If weights are provided, creates weighted endpoints. Otherwise, uses simple
 /// endpoint addresses.
-pub(crate) fn build_cluster(name: &str, endpoints: Vec<String>, weights: Option<Vec<i32>>) -> PraxisCluster {
+pub fn build_cluster(name: &str, endpoints: Vec<String>, weights: Option<Vec<i32>>) -> PraxisCluster {
     let endpoints = if let Some(ws) = weights {
         endpoints
             .into_iter()

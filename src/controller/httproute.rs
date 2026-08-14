@@ -37,7 +37,13 @@ use crate::{
 /// validation. `Accepted = True` is set by the Gateway controller
 /// after the data-plane Deployment rollout completes, preventing the
 /// conformance test from sending traffic to a stale configuration.
-pub(crate) async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Result<Action> {
+///
+/// # Errors
+///
+/// Returns an error if a parent `Gateway` cannot be read or if patching
+/// the route status fails. The error reaches [`error_policy`], which
+/// requeues with backoff.
+pub async fn reconcile(route: Arc<HTTPRoute>, ctx: Arc<Context>) -> Result<Action> {
     let ns = route_status::route_namespace(&route);
     let name = route.name_any();
     info!("reconciling HTTPRoute {ns}/{name}");
@@ -326,7 +332,7 @@ fn hostnames_intersect(route: &HTTPRoute, gw: &Gateway, section_name: Option<&st
 /// Error policy for `HTTPRoute` reconciliation failures.
 ///
 /// Logs the error and requeues after 30 seconds.
-pub(crate) fn error_policy(_route: Arc<HTTPRoute>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
+pub fn error_policy(_route: Arc<HTTPRoute>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     error!(%error, "HTTPRoute reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }

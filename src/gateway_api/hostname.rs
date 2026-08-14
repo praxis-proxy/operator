@@ -17,7 +17,20 @@ use std::collections::BTreeSet;
 ///
 /// Comparison is ASCII case-insensitive: DNS names are case-insensitive
 /// per RFC 1123 section 2.1 and RFC 4343 section 1.
-pub(crate) fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
+///
+/// ```
+/// use praxis_operator::gateway_api::hostname::hostname_matches;
+///
+/// assert!(hostname_matches("foo.example.com", "*.example.com"));
+/// assert!(hostname_matches("Foo.Example.com", "*.example.com"));
+///
+/// // A bare domain does not match its own wildcard.
+/// assert!(!hostname_matches("example.com", "*.example.com"));
+///
+/// // The separator dot is load-bearing.
+/// assert!(!hostname_matches("fooexample.com", "*.example.com"));
+/// ```
+pub fn hostname_matches(route_host: &str, listener_host: &str) -> bool {
     if route_host.eq_ignore_ascii_case(listener_host) {
         return true;
     }
@@ -56,10 +69,20 @@ fn wildcard_covers(wildcard: &str, candidate: &str) -> bool {
 /// or `None` if the hostnames do not intersect. When a wildcard matches
 /// an exact hostname, the exact hostname is returned.
 ///
-/// A route hostname of `foo.example.com` on a `*.example.com` listener
-/// intersects to `foo.example.com`; `bar.other.com` on the same listener
-/// yields `None`. See `test_intersection_route_exact_listener_wildcard`.
-pub(crate) fn hostname_intersection(route_host: &str, listener_host: &str) -> Option<String> {
+/// ```
+/// use praxis_operator::gateway_api::hostname::hostname_intersection;
+///
+/// // The more specific side wins.
+/// assert_eq!(
+///     hostname_intersection("foo.example.com", "*.example.com"),
+///     Some("foo.example.com".to_owned()),
+/// );
+/// assert_eq!(
+///     hostname_intersection("bar.other.com", "*.example.com"),
+///     None
+/// );
+/// ```
+pub fn hostname_intersection(route_host: &str, listener_host: &str) -> Option<String> {
     if route_host.eq_ignore_ascii_case(listener_host) {
         return Some(route_host.to_owned());
     }
@@ -82,8 +105,23 @@ pub(crate) fn hostname_intersection(route_host: &str, listener_host: &str) -> Op
 /// constraints), all route hostnames pass through unchanged.
 ///
 /// Results keep route-hostname order, which the generated config depends
-/// on. See `test_intersect_filters_non_matching`.
-pub(crate) fn intersect_hostnames(route_hostnames: &[String], listener_hostnames: &[Option<String>]) -> Vec<String> {
+/// on.
+///
+/// ```
+/// use praxis_operator::gateway_api::hostname::intersect_hostnames;
+///
+/// let routes = ["a.example.com".to_owned(), "nope.other.com".to_owned()];
+/// let listeners = [Some("*.example.com".to_owned())];
+///
+/// assert_eq!(
+///     intersect_hostnames(&routes, &listeners),
+///     vec!["a.example.com"]
+/// );
+///
+/// // An unconstrained listener passes everything through.
+/// assert_eq!(intersect_hostnames(&routes, &[None]), routes.to_vec());
+/// ```
+pub fn intersect_hostnames(route_hostnames: &[String], listener_hostnames: &[Option<String>]) -> Vec<String> {
     let constrained: Vec<_> = listener_hostnames.iter().filter_map(|h| h.as_deref()).collect();
     if constrained.is_empty() || constrained.len() < listener_hostnames.len() {
         return route_hostnames.to_vec();

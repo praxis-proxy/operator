@@ -32,7 +32,7 @@ const PAGE_SIZE: u32 = 500;
 /// Returns an error if any page request fails. A partial listing is
 /// never returned: a caller acting on half a cluster's routes would
 /// generate a config that silently drops the rest.
-pub(crate) async fn list_all<K>(api: &Api<K>) -> Result<Vec<K>>
+pub async fn list_all<K>(api: &Api<K>) -> Result<Vec<K>>
 where
     K: Clone + std::fmt::Debug + DeserializeOwned,
 {

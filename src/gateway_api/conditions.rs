@@ -13,7 +13,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 /// observedGeneration.
 ///
 /// Sets `last_transition_time` to the current UTC timestamp.
-pub(crate) fn make_condition(type_: &str, status: &str, reason: &str, message: &str, generation: i64) -> Condition {
+pub fn make_condition(type_: &str, status: &str, reason: &str, message: &str, generation: i64) -> Condition {
     Condition {
         last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
         message: message.to_owned(),
@@ -25,37 +25,37 @@ pub(crate) fn make_condition(type_: &str, status: &str, reason: &str, message: &
 }
 
 /// Returns an Accepted: True condition.
-pub(crate) fn accepted(generation: i64, message: &str) -> Condition {
+pub fn accepted(generation: i64, message: &str) -> Condition {
     make_condition("Accepted", "True", "Accepted", message, generation)
 }
 
 /// Returns an `Accepted: False` condition.
-pub(crate) fn not_accepted(generation: i64, reason: &str, message: &str) -> Condition {
+pub fn not_accepted(generation: i64, reason: &str, message: &str) -> Condition {
     make_condition("Accepted", "False", reason, message, generation)
 }
 
 /// Returns a `Programmed: True` condition.
-pub(crate) fn programmed(generation: i64, message: &str) -> Condition {
+pub fn programmed(generation: i64, message: &str) -> Condition {
     make_condition("Programmed", "True", "Programmed", message, generation)
 }
 
 /// Returns a `Programmed: False` condition.
-pub(crate) fn not_programmed(generation: i64, reason: &str, message: &str) -> Condition {
+pub fn not_programmed(generation: i64, reason: &str, message: &str) -> Condition {
     make_condition("Programmed", "False", reason, message, generation)
 }
 
 /// Returns a `ResolvedRefs: True` condition.
-pub(crate) fn resolved_refs(generation: i64, message: &str) -> Condition {
+pub fn resolved_refs(generation: i64, message: &str) -> Condition {
     make_condition("ResolvedRefs", "True", "ResolvedRefs", message, generation)
 }
 
 /// Returns a `ResolvedRefs: False` condition.
-pub(crate) fn unresolved_refs(generation: i64, reason: &str, message: &str) -> Condition {
+pub fn unresolved_refs(generation: i64, reason: &str, message: &str) -> Condition {
     make_condition("ResolvedRefs", "False", reason, message, generation)
 }
 
 /// Returns a Conflicted: False condition indicating no conflicts.
-pub(crate) fn no_conflicts(generation: i64) -> Condition {
+pub fn no_conflicts(generation: i64) -> Condition {
     make_condition(
         "Conflicted",
         "False",
@@ -69,12 +69,12 @@ pub(crate) fn no_conflicts(generation: i64) -> Condition {
 ///
 /// Signals that the route was accepted but some of its rules were
 /// dropped because this operator cannot express them.
-pub(crate) fn partially_invalid(generation: i64, message: &str) -> Condition {
+pub fn partially_invalid(generation: i64, message: &str) -> Condition {
     make_condition("PartiallyInvalid", "True", "UnsupportedValue", message, generation)
 }
 
 /// Returns a `Conflicted: True` condition.
-pub(crate) fn conflicted(generation: i64, reason: &str, message: &str) -> Condition {
+pub fn conflicted(generation: i64, reason: &str, message: &str) -> Condition {
     make_condition("Conflicted", "True", reason, message, generation)
 }
 

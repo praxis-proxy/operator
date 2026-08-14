@@ -3,5 +3,5 @@
 
 //! Health, readiness and metrics for the operator process.
 
-pub(crate) mod metrics;
-pub(crate) mod server;
+pub mod metrics;
+pub mod server;

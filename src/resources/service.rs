@@ -23,7 +23,7 @@ use super::labels::{owner_reference, standard_labels};
 /// # Errors
 ///
 /// Returns an error if the Gateway has no UID.
-pub(crate) fn build_service(
+pub fn build_service(
     name: &str,
     namespace: &str,
     gateway: &Gateway,

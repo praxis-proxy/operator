@@ -59,7 +59,14 @@ impl TargetPort {
 ///
 /// Tries `EndpointSlice` first (supports headless and manual endpoints),
 /// falling back to classic Endpoints for backwards compatibility.
-pub(crate) async fn resolve_endpoints(
+///
+/// # Errors
+///
+/// Returns an error if listing `EndpointSlices` or reading the
+/// `Service` fails for any reason other than the object being absent.
+/// A missing `Service` yields an empty address list, not an error, so
+/// the caller can report `BackendNotFound` on the route instead.
+pub async fn resolve_endpoints(
     client: &Client,
     namespace: &str,
     service_name: &str,
