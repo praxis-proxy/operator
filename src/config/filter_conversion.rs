@@ -6,7 +6,7 @@
 use gateway_api::httproutes::{
     HttpRouteRules, HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
     HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesFiltersResponseHeaderModifier, HttpRouteRulesFiltersType,
-    HttpRouteRulesMatchesPathType,
+    HttpRouteRulesMatches, HttpRouteRulesMatchesPathType,
 };
 use serde::Serialize;
 use tracing::warn;
@@ -159,31 +159,81 @@ fn dispatch_filter(
     }
 }
 
-/// Extracts a Praxis condition from a rule's first path match.
+/// Builds the Praxis filter condition scoping a rule's filters.
 ///
-/// Returns a YAML value suitable for the `conditions` field of a Praxis
-/// filter, or `None` for catch-all rules without path constraints.
+/// Returns a value for the `conditions` field of a Praxis filter, or
+/// `None` for a rule with no constraints to scope by.
+///
+/// Filters are chain-level in Praxis, not per-route, so a filter is
+/// confined to its own rule's traffic only as precisely as
+/// `praxis_core::config::ConditionMatch` allows: path, path prefix,
+/// methods and headers. That type has no host field, so two routes
+/// sharing a listener and a path but differing only in hostname still
+/// share their filters. Narrowing that further needs host matching in
+/// the Praxis condition schema.
 fn extract_rule_condition(rule: &HttpRouteRules) -> Option<serde_yaml::Value> {
-    let matches = rule.matches.as_ref()?;
-    let first = matches.first()?;
-    let path = first.path.as_ref()?;
-    let value = path.value.as_deref()?;
+    let first = rule.matches.as_ref()?.first()?;
 
-    let field = match &path.r#type {
-        Some(HttpRouteRulesMatchesPathType::PathPrefix | HttpRouteRulesMatchesPathType::Exact) => "path_prefix",
-        _ => return None,
-    };
+    let mut predicate = serde_yaml::Mapping::new();
+    insert_path_predicate(first, &mut predicate);
+    insert_header_predicate(first, &mut predicate);
 
-    let when = serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String(field.to_owned()),
-        serde_yaml::Value::String(value.to_owned()),
-    )]);
+    if predicate.is_empty() {
+        return None;
+    }
+
     let entry = serde_yaml::Mapping::from_iter([(
         serde_yaml::Value::String("when".to_owned()),
-        serde_yaml::Value::Mapping(when),
+        serde_yaml::Value::Mapping(predicate),
     )]);
 
     Some(serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(entry)]))
+}
+
+/// Adds the path constraint to a filter predicate.
+///
+/// An `Exact` match uses the Praxis `path` field and a `PathPrefix`
+/// match uses `path_prefix`. Collapsing both onto `path_prefix`, as this
+/// did before, made a filter scoped to exactly `/foo` fire on `/foo/bar`
+/// as well.
+fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut serde_yaml::Mapping) {
+    let Some(path) = m.path.as_ref() else { return };
+    let Some(value) = path.value.as_deref() else { return };
+
+    let field = match &path.r#type {
+        Some(HttpRouteRulesMatchesPathType::Exact) => "path",
+        Some(HttpRouteRulesMatchesPathType::PathPrefix) => "path_prefix",
+        _ => return,
+    };
+
+    predicate.insert(
+        serde_yaml::Value::String(field.to_owned()),
+        serde_yaml::Value::String(value.to_owned()),
+    );
+}
+
+/// Adds the rule's header constraints to a filter predicate.
+///
+/// Narrows the filter to the traffic its own rule matches. Without it a
+/// header modifier written for one route also fires for any other route
+/// sharing its path on the same listener.
+fn insert_header_predicate(m: &HttpRouteRulesMatches, predicate: &mut serde_yaml::Mapping) {
+    let Some(headers) = m.headers.as_deref().filter(|h| !h.is_empty()) else {
+        return;
+    };
+
+    let mut mapping = serde_yaml::Mapping::new();
+    for header in headers {
+        mapping.insert(
+            serde_yaml::Value::String(header.name.clone()),
+            serde_yaml::Value::String(header.value.clone()),
+        );
+    }
+
+    predicate.insert(
+        serde_yaml::Value::String("headers".to_owned()),
+        serde_yaml::Value::Mapping(mapping),
+    );
 }
 
 /// Dispatches a request header modifier filter.
@@ -660,5 +710,114 @@ mod tests {
             second_yaml.contains("/add"),
             "second filter should be conditioned on /add"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Condition Scoping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exact_path_scopes_on_path_not_prefix() {
+        let rule = rule_with_path(HttpRouteRulesMatchesPathType::Exact, "/foo");
+        let cond = extract_rule_condition(&rule).expect("an exact path should produce a condition");
+        let when = &cond[0]["when"];
+
+        assert_eq!(
+            when["path"],
+            serde_yaml::Value::String("/foo".to_owned()),
+            "an Exact match must scope on the Praxis path field"
+        );
+        assert!(
+            when.get("path_prefix").is_none(),
+            "using path_prefix for an Exact match would fire the filter on /foo/bar too"
+        );
+    }
+
+    #[test]
+    fn test_prefix_path_scopes_on_path_prefix() {
+        let rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/api");
+        let cond = extract_rule_condition(&rule).expect("a prefix path should produce a condition");
+
+        assert_eq!(
+            cond[0]["when"]["path_prefix"],
+            serde_yaml::Value::String("/api".to_owned()),
+            "a PathPrefix match must scope on path_prefix"
+        );
+    }
+
+    #[test]
+    fn test_header_constraints_narrow_the_condition() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/api");
+        if let Some(matches) = rule.matches.as_mut()
+            && let Some(first) = matches.first_mut()
+        {
+            first.headers = Some(vec![gateway_api::httproutes::HttpRouteRulesMatchesHeaders {
+                name: "x-tenant".to_owned(),
+                value: "acme".to_owned(),
+                r#type: None,
+            }]);
+        }
+
+        let cond = extract_rule_condition(&rule).expect("condition expected");
+
+        assert_eq!(
+            cond[0]["when"]["headers"]["x-tenant"],
+            serde_yaml::Value::String("acme".to_owned()),
+            "a rule's header match must scope its filters, or the filter fires for other routes \
+             sharing the same path on this listener"
+        );
+    }
+
+    #[test]
+    fn test_header_only_rule_still_produces_a_condition() {
+        let rule = HttpRouteRules {
+            matches: Some(vec![HttpRouteRulesMatches {
+                headers: Some(vec![gateway_api::httproutes::HttpRouteRulesMatchesHeaders {
+                    name: "x-canary".to_owned(),
+                    value: "true".to_owned(),
+                    r#type: None,
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let cond = extract_rule_condition(&rule).expect("a header-only rule should still be scoped");
+
+        assert!(
+            cond[0]["when"].get("headers").is_some(),
+            "a rule constrained only by headers must not produce an unscoped filter"
+        );
+    }
+
+    #[test]
+    fn test_unconstrained_rule_has_no_condition() {
+        let rule = HttpRouteRules {
+            matches: Some(vec![HttpRouteRulesMatches::default()]),
+            ..Default::default()
+        };
+
+        assert!(
+            extract_rule_condition(&rule).is_none(),
+            "a rule with nothing to match on cannot be scoped and must stay unconditional"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Builds a rule with a single path match of the given type.
+    fn rule_with_path(kind: HttpRouteRulesMatchesPathType, value: &str) -> HttpRouteRules {
+        HttpRouteRules {
+            matches: Some(vec![HttpRouteRulesMatches {
+                path: Some(gateway_api::httproutes::HttpRouteRulesMatchesPath {
+                    r#type: Some(kind),
+                    value: Some(value.to_owned()),
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
     }
 }
