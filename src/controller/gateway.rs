@@ -90,7 +90,7 @@ pub(crate) fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<C
 /// configuration.
 async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
     if !gateway_helpers::validate_gateway_class(&ctx.client, &gw).await?
-        || reject_if_parameters_ref(&ctx.client, &gw).await?
+        || reject_unsupported_spec(&ctx.client, &gw).await?
     {
         return Ok(Action::await_change());
     }
@@ -172,25 +172,49 @@ async fn list_all_grants(client: &kube::Client) -> Result<Vec<ReferenceGrant>> {
     Ok(list.items)
 }
 
-/// Rejects the Gateway if it has a `parametersRef`. Returns `true` when
-/// rejected.
-async fn reject_if_parameters_ref(client: &kube::Client, gw: &Gateway) -> Result<bool> {
-    if !has_parameters_ref(gw) {
+/// Rejects a Gateway whose spec this operator cannot honour.
+///
+/// Returns `true` when the Gateway was rejected and the caller should
+/// stop reconciling it.
+async fn reject_unsupported_spec(client: &kube::Client, gw: &Gateway) -> Result<bool> {
+    let Some((reason, message)) = unsupported_spec_reason(gw) else {
         return Ok(false);
-    }
+    };
+
     let generation = gw.metadata.generation.unwrap_or(1);
-    reject_gateway(
-        client,
-        gw,
-        generation,
-        "InvalidParameters",
-        "parametersRef is not supported",
-    )
-    .await?;
+    reject_gateway(client, gw, generation, reason, message).await?;
+
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
-    info!("Gateway {ns}/{name} rejected: unsupported parametersRef");
+    info!("Gateway {ns}/{name} rejected: {message}");
     Ok(true)
+}
+
+/// Returns the `(reason, message)` for a Gateway spec this operator
+/// cannot honour.
+///
+/// `parametersRef` carries implementation-specific configuration this
+/// operator does not define, and requested addresses cannot be
+/// satisfied because the data-plane Service takes whatever address its
+/// provider assigns.
+fn unsupported_spec_reason(gw: &Gateway) -> Option<(&'static str, &'static str)> {
+    if has_parameters_ref(gw) {
+        return Some(("InvalidParameters", "parametersRef is not supported"));
+    }
+
+    if has_requested_addresses(gw) {
+        return Some((
+            "UnsupportedAddress",
+            "spec.addresses is not supported; the data-plane Service address is assigned by the cluster",
+        ));
+    }
+
+    None
+}
+
+/// Checks whether a `Gateway` requests specific addresses.
+fn has_requested_addresses(gw: &Gateway) -> bool {
+    gw.spec.addresses.as_ref().is_some_and(|a| !a.is_empty())
 }
 
 // -----------------------------------------------------------------------------
@@ -361,6 +385,7 @@ fn find_gateway_parent_ref(
 )]
 mod tests {
     use gateway_api::{
+        gateways::GatewayAddresses,
         httproutes::{HTTPRoute, HttpRouteParentRefs, HttpRouteSpec},
         referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo},
     };
@@ -472,6 +497,53 @@ mod tests {
         assert!(
             !has_parameters_ref(&gw),
             "default gateway should have no parameters ref"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_spec_reason_accepts_a_plain_gateway() {
+        let gw = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: None,
+        };
+        assert!(
+            unsupported_spec_reason(&gw).is_none(),
+            "a Gateway with neither parametersRef nor addresses is supported"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_spec_reason_rejects_requested_addresses() {
+        let mut gw = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: None,
+        };
+        gw.spec.addresses = Some(vec![GatewayAddresses {
+            value: Some("192.0.2.1".to_owned()),
+            ..Default::default()
+        }]);
+
+        let (reason, _) = unsupported_spec_reason(&gw).expect("requested addresses should be rejected");
+        assert_eq!(
+            reason, "UnsupportedAddress",
+            "the Gateway API reason for an address this operator cannot assign is UnsupportedAddress"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_spec_reason_ignores_an_empty_address_list() {
+        let mut gw = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: None,
+        };
+        gw.spec.addresses = Some(Vec::new());
+
+        assert!(
+            unsupported_spec_reason(&gw).is_none(),
+            "an empty address list requests nothing and must not be rejected"
         );
     }
 
