@@ -8,6 +8,8 @@ use kube::{
     runtime::events::{Recorder, Reporter},
 };
 
+use crate::stores::Stores;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -55,6 +57,9 @@ pub struct Context {
 
     /// Publishes Kubernetes events for user-visible decisions.
     pub recorder: Recorder,
+
+    /// Cluster-wide caches read in place of per-reconcile listing.
+    pub stores: Stores,
 }
 
 /// Builds the event reporter identifying this operator.

@@ -16,9 +16,9 @@ pub mod endpoints;
 pub mod error;
 pub mod gateway_api;
 pub mod leader;
-pub mod listing;
 pub mod observability;
 pub mod resources;
+pub mod stores;
 
 use std::{future::Future, sync::Arc};
 
@@ -101,6 +101,7 @@ async fn run_controllers(client: &Client, identity: &str) -> error::Result<()> {
     let ctx = Arc::new(context::Context {
         client: client.clone(),
         recorder: kube::runtime::events::Recorder::new(client.clone(), context::reporter()),
+        stores: stores::Stores::spawn(client).await?,
     });
     let gc = build_gc_controller(client, Arc::clone(&ctx));
     let gw = build_gw_controller(client, Arc::clone(&ctx));

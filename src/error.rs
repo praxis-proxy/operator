@@ -30,6 +30,10 @@ pub enum OperatorError {
     #[error("leadership lost to another replica")]
     LeadershipLost,
 
+    /// A watch cache never completed its initial sync.
+    #[error("cache for {0} did not sync; check list/watch permission on that kind")]
+    CacheSync(&'static str),
+
     /// Serialization failed.
     #[error("serialization: {0}")]
     Serialization(#[from] serde_json::Error),

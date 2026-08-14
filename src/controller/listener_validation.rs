@@ -20,9 +20,8 @@ use kube::Api;
 use serde_json::{Value, json};
 
 use crate::{
-    error::Result,
+    context::Context,
     gateway_api::{conditions, reference_grant},
-    listing,
 };
 
 // -----------------------------------------------------------------------------
@@ -37,7 +36,7 @@ pub(super) async fn listener_resolved_refs(
     listener: &GatewayListeners,
     generation: i64,
     gateway_ns: &str,
-    client: &kube::Client,
+    ctx: &Context,
 ) -> (Vec<Value>, Condition) {
     let (supported, kinds_invalid) = validate_route_kinds(listener);
 
@@ -48,7 +47,7 @@ pub(super) async fn listener_resolved_refs(
         );
     }
 
-    if let Some(condition) = validate_tls_cert_refs(listener, generation, gateway_ns, client).await {
+    if let Some(condition) = validate_tls_cert_refs(listener, generation, gateway_ns, ctx).await {
         return (supported, condition);
     }
 
@@ -93,7 +92,7 @@ async fn validate_tls_cert_refs(
     listener: &GatewayListeners,
     generation: i64,
     gateway_ns: &str,
-    client: &kube::Client,
+    ctx: &Context,
 ) -> Option<Condition> {
     let cert_refs = listener.tls.as_ref()?.certificate_refs.as_ref()?;
 
@@ -106,10 +105,10 @@ async fn validate_tls_cert_refs(
             ));
         }
         let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gateway_ns);
-        if let Some(c) = check_cross_ns_grant(client, generation, gateway_ns, secret_ns, &cert_ref.name).await {
+        if let Some(c) = check_cross_ns_grant(ctx, generation, gateway_ns, secret_ns, &cert_ref.name) {
             return Some(c);
         }
-        if let Some(c) = check_secret_contents(client, generation, secret_ns, &cert_ref.name).await {
+        if let Some(c) = check_secret_contents(&ctx.client, generation, secret_ns, &cert_ref.name).await {
             return Some(c);
         }
     }
@@ -127,8 +126,8 @@ fn is_secret_cert_ref(cert_ref: &GatewayListenersTlsCertificateRefs) -> bool {
 ///
 /// Returns `Some(condition)` when the reference is denied, `None` when
 /// allowed or same-namespace.
-async fn check_cross_ns_grant(
-    client: &kube::Client,
+fn check_cross_ns_grant(
+    ctx: &Context,
     generation: i64,
     gateway_ns: &str,
     secret_ns: &str,
@@ -138,13 +137,7 @@ async fn check_cross_ns_grant(
         return None;
     }
 
-    let Ok(grants) = list_reference_grants(client, secret_ns).await else {
-        return Some(conditions::unresolved_refs(
-            generation,
-            "RefNotPermitted",
-            "cannot verify cross-namespace grant",
-        ));
-    };
+    let grants = ctx.stores.grants_in(secret_ns);
 
     if is_secret_ref_granted(gateway_ns, secret_ns, secret_name, &grants) {
         return None;
@@ -155,12 +148,6 @@ async fn check_cross_ns_grant(
         "RefNotPermitted",
         "cross-namespace secret reference requires a valid ReferenceGrant",
     ))
-}
-
-/// Lists `ReferenceGrant` resources in the given namespace.
-async fn list_reference_grants(client: &kube::Client, ns: &str) -> Result<Vec<ReferenceGrant>> {
-    let api = Api::<ReferenceGrant>::namespaced(client.clone(), ns);
-    listing::list_all(&api).await
 }
 
 /// Checks whether a Gateway-to-Secret cross-namespace ref is allowed.

@@ -3,6 +3,8 @@
 
 //! Route attachment logic for `HTTPRoute` `parentRefs`.
 
+use std::sync::Arc;
+
 use gateway_api::httproutes::{HTTPRoute, HttpRouteParentRefs};
 
 // -----------------------------------------------------------------------------
@@ -61,7 +63,11 @@ pub fn parent_ref_matches_gateway(
 ///
 /// Each tuple contains a route and a vector of section names (one per matching
 /// parentRef). A `None` section name means the route attaches to all listeners.
-pub fn attached_routes<'a>(gateway_name: &str, gateway_ns: &str, routes: &'a [HTTPRoute]) -> Vec<AttachedRoute<'a>> {
+pub fn attached_routes<'a>(
+    gateway_name: &str,
+    gateway_ns: &str,
+    routes: &'a [Arc<HTTPRoute>],
+) -> Vec<AttachedRoute<'a>> {
     let mut result = Vec::new();
 
     for route in routes {
@@ -195,7 +201,7 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![route];
+        let routes = vec![Arc::new(route)];
         let attached = attached_routes("test-gateway", "default", &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
@@ -229,7 +235,7 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![route];
+        let routes = vec![Arc::new(route)];
         let attached = attached_routes("test-gateway", "default", &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
@@ -272,7 +278,7 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![route];
+        let routes = vec![Arc::new(route)];
         let attached = attached_routes("test-gateway", "default", &routes);
 
         assert_eq!(attached.len(), 1, "one route should be attached");
@@ -313,7 +319,7 @@ mod tests {
             status: None,
         };
 
-        let routes = vec![route];
+        let routes = vec![Arc::new(route)];
         let attached = attached_routes("test-gateway", "default", &routes);
 
         assert!(attached.is_empty(), "no routes should be attached");
