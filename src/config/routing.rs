@@ -256,13 +256,21 @@ fn process_rule(
         return;
     }
 
-    let all_refs: Vec<_> = raw_backends.iter().collect();
-    let cluster_name = merged_cluster_name_from_refs(&all_refs, route_ns);
+    let authorized: Vec<_> = raw_backends
+        .iter()
+        .filter(|b| check_backend_authorized(b, route_ns, grants))
+        .collect();
+
+    if authorized.is_empty() {
+        tracing::debug!("rule has no authorized backends; emitting no route");
+        return;
+    }
+
+    let cluster_name = merged_cluster_name_from_refs(&authorized, route_ns);
     create_routes_for_backend(&cluster_name, matches, route_hostnames, section_names, praxis_routes);
     backend_refs.extend(
-        raw_backends
+        authorized
             .iter()
-            .filter(|b| check_backend_authorized(b, route_ns, grants))
             .filter_map(|b| process_backend_ref(b, route_ns, &cluster_name, seen_clusters)),
     );
 }
@@ -1365,14 +1373,59 @@ mod tests {
         let routes = vec![(&route, vec![None])];
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
-        assert_eq!(
-            praxis_routes.len(),
-            1,
-            "route should still be created for unauthorized backend"
+        assert!(
+            praxis_routes.is_empty(),
+            "a rule whose only backend is unauthorized must emit no route: pointing one at a \
+             cluster that is never created leaves the data plane with a dangling reference"
         );
         assert!(
             backend_refs.is_empty(),
             "unauthorized cross-ns backend should be excluded from cluster"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_cluster_name_covers_only_authorized_backends() {
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("mixed-xns".to_owned()),
+                namespace: Some("infra".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                rules: Some(vec![HttpRouteRules {
+                    backend_refs: Some(vec![
+                        HttpRouteRulesBackendRefs {
+                            name: "local".to_owned(),
+                            port: Some(80),
+                            ..Default::default()
+                        },
+                        HttpRouteRulesBackendRefs {
+                            name: "denied".to_owned(),
+                            namespace: Some("other-ns".to_owned()),
+                            port: Some(80),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let routes = vec![(&route, vec![None])];
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert_eq!(
+            praxis_routes[0].cluster, "infra~local~80",
+            "the cluster name must describe only the backends that actually resolve, or the \
+             generated name promises endpoints the cluster will never contain"
+        );
+        assert_eq!(
+            backend_refs.len(),
+            1,
+            "only the authorized backend contributes endpoints"
         );
     }
 
