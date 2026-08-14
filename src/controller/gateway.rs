@@ -412,8 +412,10 @@ mod tests {
         referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo},
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use serde_json::Value;
 
     use super::*;
+    use crate::testing;
 
     #[test]
     fn test_map_route_to_gateway_basic() {
@@ -663,5 +665,388 @@ mod tests {
                 }],
             },
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconciliation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_a_full_apply_writes_children_status_and_route_status() {
+        let route = attachable_route();
+        let (ctx, journal) = testing::fake_context(
+            reconcile_responses(),
+            testing::Cached {
+                routes: vec![route],
+                ..Default::default()
+            },
+        );
+
+        let action = Box::pin(apply(Arc::new(reconcilable_gateway()), &ctx))
+            .await
+            .expect("every call is answered");
+
+        for kind in ["/configmaps", "/deployments", "/services", "/poddisruptionbudgets"] {
+            assert!(
+                !journal.matching(kind).is_empty(),
+                "the data plane is only complete once every child is applied: {kind}"
+            );
+        }
+        assert!(
+            !journal.matching("/gateways/gw/status").is_empty(),
+            "a Gateway with no status tells conformance nothing about whether it is serving"
+        );
+        assert_eq!(
+            action,
+            Action::requeue(Duration::from_secs(2)),
+            "a Deployment that has not finished rolling out is re-checked quickly, not in fifteen \
+             seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_finished_rollout_with_unchanged_config_admits_routes() {
+        let (client, _) = testing::fake_client(vec![rolled_out_deployment()]);
+
+        assert!(
+            can_accept_routes(&client, &reconcilable_gateway(), "infra", false).await,
+            "a settled data plane serving the config that is already applied is exactly when a \
+             route may be reported accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_changed_config_holds_routes_back() {
+        let (client, _) = testing::fake_client(vec![rolled_out_deployment()]);
+
+        assert!(
+            !can_accept_routes(&client, &reconcilable_gateway(), "infra", true).await,
+            "the pods are still running the previous config, so accepting the route would invite \
+             traffic the data plane cannot route yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unfinished_rollout_holds_routes_back() {
+        let (client, _) = testing::fake_client(vec![]);
+
+        assert!(
+            !can_accept_routes(&client, &reconcilable_gateway(), "infra", false).await,
+            "a Deployment that does not exist yet has certainly not rolled out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_gateway_from_another_class_is_left_alone() {
+        let (ctx, journal) = testing::fake_context(
+            vec![testing::Canned::ok(
+                "/gatewayclasses/praxis",
+                serde_json::json!({
+                    "apiVersion": "gateway.networking.k8s.io/v1",
+                    "kind": "GatewayClass",
+                    "metadata": { "name": "praxis" },
+                    "spec": { "controllerName": "example.com/other" },
+                }),
+            )],
+            testing::Cached::default(),
+        );
+
+        let action = Box::pin(apply(Arc::new(reconcilable_gateway()), &ctx))
+            .await
+            .expect("skipping is not a failure");
+
+        assert_eq!(action, Action::await_change(), "there is nothing to requeue for");
+        assert_eq!(
+            journal.requests().len(),
+            1,
+            "the class lookup is the only call another controller's Gateway should provoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_gateway_requesting_an_address_is_rejected() {
+        let (ctx, journal) = testing::fake_context(reconcile_responses(), testing::Cached::default());
+        let mut gw = reconcilable_gateway();
+        gw.spec.addresses = Some(vec![GatewayAddresses {
+            value: Some("1.2.3.4".to_owned()),
+            ..Default::default()
+        }]);
+
+        let action = Box::pin(apply(Arc::new(gw), &ctx))
+            .await
+            .expect("a rejection is a clean outcome");
+
+        let status = journal
+            .matching("/gateways/gw/status")
+            .pop()
+            .and_then(|request| request.body)
+            .expect("the rejection has to be written where the author will see it");
+        assert_eq!(
+            status.pointer("/status/conditions/0/reason").and_then(Value::as_str),
+            Some("UnsupportedAddress"),
+            "the data-plane Service takes whatever address its provider assigns, and silently \
+             ignoring the request would look like it had been honoured"
+        );
+        assert_eq!(action, Action::await_change(), "a rejected Gateway waits for an edit");
+        assert!(
+            journal.matching("/deployments").is_empty(),
+            "a rejected Gateway must not get a data plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_clears_this_gateways_route_entries() {
+        let route = route_with_parent_status();
+        let (ctx, journal) = testing::fake_context(
+            vec![route_response()],
+            testing::Cached {
+                routes: vec![route],
+                ..Default::default()
+            },
+        );
+
+        cleanup(&reconcilable_gateway(), &ctx).await;
+
+        assert!(
+            !journal.matching("/httproutes/route/status").is_empty(),
+            "child resources go with owner references, but route status does not — a stale entry \
+             naming a deleted parent would outlive the Gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_survives_a_route_it_cannot_patch() {
+        let route = attachable_route();
+        let (ctx, _) = testing::fake_context(
+            vec![testing::Canned::server_error("")],
+            testing::Cached {
+                routes: vec![route],
+                ..Default::default()
+            },
+        );
+
+        cleanup(&reconcilable_gateway(), &ctx).await;
+        // Reaching here is the assertion: a Gateway that cannot finish
+        // deleting because one route refused a patch would hold its
+        // finalizer forever.
+    }
+
+    #[tokio::test]
+    async fn test_apply_resource_reports_a_refused_patch() {
+        let (client, _) = testing::failing_client();
+        let cm = k8s_openapi::api::core::v1::ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("praxis-gw".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = apply_resource(&client, "infra", &cm)
+            .await
+            .expect_err("a 500 is not an applied resource");
+
+        assert!(
+            matches!(error, OperatorError::Kube(_)),
+            "an apply the API server refused has to fail the reconcile, or the Gateway reports a \
+             data plane it never built: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_resource_needs_a_name() {
+        let (client, _) = testing::fake_client(vec![]);
+        let cm = k8s_openapi::api::core::v1::ConfigMap::default();
+
+        let error = apply_resource(&client, "infra", &cm)
+            .await
+            .expect_err("an unnamed resource cannot be applied");
+
+        assert!(
+            matches!(error, OperatorError::MissingObjectKey(".metadata.name")),
+            "the missing field is named, because the alternative is a 404 with no explanation: \
+             {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_policy_retries_a_transient_failure_sooner() {
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+        let gw = Arc::new(reconcilable_gateway());
+
+        let transient = error_policy(
+            Arc::clone(&gw),
+            &OperatorError::Kube(kube::Error::LinesCodecMaxLineLengthExceeded),
+            Arc::clone(&ctx),
+        );
+        let logic = error_policy(gw, &OperatorError::MissingObjectKey(".metadata.uid"), ctx);
+
+        assert_eq!(
+            transient,
+            Action::requeue(Duration::from_secs(15)),
+            "an API server that blinked is worth retrying soon"
+        );
+        assert_eq!(
+            logic,
+            Action::requeue(Duration::from_secs(30)),
+            "a malformed object will not fix itself in fifteen seconds, and retrying it as fast \
+             only burns the API budget"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test Utilities
+    // -----------------------------------------------------------------------
+
+    /// Builds a Gateway this operator owns and can serve.
+    fn reconcilable_gateway() -> Gateway {
+        use gateway_api::gateways::{GatewayListeners, GatewaySpec};
+
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_owned()),
+                namespace: Some("infra".to_owned()),
+                uid: Some("uid".to_owned()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "praxis".to_owned(),
+                listeners: vec![GatewayListeners {
+                    name: "http".to_owned(),
+                    port: 80,
+                    protocol: "HTTP".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Builds a route already carrying this controller's status entry
+    /// for [`reconcilable_gateway`].
+    fn route_with_parent_status() -> HTTPRoute {
+        let mut route = attachable_route();
+        route.status = serde_json::from_value(serde_json::json!({
+            "parents": [{
+                "parentRef": {
+                    "group": GATEWAY_GROUP,
+                    "kind": "Gateway",
+                    "name": "gw",
+                    "namespace": "infra",
+                },
+                "controllerName": crate::context::CONTROLLER_NAME,
+                "conditions": [],
+            }],
+        }))
+        .expect("the entry is the shape the operator writes");
+        route
+    }
+
+    /// Builds a route that attaches to [`reconcilable_gateway`].
+    fn attachable_route() -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_owned()),
+                namespace: Some("infra".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: Some(vec![HttpRouteParentRefs {
+                    name: "gw".to_owned(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Every response a clean reconcile asks for.
+    fn reconcile_responses() -> Vec<testing::Canned> {
+        let mut responses = vec![owned_class_response()];
+        responses.extend(child_apply_responses());
+        responses.push(gateway_response());
+        responses.push(route_response());
+        responses
+    }
+
+    /// The `GatewayClass` this operator owns.
+    fn owned_class_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/gatewayclasses/praxis",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "GatewayClass",
+                "metadata": { "name": "praxis" },
+                "spec": { "controllerName": crate::context::CONTROLLER_NAME },
+            }),
+        )
+    }
+
+    /// An accepting answer for each child resource apply.
+    fn child_apply_responses() -> Vec<testing::Canned> {
+        vec![
+            testing::Canned::ok("/configmaps", serde_json::json!({ "kind": "ConfigMap" })),
+            testing::Canned::ok("/deployments", serde_json::json!({ "kind": "Deployment" })),
+            testing::Canned::ok("/services", serde_json::json!({ "kind": "Service" })),
+            testing::Canned::ok(
+                "/poddisruptionbudgets",
+                serde_json::json!({ "kind": "PodDisruptionBudget" }),
+            ),
+        ]
+    }
+
+    /// The object the API server hands back from a Gateway status apply.
+    fn gateway_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/gateways/gw",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "Gateway",
+                "metadata": { "name": "gw", "namespace": "infra" },
+                "spec": { "gatewayClassName": "praxis", "listeners": [] },
+            }),
+        )
+    }
+
+    /// The object the API server hands back from a route status apply.
+    fn route_response() -> testing::Canned {
+        testing::Canned::ok(
+            "/httproutes/route",
+            serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "HTTPRoute",
+                "metadata": { "name": "route", "namespace": "infra" },
+                "spec": {},
+            }),
+        )
+    }
+
+    /// A child Deployment whose rollout has finished.
+    ///
+    /// Placed ahead of the generic `/deployments` apply response so the
+    /// GET that reads rollout state sees a finished one.
+    fn rolled_out_deployment() -> testing::Canned {
+        testing::Canned::ok(
+            "/deployments/praxis-gw",
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": { "name": "praxis-gw", "namespace": "infra", "generation": 1 },
+                "spec": { "selector": { "matchLabels": {} }, "template": {} },
+                "status": {
+                    "observedGeneration": 1,
+                    "readyReplicas": 1,
+                    "conditions": [{
+                        "type": "Progressing",
+                        "status": "True",
+                        "reason": "NewReplicaSetAvailable",
+                        "lastTransitionTime": "2026-01-01T00:00:00Z",
+                    }],
+                },
+            }),
+        )
     }
 }
