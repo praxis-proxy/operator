@@ -43,8 +43,11 @@ fi
 
 echo "==> Running conformance tests (context: kind-${CLUSTER_NAME})..."
 cd "${GWAPI_DIR}"
+# The suite needs headroom: it already ran ~17 minutes against the old 20m
+# ceiling, so any CI slowdown aborted it with no report written. Raised to
+# 45m so a genuine hang is still caught while normal variance is not.
 go test ./conformance -run TestConformance \
-    -timeout 20m -v \
+    -timeout 45m -v \
     -args \
     --gateway-class="${GATEWAY_CLASS}" \
     --conformance-profiles=GATEWAY-HTTP \
