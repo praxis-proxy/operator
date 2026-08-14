@@ -14,11 +14,7 @@ use gateway_api::referencegrants::ReferenceGrant;
 /// Returns `true` if the reference is within the same namespace or if a
 /// `ReferenceGrant` permits the reference. The grant must match the `from`
 /// (namespace, group, kind) and `to` (group, kind, optional name).
-#[expect(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "params map 1:1 to Gateway API fields"
-)]
+///
 /// ```
 /// use praxis_operator::gateway_api::reference_grant::is_reference_allowed;
 ///
@@ -46,6 +42,11 @@ use gateway_api::referencegrants::ReferenceGrant;
 ///     &[],
 /// ));
 /// ```
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "params map 1:1 to Gateway API fields"
+)]
 pub fn is_reference_allowed(
     from_ns: &str,
     from_group: &str,
@@ -101,19 +102,7 @@ pub fn is_reference_allowed(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
+#[expect(clippy::too_many_lines, reason = "tests")]
 mod tests {
     use gateway_api::referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

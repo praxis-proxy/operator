@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::{
-    context::CONTROLLER_NAME,
+    context::{CONTROLLER_NAME, FIELD_MANAGER},
     error::Result,
     gateway_api::{conditions, reference_grant, status},
     observability::metrics,
@@ -30,9 +30,6 @@ use crate::{
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
-
-/// Field manager used for every server-side apply the operator issues.
-const FIELD_MANAGER: &str = "praxis-operator";
 
 /// API group owning `Gateway` and `HTTPRoute`.
 const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
@@ -406,19 +403,6 @@ fn find_by_parent_ref<'a>(entries: &'a [Value], target: &Value) -> Option<&'a Va
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
 mod tests {
     use gateway_api::{
         httproutes::{HttpRouteSpec, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef},

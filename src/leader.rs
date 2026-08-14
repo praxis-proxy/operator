@@ -18,7 +18,10 @@ use kube::{
 };
 use tracing::{debug, info, warn};
 
-use crate::error::{OperatorError, Result};
+use crate::{
+    context::FIELD_MANAGER,
+    error::{OperatorError, Result},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -41,9 +44,6 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often a non-holder re-checks whether the lease has expired.
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Field manager for lease writes.
-const FIELD_MANAGER: &str = "praxis-operator";
 
 // -----------------------------------------------------------------------------
 // Identity
@@ -219,19 +219,6 @@ fn lease_patch(identity: &str, now: Timestamp, transitions: i32) -> serde_json::
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
 mod tests {
     use k8s_openapi::api::coordination::v1::LeaseSpec;
 

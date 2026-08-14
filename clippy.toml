@@ -12,6 +12,13 @@ type-complexity-threshold = 200
 stack-size-threshold = 65536
 avoid-breaking-exported-api = false
 msrv = "1.96"
+# A test that unwraps is asserting; a test that panics is failing. These
+# four were previously suppressed by a hand-copied attribute block at the
+# top of every test module, which drifts and hides more than it says.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "use tokio::time::sleep in async context" },
     { path = "std::io::stdin", reason = "a server must not read interactive input" },

@@ -512,19 +512,7 @@ fn is_regex_header(h: &gateway_api::httproutes::HttpRouteRulesMatchesHeaders) ->
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::allow_attributes,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    clippy::default_trait_access,
-    clippy::match_wildcard_for_single_variants,
-    clippy::missing_assert_message,
-    reason = "tests"
-)]
+#[expect(clippy::too_many_lines, reason = "tests")]
 mod tests {
     use gateway_api::httproutes::{
         HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteSpec,
