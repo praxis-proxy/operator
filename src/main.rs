@@ -11,6 +11,7 @@ mod controller;
 mod endpoints;
 mod error;
 mod gateway_api;
+mod listing;
 mod resources;
 
 use std::{future::Future, sync::Arc};
