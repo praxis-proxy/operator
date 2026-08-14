@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 
 use gateway_api::{
     gatewayclasses::GatewayClass,
-    gateways::{Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesSelector},
+    gateways::{Gateway, GatewayListeners},
     httproutes::{HTTPRoute, HttpRouteParentRefs},
 };
 use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::Condition};
@@ -20,6 +20,7 @@ use kube::{Api, ResourceExt as _, runtime::controller::Action};
 use serde_json::Value;
 use tracing::{debug, error, info};
 
+use super::namespace_filter;
 use crate::{
     context::{CONTROLLER_NAME, Context},
     error::{OperatorError, Result},
@@ -117,7 +118,7 @@ async fn build_rejection_status(
         return None;
     }
 
-    let rejection = validate_listener_attachment(route, &gw, parent_ref, generation, &ctx.client).await;
+    let rejection = validate_listener_attachment(route, &gw, parent_ref, generation, ctx);
     let grants = ctx.stores.grants();
     let resolve_result = route_status::check_backend_refs(route, route_ns, &ctx.client, &grants).await;
     let resolved = route_status::resolved_refs_condition(&resolve_result, generation);
@@ -158,12 +159,12 @@ async fn lookup_parent_gateway(gw_name: &str, gw_ns: &str, route_ns: &str, ctx: 
 // -----------------------------------------------------------------------------
 
 /// Returns a rejection condition if the route fails listener validation.
-async fn validate_listener_attachment(
+fn validate_listener_attachment(
     route: &HTTPRoute,
     gw: &Gateway,
     parent_ref: &HttpRouteParentRefs,
     generation: i64,
-    client: &kube::Client,
+    ctx: &Context,
 ) -> Option<Condition> {
     if !section_name_valid(gw, parent_ref) {
         return Some(conditions::not_accepted(
@@ -172,7 +173,7 @@ async fn validate_listener_attachment(
             "no listener matches sectionName",
         ));
     }
-    if !namespace_allowed(route, gw, parent_ref, client).await {
+    if !namespace_allowed(route, gw, parent_ref, ctx) {
         return Some(conditions::not_accepted(
             generation,
             "NotAllowedByListeners",
@@ -198,12 +199,7 @@ fn section_name_valid(gw: &Gateway, parent_ref: &HttpRouteParentRefs) -> bool {
 }
 
 /// Returns `true` when the route's namespace is allowed by listeners.
-async fn namespace_allowed(
-    route: &HTTPRoute,
-    gw: &Gateway,
-    parent_ref: &HttpRouteParentRefs,
-    client: &kube::Client,
-) -> bool {
+fn namespace_allowed(route: &HTTPRoute, gw: &Gateway, parent_ref: &HttpRouteParentRefs, ctx: &Context) -> bool {
     let route_ns = route_status::route_namespace(route);
     let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("default");
     route_allowed_by_listeners(
@@ -211,27 +207,22 @@ async fn namespace_allowed(
         gw_ns,
         &gw.spec.listeners,
         parent_ref.section_name.as_deref(),
-        client,
+        &ctx.stores.namespaces(),
     )
-    .await
 }
 
 /// Checks whether a route's namespace is allowed by at least one
 /// targeted listener.
-async fn route_allowed_by_listeners(
+fn route_allowed_by_listeners(
     route_ns: &str,
     gw_ns: &str,
     listeners: &[GatewayListeners],
     section_name: Option<&str>,
-    client: &kube::Client,
+    namespaces: &[Namespace],
 ) -> bool {
-    let matching = targeted_listeners(listeners, section_name);
-    for listener in &matching {
-        if listener_allows_namespace(listener, route_ns, gw_ns, client).await {
-            return true;
-        }
-    }
-    false
+    targeted_listeners(listeners, section_name)
+        .iter()
+        .any(|listener| namespace_filter::is_namespace_allowed(listener, route_ns, gw_ns, Some(namespaces)))
 }
 
 /// Returns listeners targeted by a section name (or all if `None`).
@@ -240,58 +231,6 @@ fn targeted_listeners<'a>(listeners: &'a [GatewayListeners], section_name: Optio
         Some(name) => listeners.iter().filter(|l| l.name == name).collect(),
         None => listeners.iter().collect(),
     }
-}
-
-/// Checks whether a single listener allows the given route namespace.
-async fn listener_allows_namespace(
-    listener: &GatewayListeners,
-    route_ns: &str,
-    gw_ns: &str,
-    client: &kube::Client,
-) -> bool {
-    use gateway_api::gateways::GatewayListenersAllowedRoutesNamespacesFrom;
-
-    let from = listener
-        .allowed_routes
-        .as_ref()
-        .and_then(|ar| ar.namespaces.as_ref())
-        .and_then(|ns| ns.from.as_ref());
-
-    match from {
-        None | Some(GatewayListenersAllowedRoutesNamespacesFrom::Same) => route_ns == gw_ns,
-        Some(GatewayListenersAllowedRoutesNamespacesFrom::All) => true,
-        Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector) => {
-            let selector = listener
-                .allowed_routes
-                .as_ref()
-                .and_then(|ar| ar.namespaces.as_ref())
-                .and_then(|ns| ns.selector.as_ref());
-            namespace_matches_label_selector(client, route_ns, selector).await
-        },
-    }
-}
-
-/// Checks whether a namespace's labels match a label selector.
-async fn namespace_matches_label_selector(
-    client: &kube::Client,
-    ns_name: &str,
-    selector: Option<&GatewayListenersAllowedRoutesNamespacesSelector>,
-) -> bool {
-    let Some(selector) = selector else { return false };
-    let ns_api = Api::<Namespace>::all(client.clone());
-    let Ok(ns_obj) = ns_api.get(ns_name).await else {
-        return false;
-    };
-
-    let Some(match_labels) = &selector.match_labels else {
-        return true;
-    };
-    let Some(labels) = ns_obj.metadata.labels.as_ref() else {
-        return false;
-    };
-    match_labels
-        .iter()
-        .all(|(k, v)| labels.get(k).is_some_and(|lv| lv == v))
 }
 
 /// Checks if any route hostname intersects with a matching listener.
@@ -330,7 +269,14 @@ pub fn error_policy(_route: Arc<HTTPRoute>, error: &OperatorError, _ctx: Arc<Con
 
 #[cfg(test)]
 mod tests {
-    use gateway_api::{gateways::GatewaySpec, httproutes::HttpRouteSpec};
+    use gateway_api::{
+        gateways::{
+            GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces,
+            GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersAllowedRoutesNamespacesSelector,
+            GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewaySpec,
+        },
+        httproutes::HttpRouteSpec,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;
@@ -507,5 +453,86 @@ mod tests {
             },
             status: None,
         }
+    }
+    // -----------------------------------------------------------------------------
+    // Namespace Policy
+    // -----------------------------------------------------------------------------
+
+    /// Builds a listener selecting namespaces by the given selector.
+    fn selector_listener(selector: GatewayListenersAllowedRoutesNamespacesSelector) -> GatewayListeners {
+        GatewayListeners {
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                    from: Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector),
+                    selector: Some(selector),
+                }),
+                ..Default::default()
+            }),
+            ..listener("http", None)
+        }
+    }
+
+    /// Builds a `Namespace` carrying one label.
+    fn labelled_namespace(name: &str, key: &str, value: &str) -> Namespace {
+        Namespace {
+            metadata: ObjectMeta {
+                name: Some(name.to_owned()),
+                labels: Some([(key.to_owned(), value.to_owned())].into_iter().collect()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_match_expressions_alone_can_deny_a_namespace() {
+        let listeners = vec![selector_listener(GatewayListenersAllowedRoutesNamespacesSelector {
+            match_labels: None,
+            match_expressions: Some(vec![GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+                key: "team".to_owned(),
+                operator: "In".to_owned(),
+                values: Some(vec!["platform".to_owned()]),
+            }]),
+        })];
+        let namespaces = vec![labelled_namespace("apps", "team", "payments")];
+
+        assert!(
+            !route_allowed_by_listeners("apps", "infra", &listeners, None, &namespaces),
+            "a selector with only matchExpressions must still be evaluated; treating an absent \
+             matchLabels as \"allow everything\" would accept a route the Gateway controller \
+             drops from the config, leaving it with no rejection status and no traffic"
+        );
+    }
+
+    #[test]
+    fn test_match_expressions_alone_can_allow_a_namespace() {
+        let listeners = vec![selector_listener(GatewayListenersAllowedRoutesNamespacesSelector {
+            match_labels: None,
+            match_expressions: Some(vec![GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+                key: "team".to_owned(),
+                operator: "In".to_owned(),
+                values: Some(vec!["platform".to_owned()]),
+            }]),
+        })];
+        let namespaces = vec![labelled_namespace("apps", "team", "platform")];
+
+        assert!(
+            route_allowed_by_listeners("apps", "infra", &listeners, None, &namespaces),
+            "a namespace satisfying the expression is allowed"
+        );
+    }
+
+    #[test]
+    fn test_same_namespace_policy_needs_no_namespace_cache() {
+        let listeners = vec![listener("http", None)];
+
+        assert!(
+            route_allowed_by_listeners("infra", "infra", &listeners, None, &[]),
+            "the default Same policy compares namespaces directly"
+        );
+        assert!(
+            !route_allowed_by_listeners("apps", "infra", &listeners, None, &[]),
+            "a route in another namespace is not allowed by the default policy"
+        );
     }
 }
