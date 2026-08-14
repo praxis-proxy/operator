@@ -41,9 +41,14 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
+  # The operator creates and owns child Services and ConfigMaps.
   - apiGroups: [""]
-    resources: ["services", "endpoints", "configmaps", "secrets"]
+    resources: ["services", "configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Secrets (TLS material) and Endpoints are only ever read.
+  - apiGroups: [""]
+    resources: ["secrets", "endpoints"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
