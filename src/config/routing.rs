@@ -12,7 +12,9 @@ use gateway_api::{
 use serde::Serialize;
 use tracing::warn;
 
-use crate::gateway_api::{hostname::intersect_hostnames, reference_grant::is_reference_allowed};
+use crate::gateway_api::{
+    hostname::intersect_hostnames, reference_grant::is_reference_allowed, route_validation::validate_route,
+};
 
 // -----------------------------------------------------------------------------
 // PraxisRoute
@@ -128,23 +130,61 @@ pub(crate) fn convert_routes(
             continue;
         }
 
-        if let Some(rules) = &route.spec.rules {
-            for rule in rules {
-                process_rule(
-                    rule,
-                    route_ns,
-                    &effective,
-                    section_names,
-                    grants,
-                    &mut seen_clusters,
-                    &mut praxis_routes,
-                    &mut backend_refs,
-                );
-            }
-        }
+        process_supported_rules(
+            route,
+            route_ns,
+            &effective,
+            section_names,
+            grants,
+            &mut seen_clusters,
+            &mut praxis_routes,
+            &mut backend_refs,
+        );
     }
 
     (praxis_routes, backend_refs)
+}
+
+/// Converts the rules of one route, skipping any this operator cannot
+/// express.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rule processing needs access to shared accumulators"
+)]
+fn process_supported_rules(
+    route: &HTTPRoute,
+    route_ns: &str,
+    hostnames: &[String],
+    section_names: &[Option<String>],
+    grants: &[ReferenceGrant],
+    seen_clusters: &mut HashSet<String>,
+    praxis_routes: &mut Vec<PraxisRoute>,
+    backend_refs: &mut Vec<BackendRef>,
+) {
+    let validation = validate_route(route);
+    let rules = route.spec.rules.as_deref().unwrap_or(&[]);
+
+    for (index, rule) in rules.iter().enumerate() {
+        if validation.is_rejected(index) {
+            tracing::debug!(
+                route = route.metadata.name.as_deref().unwrap_or_default(),
+                rule = index,
+                "skipping rule this operator cannot express"
+            );
+            continue;
+        }
+
+        process_rule(
+            rule,
+            route_ns,
+            hostnames,
+            section_names,
+            grants,
+            seen_clusters,
+            praxis_routes,
+            backend_refs,
+        );
+    }
 }
 
 /// Computes the effective hostnames for a route after listener intersection.
@@ -425,8 +465,8 @@ fn extract_path_match(
             vec![(Some(value), String::new())]
         },
         Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
-            warn!("RegularExpression path match not supported, using catch-all prefix /");
-            vec![(None, "/".to_owned())]
+            warn!("RegularExpression path match reached conversion; emitting no route");
+            Vec::new()
         },
         _ => vec![(None, "/".to_owned())],
     }
@@ -868,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_routes_regular_expression_type() {
+    fn test_convert_routes_rejects_regular_expression_path() {
         let route = HTTPRoute {
             metadata: ObjectMeta {
                 name: Some("test-route".to_owned()),
@@ -897,13 +937,77 @@ mod tests {
         };
 
         let routes = vec![(&route, vec![None])];
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert!(
+            praxis_routes.is_empty(),
+            "a RegularExpression path must produce no route: widening it to the catch-all prefix / \
+             would silently hijack every request on the listener"
+        );
+        assert!(
+            backend_refs.is_empty(),
+            "a rejected rule must not contribute a backend cluster either"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_keeps_supported_rules_alongside_rejected_ones() {
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("mixed-route".to_owned()),
+                namespace: Some("default".to_owned()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                rules: Some(vec![
+                    HttpRouteRules {
+                        matches: Some(vec![HttpRouteRulesMatches {
+                            path: Some(HttpRouteRulesMatchesPath {
+                                r#type: Some(HttpRouteRulesMatchesPathType::Exact),
+                                value: Some("/ok".to_owned()),
+                            }),
+                            ..Default::default()
+                        }]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc".to_owned(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                    HttpRouteRules {
+                        matches: Some(vec![HttpRouteRulesMatches {
+                            path: Some(HttpRouteRulesMatchesPath {
+                                r#type: Some(HttpRouteRulesMatchesPathType::RegularExpression),
+                                value: Some("/bad/.*".to_owned()),
+                            }),
+                            ..Default::default()
+                        }]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "other".to_owned(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+            status: None,
+        };
+
+        let routes = vec![(&route, vec![None])];
         let (praxis_routes, _) = convert_routes(&routes, &HashMap::new(), &[]);
 
-        assert_eq!(praxis_routes.len(), 1, "should produce one route");
-        assert_eq!(praxis_routes[0].path, None, "regex match should have no exact path");
         assert_eq!(
-            praxis_routes[0].path_prefix, "/",
-            "regex match should fall back to default /"
+            praxis_routes.len(),
+            1,
+            "the supported rule must survive while only the regex rule is dropped"
+        );
+        assert_eq!(
+            praxis_routes[0].path,
+            Some("/ok".to_owned()),
+            "the surviving route should be the exact-match rule"
         );
     }
 

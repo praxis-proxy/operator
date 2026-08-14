@@ -8,4 +8,5 @@ pub(crate) mod conditions;
 pub(crate) mod hostname;
 pub(crate) mod reference_grant;
 pub(crate) mod route_status;
+pub(crate) mod route_validation;
 pub(crate) mod status;

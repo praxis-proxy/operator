@@ -184,6 +184,18 @@ pub(crate) fn parent_status_json(
     accepted: &Condition,
     resolved: &Condition,
 ) -> Value {
+    parent_status_with_conditions(parent_ref, gw_ns, &[accepted.clone(), resolved.clone()])
+}
+
+/// Builds the `status.parents` entry from an explicit condition list.
+///
+/// Used when a route carries more than the usual `Accepted` and
+/// `ResolvedRefs` pair, such as a `PartiallyInvalid` route.
+pub(crate) fn parent_status_with_conditions(
+    parent_ref: &HttpRouteParentRefs,
+    gw_ns: &str,
+    conditions: &[Condition],
+) -> Value {
     let mut ref_json = json!({
         "group": GATEWAY_GROUP,
         "kind": "Gateway",
@@ -200,7 +212,7 @@ pub(crate) fn parent_status_json(
     json!({
         "parentRef": ref_json,
         "controllerName": CONTROLLER_NAME,
-        "conditions": [accepted, resolved],
+        "conditions": conditions,
     })
 }
 

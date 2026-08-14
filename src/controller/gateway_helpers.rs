@@ -45,7 +45,7 @@ use crate::{
     context::CONTROLLER_NAME,
     endpoints,
     error::{OperatorError, Result},
-    gateway_api::{attachment, conditions, hostname, reference_grant, route_status, status},
+    gateway_api::{attachment, conditions, hostname, reference_grant, route_status, route_validation, status},
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
@@ -628,6 +628,8 @@ async fn build_route_statuses(
     client: &kube::Client,
     grants: &[ReferenceGrant],
 ) -> Vec<Value> {
+    let validation = route_validation::validate_route(route);
+
     let mut statuses = Vec::new();
     for parent_ref in parent_refs {
         if !route_status::is_ref_targeting_gateway(parent_ref, gw_name, gw_ns, route_ns) {
@@ -635,16 +637,34 @@ async fn build_route_statuses(
         }
 
         let resolved = route_status::check_backend_refs(route, route_ns, client, grants).await;
-        let accepted_cond = conditions::accepted(generation, "route accepted");
         let resolved_cond = route_status::resolved_refs_condition(&resolved, generation);
-        statuses.push(route_status::parent_status_json(
+        let mut route_conditions = validation_conditions(&validation, generation);
+        route_conditions.push(resolved_cond);
+
+        statuses.push(route_status::parent_status_with_conditions(
             parent_ref,
             gw_ns,
-            &accepted_cond,
-            &resolved_cond,
+            &route_conditions,
         ));
     }
     statuses
+}
+
+/// Builds the `Accepted` condition, plus `PartiallyInvalid` when only
+/// some rules were dropped.
+fn validation_conditions(validation: &route_validation::RouteValidation, generation: i64) -> Vec<Condition> {
+    let detail = validation.message().unwrap_or_default();
+
+    if validation.is_fully_rejected() {
+        return vec![conditions::not_accepted(generation, "UnsupportedValue", &detail)];
+    }
+
+    let accepted = conditions::accepted(generation, "route accepted");
+    if validation.is_partially_rejected() {
+        return vec![accepted, conditions::partially_invalid(generation, &detail)];
+    }
+
+    vec![accepted]
 }
 
 /// Components used to build the Gateway status JSON payload.
@@ -1383,6 +1403,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------
+    // Route Validation Conditions
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn test_validation_conditions_accepts_a_supported_route() {
+        let conds = validation_conditions(&route_validation::RouteValidation::default(), 1);
+
+        assert_eq!(conds.len(), 1, "a supported route needs only an Accepted condition");
+        assert_eq!(conds[0].type_, "Accepted", "the condition should be Accepted");
+        assert_eq!(conds[0].status, "True", "a supported route is accepted");
+    }
+
+    #[test]
+    fn test_validation_conditions_rejects_a_fully_invalid_route() {
+        let route = regex_route(1);
+        let conds = validation_conditions(&route_validation::validate_route(&route), 1);
+
+        assert_eq!(conds[0].type_, "Accepted", "the first condition should be Accepted");
+        assert_eq!(
+            conds[0].status, "False",
+            "a route whose every rule is unsupported must not be accepted"
+        );
+        assert_eq!(
+            conds[0].reason, "UnsupportedValue",
+            "the Gateway API reason for an unrepresentable value is UnsupportedValue"
+        );
+    }
+
+    #[test]
+    fn test_validation_conditions_marks_a_partially_invalid_route() {
+        let route = regex_route(2);
+        let conds = validation_conditions(&route_validation::validate_route(&route), 1);
+
+        assert_eq!(conds.len(), 2, "a partially invalid route carries a second condition");
+        assert_eq!(conds[0].status, "True", "surviving rules keep the route accepted");
+        assert_eq!(
+            conds[1].type_, "PartiallyInvalid",
+            "dropped rules must be signalled with PartiallyInvalid"
+        );
+        assert_eq!(conds[1].status, "True", "PartiallyInvalid should be True");
+    }
+
+    // -----------------------------------------------------------------------------
     // Weight Distribution
     // -----------------------------------------------------------------------------
 
@@ -2070,6 +2133,44 @@ mod tests {
             key: key.to_owned(),
             operator: operator.to_owned(),
             values: Some(values.iter().map(|v| (*v).to_owned()).collect()),
+        }
+    }
+
+    /// Builds a route with `rules` rules, the last of which uses an
+    /// unsupported `RegularExpression` path match.
+    fn regex_route(rules: usize) -> HTTPRoute {
+        use gateway_api::httproutes::{
+            HttpRouteRules, HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
+            HttpRouteSpec,
+        };
+
+        let built = (0..rules)
+            .map(|index| {
+                let kind = if index + 1 == rules {
+                    HttpRouteRulesMatchesPathType::RegularExpression
+                } else {
+                    HttpRouteRulesMatchesPathType::Exact
+                };
+                HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(HttpRouteRulesMatchesPath {
+                            r#type: Some(kind),
+                            value: Some("/x".to_owned()),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        HTTPRoute {
+            metadata: Default::default(),
+            spec: HttpRouteSpec {
+                rules: Some(built),
+                ..Default::default()
+            },
+            status: None,
         }
     }
 }
