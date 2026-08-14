@@ -305,8 +305,10 @@ Never: `// --- Section Name ---`
 
 - Differentiated backoff: shorter for transient API
   errors, longer for configuration or logic errors.
-- All errors flow through `error::Error` enum using
-  `thiserror`.
+- All errors flow through the `error::OperatorError` enum
+  using `thiserror`. The name is not `Error`:
+  `clippy::error_impl_error` is denied, so an error type
+  must not be called `Error` outright.
 - No panics or unwraps in production code paths.
 
 ## Code Responsibility
