@@ -72,18 +72,33 @@ use crate::{
 /// from any backend that eventually replies; a hung backend still
 /// hangs. Withdraw both if that gap matters more than the coverage.
 ///
+/// The redirect features need no code of their own: the `redirect`
+/// filter already carries scheme and status through, and Praxis
+/// accepts 301, 302, 307 and 308. `HTTPRoute303RedirectStatusCode` is
+/// absent because it accepts no 303, and `HTTPRoutePathRedirect`
+/// because its `location` template offers `${path}` whole and no way
+/// to substitute part of it, which `ReplacePrefixMatch` needs.
+/// `HTTPRoutePortRedirect` is absent for a different reason: the suite
+/// gating on it requires omitting a default port for the listener's
+/// own scheme, and filter entries are built once per Gateway rather
+/// than once per listener, so that scheme is not known where the
+/// location is assembled.
+///
 /// [`validate_route`]: crate::gateway_api::route_validation::validate_route
 const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
     "GatewayInfrastructurePropagation",
     "GatewayPort8080",
     "HTTPRoute",
+    "HTTPRoute307RedirectStatusCode",
+    "HTTPRoute308RedirectStatusCode",
     "HTTPRouteBackendTimeout",
     "HTTPRouteHostRewrite",
     "HTTPRoutePathRewrite",
     "HTTPRouteRequestHeaderModification",
     "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
+    "HTTPRouteSchemeRedirect",
     "ReferenceGrant",
 ];
 
