@@ -20,6 +20,35 @@ use crate::{
 };
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Gateway API features this operator implements.
+///
+/// Advertised through `GatewayClass.status.supportedFeatures` so that
+/// conformance tooling runs only the suites this implementation claims.
+/// Every entry must correspond to behaviour that is actually reachable:
+/// an over-claim turns a passing run into a false negative elsewhere.
+/// Kept sorted, which `test_supported_features_are_sorted_and_unique`
+/// enforces.
+/// Deliberately absent: `HTTPRouteHostRewrite` and `HTTPRoutePathRewrite`
+/// (the `URLRewrite` filter), `HTTPRouteRequestMirror` and
+/// `HTTPRouteRequestMultipleMirrors` (the `RequestMirror` filter). Those
+/// filters are rejected by [`validate_route`], so advertising them would
+/// direct conformance tooling at suites that cannot pass.
+///
+/// [`validate_route`]: crate::gateway_api::route_validation::validate_route
+const SUPPORTED_FEATURES: &[&str] = &[
+    "Gateway",
+    "GatewayPort8080",
+    "HTTPRoute",
+    "HTTPRouteMethodMatching",
+    "HTTPRouteQueryParamMatching",
+    "HTTPRouteResponseHeaderModification",
+    "ReferenceGrant",
+];
+
+// -----------------------------------------------------------------------------
 // Reconciler
 // -----------------------------------------------------------------------------
 
@@ -96,13 +125,14 @@ async fn accept_gateway_class(gc: &GatewayClass, name: &str, ctx: &Context) -> R
 /// Sets the `Accepted` condition to `True` and declares supported features.
 fn build_accepted_status(generation: i64) -> serde_json::Value {
     let condition = conditions::accepted(generation, "GatewayClass accepted");
+    let features: Vec<_> = SUPPORTED_FEATURES
+        .iter()
+        .map(|name| serde_json::json!({ "name": name }))
+        .collect();
 
     serde_json::json!({
         "conditions": [condition],
-        "supportedFeatures": [
-            { "name": "Gateway" },
-            { "name": "HTTPRoute" },
-        ],
+        "supportedFeatures": features,
     })
 }
 
@@ -175,8 +205,29 @@ mod tests {
 
         assert_eq!(
             status["supportedFeatures"].as_array().map(Vec::len),
-            Some(2),
-            "the advertised feature list should be present"
+            Some(SUPPORTED_FEATURES.len()),
+            "every advertised feature should reach the status"
+        );
+    }
+
+    #[test]
+    fn test_supported_features_are_sorted_and_unique() {
+        let mut sorted = SUPPORTED_FEATURES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        assert_eq!(
+            sorted,
+            SUPPORTED_FEATURES.to_vec(),
+            "the feature list must stay sorted and free of duplicates so diffs stay readable"
+        );
+    }
+
+    #[test]
+    fn test_supported_features_include_the_core_kinds() {
+        assert!(
+            SUPPORTED_FEATURES.contains(&"Gateway") && SUPPORTED_FEATURES.contains(&"HTTPRoute"),
+            "the two core kinds this operator reconciles must be advertised"
         );
     }
 
