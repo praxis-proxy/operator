@@ -61,11 +61,18 @@ async fn main() -> error::Result<()> {
     let health = Arc::new(observability::server::Health::default());
     let observability = tokio::spawn(observability::server::serve(Arc::clone(&health)));
 
+    // Readiness reflects process health, not leadership. A standby is
+    // healthy and must report ready, or a rolling update never completes:
+    // the Deployment waits for every replica, and a replica that only
+    // turns ready on winning the lease can never satisfy it.
+    health.mark_ready();
+
     let identity = leader::identity();
     info!("standing for election as {identity}");
     leader::acquire(&client, &identity).await?;
+    observability::metrics::global().set_leader(true);
 
-    let result = Box::pin(run_controllers(&client, &identity, &health)).await;
+    let result = Box::pin(run_controllers(&client, &identity)).await;
 
     observability.abort();
     result
@@ -79,7 +86,7 @@ async fn main() -> error::Result<()> {
 /// the lease, so the process exits non-zero and restarts as a follower.
 ///
 /// [`OperatorError::LeadershipLost`]: error::OperatorError::LeadershipLost
-async fn run_controllers(client: &Client, identity: &str, health: &observability::server::Health) -> error::Result<()> {
+async fn run_controllers(client: &Client, identity: &str) -> error::Result<()> {
     let ctx = Arc::new(context::Context {
         client: client.clone(),
         recorder: kube::runtime::events::Recorder::new(client.clone(), context::reporter()),
@@ -89,7 +96,6 @@ async fn run_controllers(client: &Client, identity: &str, health: &observability
     let rt = build_route_controller(client, ctx);
 
     info!("starting controllers");
-    health.mark_ready();
 
     tokio::select! {
         () = async { tokio::join!(gc, gw, rt); } => Ok(()),
