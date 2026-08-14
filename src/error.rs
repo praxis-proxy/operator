@@ -26,21 +26,6 @@ pub(crate) enum OperatorError {
     #[error("gatewayclass not found: {0}")]
     GatewayClassNotFound(String),
 
-    /// A referenced Kubernetes Secret was not found.
-    #[error("secret not found: {namespace}/{name}")]
-    #[expect(dead_code, reason = "reserved for TLS secret resolution")]
-    SecretNotFound {
-        /// Secret namespace.
-        namespace: String,
-        /// Secret name.
-        name: String,
-    },
-
-    /// Generated Praxis config is invalid.
-    #[error("config generation: {0}")]
-    #[expect(dead_code, reason = "reserved for config validation")]
-    ConfigGeneration(String),
-
     /// Serialization failed.
     #[error("serialization: {0}")]
     Serialization(#[from] serde_json::Error),

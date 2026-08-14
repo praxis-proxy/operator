@@ -22,7 +22,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && printf '//! stub\nfn main() {}\n' > src/main.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && rm -rf src
 
 # ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ RUN mkdir src \
 
 COPY src src
 RUN touch src/main.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && cp target/release/praxis-operator /usr/local/bin/
 
 # ---------------------------------------------------------------------------
