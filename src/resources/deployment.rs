@@ -38,10 +38,24 @@ const REPLICAS_ANNOTATION: &str = "praxis.sh/replicas";
 
 /// Replicas run when the Gateway does not ask for a specific count.
 ///
-/// Two rather than one so a node drain or a rolling config change does
-/// not take the data plane down; a single-replica Gateway is a single
-/// point of failure for every route attached to it.
-const DEFAULT_REPLICAS: i32 = 2;
+/// One, matching the behaviour every existing Gateway already has.
+///
+/// Two would be the better availability default — a single-replica
+/// Gateway is a single point of failure for every route attached to it
+/// — but the data plane cannot currently sustain it. Praxis 0.3.1
+/// registers its KV admin endpoints on the same port as its health
+/// endpoints via `SO_REUSEPORT`, so probe connections land on whichever
+/// listener the kernel picks and roughly half of them 404. Praxis has
+/// since deprecated that registration for exactly this reason
+/// ("non-deterministic connection routing that breaks health probes"),
+/// but on the pinned version every additional replica is another pod
+/// whose liveness probe flaps and whose container is restarted, and a
+/// Gateway whose pods never settle never reports Programmed.
+///
+/// Raise this to two once the data plane serves health on a port of its
+/// own. Until then `praxis.sh/replicas` is the opt-in for anyone who
+/// wants the availability and can tolerate the flapping.
+const DEFAULT_REPLICAS: i32 = 1;
 
 // -----------------------------------------------------------------------------
 // Deployment Builder
