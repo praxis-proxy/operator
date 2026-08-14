@@ -165,6 +165,7 @@ pub fn convert_filters(rules: &[ServedRule<'_>]) -> RouteFilters {
         if !served.resolvable && !rule_has_redirect(served.rule) {
             emit_no_backend_response(&condition, &mut filters.terminating);
         }
+        emit_conditional_timeout(served.rule, &condition, &mut filters.transforming);
         if served.rule.filters.is_some() {
             convert_rule_filters(served.rule, &condition, &mut filters);
         }
@@ -625,6 +626,89 @@ fn build_redirect_location(redirect: &gateway_api::httproutes::HttpRouteRulesFil
 }
 
 // -----------------------------------------------------------------------------
+// Timeouts
+// -----------------------------------------------------------------------------
+
+/// Emits a conditional `timeout` filter for a rule's timeouts.
+///
+/// A rule may set `request`, `backendRequest`, or both. Praxis has one
+/// timeout to give, so the shorter of the two is what gets enforced —
+/// which is also the one that would fire first if both existed. A
+/// timeout of `0s` disables it, and a rule setting nothing gets no
+/// filter.
+fn emit_conditional_timeout(
+    rule: &HttpRouteRules,
+    condition: &Option<serde_norway::Value>,
+    filters: &mut Vec<PraxisFilterEntry>,
+) {
+    let Some(timeouts) = &rule.timeouts else { return };
+
+    let request = timeouts.request.as_deref().and_then(parse_duration_ms);
+    let backend = timeouts.backend_request.as_deref().and_then(parse_duration_ms);
+    let Some(timeout_ms) = [request, backend].into_iter().flatten().filter(|ms| *ms > 0).min() else {
+        return;
+    };
+
+    let mut config = serde_norway::Mapping::new();
+    config.insert(
+        serde_norway::Value::String("timeout_ms".to_owned()),
+        serde_norway::Value::Number(timeout_ms.into()),
+    );
+
+    let config = inject_conditions(serde_norway::Value::Mapping(config), condition);
+    filters.push(PraxisFilterEntry {
+        filter: "timeout".to_owned(),
+        config,
+    });
+}
+
+/// Parses a Gateway API duration into whole milliseconds.
+///
+/// [GEP-2257] spells a duration as a run of `<value><unit>` pairs with
+/// units `h`, `m`, `s` and `ms` — `500ms`, `1s`, `1h30m`. The CRD
+/// enforces the grammar with a pattern, so a value that fails to parse
+/// here is one the API server should never have admitted; it is
+/// dropped rather than guessed at, leaving the rule without a timeout.
+///
+/// [GEP-2257]: https://gateway-api.sigs.k8s.io/geps/gep-2257/
+fn parse_duration_ms(value: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut rest = value;
+
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+        if digits == 0 {
+            return None;
+        }
+        let (number, tail) = rest.split_at(digits);
+        let (unit_ms, unit_len) = unit_millis(tail)?;
+        total = total.checked_add(number.parse::<u64>().ok()?.checked_mul(unit_ms)?)?;
+        rest = tail.get(unit_len..)?;
+    }
+
+    (value != rest).then_some(total)
+}
+
+/// Returns the millisecond value of the unit starting `tail`, with its
+/// length.
+///
+/// `ms` is tested before `m`, or every millisecond would be read as a
+/// minute followed by a stray `s`.
+fn unit_millis(tail: &str) -> Option<(u64, usize)> {
+    if tail.starts_with("ms") {
+        Some((1, 2))
+    } else if tail.starts_with('s') {
+        Some((1_000, 1))
+    } else if tail.starts_with('m') {
+        Some((60_000, 1))
+    } else if tail.starts_with('h') {
+        Some((3_600_000, 1))
+    } else {
+        None
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Path Rewrite
 // -----------------------------------------------------------------------------
 
@@ -826,7 +910,7 @@ fn inject_conditions(mut config: yaml_serde::Value, condition: &Option<yaml_serd
 #[cfg(test)]
 #[expect(clippy::too_many_lines, reason = "tests")]
 mod tests {
-    use gateway_api::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs};
+    use gateway_api::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesTimeouts};
 
     use super::*;
 
@@ -1094,6 +1178,75 @@ mod tests {
         assert!(
             second_yaml.contains("/add"),
             "second filter should be conditioned on /add"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeouts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gateway_api_durations_parse_to_milliseconds() {
+        for (text, expected) in [
+            ("500ms", 500_u64),
+            ("1s", 1_000),
+            ("0s", 0),
+            ("1m", 60_000),
+            ("1h", 3_600_000),
+            ("1h30m", 5_400_000),
+            ("1m30s500ms", 90_500),
+        ] {
+            assert_eq!(
+                parse_duration_ms(text),
+                Some(expected),
+                "GEP-2257 spells {text} as {expected}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_bare_number_is_not_a_duration() {
+        for text in ["500", "", "ms", "1x", "1s500"] {
+            assert_eq!(
+                parse_duration_ms(text),
+                None,
+                "{text} is outside the GEP-2257 grammar and must not be guessed at"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_shorter_timeout_is_the_one_enforced() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/slow");
+        rule.timeouts = Some(HttpRouteRulesTimeouts {
+            backend_request: Some("500ms".to_owned()),
+            request: Some("2s".to_owned()),
+        });
+
+        let mut filters = Vec::new();
+        emit_conditional_timeout(&rule, &None, &mut filters);
+
+        assert_eq!(
+            filters.first().and_then(|f| f.config.get("timeout_ms")),
+            Some(&serde_norway::Value::Number(500.into())),
+            "Praxis has one timeout to give, and the shorter one is what would fire first anyway"
+        );
+    }
+
+    #[test]
+    fn test_a_zero_timeout_disables_the_filter() {
+        let mut rule = rule_with_path(HttpRouteRulesMatchesPathType::PathPrefix, "/slow");
+        rule.timeouts = Some(HttpRouteRulesTimeouts {
+            backend_request: None,
+            request: Some("0s".to_owned()),
+        });
+
+        let mut filters = Vec::new();
+        emit_conditional_timeout(&rule, &None, &mut filters);
+
+        assert!(
+            filters.is_empty(),
+            "the Gateway API reads a zero duration as no timeout, not an instant one"
         );
     }
 

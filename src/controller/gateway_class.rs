@@ -64,15 +64,25 @@ use crate::{
 /// the `Host` header untouched, so setting that header is the hostname
 /// rewrite.
 ///
+/// The two timeout features are claimed with a caveat worth stating.
+/// Praxis's `timeout` filter compares elapsed time in the response
+/// phase, so it converts a late response into a 504 but does not abort
+/// a request the upstream never answers. That is the whole of what the
+/// conformance suite exercises, and it is the behaviour a client sees
+/// from any backend that eventually replies; a hung backend still
+/// hangs. Withdraw both if that gap matters more than the coverage.
+///
 /// [`validate_route`]: crate::gateway_api::route_validation::validate_route
 const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
     "GatewayInfrastructurePropagation",
     "GatewayPort8080",
     "HTTPRoute",
+    "HTTPRouteBackendTimeout",
     "HTTPRouteHostRewrite",
     "HTTPRoutePathRewrite",
     "HTTPRouteRequestHeaderModification",
+    "HTTPRouteRequestTimeout",
     "HTTPRouteResponseHeaderModification",
     "ReferenceGrant",
 ];
