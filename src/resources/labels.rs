@@ -67,12 +67,58 @@ pub fn infrastructure_annotations(gateway: &gateway_api::gateways::Gateway) -> B
         .unwrap_or_default()
 }
 
+/// Longest name Kubernetes accepts for the objects this operator
+/// creates.
+///
+/// `ConfigMap`, `Deployment`, `Service` and `PodDisruptionBudget` names
+/// are DNS labels, capped at 63 characters. A Gateway name may be up to
+/// 253, and the `praxis-` prefix spends seven of the 63, so anything
+/// past 56 characters overflows.
+const MAX_CHILD_NAME: usize = 63;
+
+/// Characters of the digest appended to a truncated name.
+const DIGEST_LEN: usize = 8;
+
 /// Returns the child resource name for a given Gateway name.
 ///
-/// Prefixes the gateway name with `praxis-` to form the deployment and service
-/// names.
+/// Prefixes the gateway name with `praxis-` to form the `ConfigMap`,
+/// `Deployment`, `Service` and `PodDisruptionBudget` names.
+///
+/// A name that would exceed the 63-character limit is truncated and
+/// given a digest of the full Gateway name. Without that, every child
+/// apply for such a Gateway is rejected as invalid, the reconcile
+/// fails before it writes a status, and the Gateway sits forever on
+/// the `Accepted: Unknown` the CRD defaults to — with nothing to say
+/// why. The digest is what keeps two long Gateways sharing a prefix
+/// from sharing a Deployment.
+///
+/// ```
+/// use praxis_operator::resources::labels::child_name;
+///
+/// assert_eq!(child_name("my-gateway"), "praxis-my-gateway");
+///
+/// // 57 characters, one past what the prefix leaves room for.
+/// let long = "gateway-with-one-not-matching-port-and-section-name-route";
+/// assert!(child_name(long).len() <= 63);
+/// assert_ne!(child_name(long), child_name(&format!("{long}-two")));
+/// ```
 pub fn child_name(gateway_name: &str) -> String {
-    format!("praxis-{gateway_name}")
+    let full = format!("praxis-{gateway_name}");
+    if full.len() <= MAX_CHILD_NAME {
+        return full;
+    }
+
+    let digest = short_digest(gateway_name);
+    let keep = MAX_CHILD_NAME - DIGEST_LEN - 1;
+    let head: String = full.chars().take(keep).collect();
+    format!("{}-{digest}", head.trim_end_matches('-'))
+}
+
+/// Returns the first [`DIGEST_LEN`] hex characters of the SHA-256 of
+/// `value`.
+fn short_digest(value: &str) -> String {
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(value.as_bytes());
+    format!("{digest:x}").chars().take(DIGEST_LEN).collect()
 }
 
 /// Returns an `OwnerReference` for a `Gateway` resource.
@@ -126,6 +172,77 @@ mod tests {
     fn test_child_name() {
         assert_eq!(child_name("my-gateway"), "praxis-my-gateway");
         assert_eq!(child_name(""), "praxis-");
+    }
+
+    #[test]
+    fn test_a_name_at_the_limit_is_left_alone() {
+        let name = "g".repeat(MAX_CHILD_NAME - "praxis-".len());
+
+        assert_eq!(
+            child_name(&name),
+            format!("praxis-{name}"),
+            "truncating a name that already fits would rename the children of every Gateway near \
+             the limit, orphaning what it had already created"
+        );
+    }
+
+    #[test]
+    fn test_an_overlong_name_is_cut_to_the_limit() {
+        let name = "g".repeat(200);
+
+        let child = child_name(&name);
+
+        assert_eq!(
+            child.len(),
+            MAX_CHILD_NAME,
+            "Kubernetes rejects a longer object name outright, and every child apply fails with it"
+        );
+    }
+
+    #[test]
+    fn test_trimming_a_trailing_dash_may_come_in_under_the_limit() {
+        let name = "gateway-with-one-not-matching-port-and-section-name-route";
+
+        let child = child_name(name);
+
+        assert!(
+            child.len() <= MAX_CHILD_NAME,
+            "the cap is a ceiling, not a target: {child}"
+        );
+        assert!(
+            !child.contains("--"),
+            "trimming the dash the cut landed on must not leave a doubled one: {child}"
+        );
+    }
+
+    #[test]
+    fn test_two_overlong_names_sharing_a_prefix_stay_distinct() {
+        let base = "g".repeat(200);
+
+        assert_ne!(
+            child_name(&format!("{base}-one")),
+            child_name(&format!("{base}-two")),
+            "truncation alone would give two Gateways the same Deployment, and each reconcile \
+             would overwrite the other's config"
+        );
+    }
+
+    #[test]
+    fn test_a_truncated_name_is_a_valid_dns_label() {
+        let name = format!("{}-", "g".repeat(60));
+
+        let child = child_name(&name);
+
+        assert!(
+            child
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "a name outside the DNS label charset is rejected as surely as a long one: {child}"
+        );
+        assert!(
+            !child.starts_with('-') && !child.ends_with('-'),
+            "a leading or trailing dash is not a DNS label: {child}"
+        );
     }
 
     #[test]
