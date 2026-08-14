@@ -44,16 +44,22 @@ use crate::{
 /// has no field to carry them. Advertising any of them would direct
 /// conformance tooling at suites that cannot pass.
 ///
-/// `HTTPRouteResponseHeaderModification` was claimed here and has been
-/// withdrawn. Claiming it is what made conformance run
+/// `HTTPRouteResponseHeaderModification` was claimed here and withdrawn.
+/// Claiming it is what made conformance run
 /// `HTTPRouteResponseHeaderModifier` at all — the suites are gated on
 /// advertised features, which is why the test was skipped before.
-/// Running it showed the data plane implements the filter only in part:
-/// `set` and `remove` behave, but `add` replaces the existing header
-/// rather than appending, so conformance asks for
-/// `append-val-1,header-val-2` and praxis 0.3.1 returns `header-val-2`.
-/// `HTTPRouteRequestHeaderModification` was never claimed, for the same
-/// underlying reason.
+/// Running it showed praxis 0.3.1 implemented the filter only in part:
+/// `set` and `remove` behaved, but `add` replaced the existing header
+/// rather than appending, so conformance asked for
+/// `append-val-1,header-val-2` and got `header-val-2`.
+///
+/// Praxis 0.5.2, now the pinned data plane, appends: `request_add`
+/// reads the existing values and combines them. So this entry and
+/// `HTTPRouteRequestHeaderModification` are both candidates to claim
+/// again. Neither is restored as part of the version bump — a feature
+/// claim is a promise, and the only way to check it is a conformance
+/// run that actually exercises the suite, which is worth doing on its
+/// own rather than confounded with an image change.
 ///
 /// [`validate_route`]: crate::gateway_api::route_validation::validate_route
 const SUPPORTED_FEATURES: &[&str] = &["Gateway", "GatewayPort8080", "HTTPRoute", "ReferenceGrant"];

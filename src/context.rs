@@ -33,7 +33,12 @@ pub const FIELD_MANAGER: &str = "praxis-operator";
 pub const ADMIN_PORT: i32 = 9901;
 
 /// Image used when `PRAXIS_IMAGE` is unset.
-const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:latest";
+///
+/// Pinned rather than `latest`. The operator chooses this image for
+/// every data plane it creates, so `latest` would let an unreviewed
+/// proxy release change the behaviour of an unchanged operator, and the
+/// version CI exercises would drift from the version users run.
+const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:0.5.2";
 
 // -----------------------------------------------------------------------------
 // Data Plane Image
@@ -41,7 +46,9 @@ const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:latest";
 
 /// Praxis container image, configurable via `PRAXIS_IMAGE` env var.
 ///
-/// Falls back to `ghcr.io/praxis-proxy/praxis:latest` when unset.
+/// Falls back to a pinned Praxis release when unset, rather than to
+/// `latest`, so an unchanged operator keeps deploying the data plane
+/// its CI exercised.
 pub fn praxis_image() -> String {
     std::env::var("PRAXIS_IMAGE").unwrap_or_else(|_| DEFAULT_PRAXIS_IMAGE.to_owned())
 }

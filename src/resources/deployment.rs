@@ -40,21 +40,21 @@ const REPLICAS_ANNOTATION: &str = "praxis.sh/replicas";
 ///
 /// One, matching the behaviour every existing Gateway already has.
 ///
-/// Two would be the better availability default — a single-replica
-/// Gateway is a single point of failure for every route attached to it
-/// — but the data plane cannot currently sustain it. Praxis 0.3.1
-/// registers its KV admin endpoints on the same port as its health
-/// endpoints via `SO_REUSEPORT`, so probe connections land on whichever
-/// listener the kernel picks and roughly half of them 404. Praxis has
-/// since deprecated that registration for exactly this reason
-/// ("non-deterministic connection routing that breaks health probes"),
-/// but on the pinned version every additional replica is another pod
-/// whose liveness probe flaps and whose container is restarted, and a
-/// Gateway whose pods never settle never reports Programmed.
+/// This was forced rather than chosen. Praxis 0.3.1 registered its KV
+/// admin endpoints on the health port via `SO_REUSEPORT`, so probe
+/// connections landed on whichever listener the kernel picked and
+/// roughly half of them 404'd; every extra replica was another pod
+/// whose liveness probe flapped, and a Gateway whose pods never settle
+/// never reports Programmed.
 ///
-/// Raise this to two once the data plane serves health on a port of its
-/// own. Until then `praxis.sh/replicas` is the opt-in for anyone who
-/// wants the availability and can tolerate the flapping.
+/// The pinned data plane is now 0.5.2, which no longer registers that
+/// endpoint, so the constraint is gone. Two is the better availability
+/// default — a single-replica Gateway is a single point of failure for
+/// every route attached to it — and raising it is now a live option
+/// rather than a blocked one. It is deliberately not part of the
+/// version bump: that is a behaviour change deserving its own
+/// conformance run, and bundling it would make a red run ambiguous.
+/// `praxis.sh/replicas` remains the per-Gateway override meanwhile.
 const DEFAULT_REPLICAS: i32 = 1;
 
 // -----------------------------------------------------------------------------

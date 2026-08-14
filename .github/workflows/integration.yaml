@@ -29,7 +29,7 @@ env:
   KIND_CLUSTER_NAME: ci
   V: ${{ inputs.debug && '1' || '' }}
   OPERATOR_IMAGE: praxis-operator:dev
-  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.3.1
+  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.5.2
 
 jobs:
   # ---------------------------------------------------------------------------
