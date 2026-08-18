@@ -1,0 +1,33 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.100"
+regex = "1.13.1"
+
+[lints.rust]
+dead_code = "deny"
+unsafe_code = "deny"
+missing_docs = "deny"
+unreachable_pub = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+# unwrap_used/expect_used/panic are intentionally not denied here: this is a
+# dev-only build tool (not shipped production code), and its regexes are
+# compile-time-constant literals compiled once into `LazyLock` statics, where
+# `.unwrap()` is the standard idiom (a bad pattern would fail on first run).
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "allow"
+print_stderr = "allow"

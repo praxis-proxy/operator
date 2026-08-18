@@ -23,6 +23,7 @@ make build          # workspace build
 make test           # all tests
 make fmt            # format with nightly rustfmt
 make lint           # clippy + nightly fmt check
+make extended-lint  # diff-scoped heuristic checks (TODOs, comment slop, repetition), via xtask
 make audit          # cargo audit + cargo deny check
 ```
 

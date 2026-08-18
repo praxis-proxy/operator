@@ -6,6 +6,9 @@ rust-version = "1.96"
 license = "MIT"
 publish = false
 
+[workspace]
+members = ["xtask"]
+
 [features]
 integration = []
 

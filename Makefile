@@ -1,5 +1,5 @@
 .PHONY: all build release check test lint fmt doc audit clean
-.PHONY: coverage-check
+.PHONY: coverage-check extended-lint
 .PHONY: require-container-engine images container praxis-image
 .PHONY: kind-up kind-down kind-reset conformance smoke-test
 .PHONY: dev-env dev-conformance dev-cycle dev-integration dev-push
@@ -45,6 +45,9 @@ check:
 lint:
 	cargo clippy --all-targets -- -D warnings
 	cargo +nightly fmt --all -- --check
+
+extended-lint:
+	cargo run -p xtask -- lint-extended
 
 fmt:
 	cargo +nightly fmt --all
@@ -197,6 +200,7 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint               clippy + nightly rustfmt check"
+	@echo "  extended-lint      diff-scoped heuristic checks (TODOs, comment slop, repetition)"
 	@echo "  fmt                format with nightly rustfmt"
 	@echo "  doc                build docs with warnings denied"
 	@echo "  audit              cargo audit + cargo deny"

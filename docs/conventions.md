@@ -25,6 +25,12 @@
 - **cargo-audit**: Check for vulnerable dependencies
 - **cargo-deny**: Enforce supply chain safety policies
 - **rustdoc**: Generate the API documentation
+- **`xtask lint-extended`** (`make extended-lint`): diff-scoped
+  heuristic checks for patterns clippy can't catch structurally --
+  leftover `TODO`/`FIXME` markers, commented-out code, narrating "what"
+  comments, repeated literals that should be named constants, weak
+  identifier names, and new clippy suppressions. Only scans lines added
+  since the diff base, so pre-existing code is never relitigated.
 
 ### Comments vs Tracing
 

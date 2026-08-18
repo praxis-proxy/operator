@@ -21,12 +21,18 @@ WORKDIR /src
 
 # The manifest declares an explicit [[bench]], so cargo refuses to parse
 # it unless that file exists. Stub it alongside src/ or this layer fails
-# before a single dependency is compiled.
+# before a single dependency is compiled. The `xtask` workspace member is
+# a dev-only tool never shipped in this image; `-p praxis-operator` keeps
+# it out of the build target, but cargo still needs its manifest and a
+# target file present to resolve the workspace, so it gets a permanent
+# stub rather than being swapped for real source later.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src benches \
+COPY xtask/Cargo.toml xtask/Cargo.toml
+RUN mkdir -p src benches xtask/src \
     && printf '//! stub\nfn main() {}\n' > src/main.rs \
     && printf 'fn main() {}\n' > benches/config_generation.rs \
-    && cargo build --release --locked \
+    && printf 'fn main() {}\n' > xtask/src/main.rs \
+    && cargo build --release --locked -p praxis-operator \
     && rm -rf src
 
 # ---------------------------------------------------------------------------
@@ -39,7 +45,7 @@ RUN mkdir -p src benches \
 COPY src src
 COPY benches benches
 RUN touch src/main.rs \
-    && cargo build --release --locked \
+    && cargo build --release --locked -p praxis-operator \
     && cp target/release/praxis-operator /usr/local/bin/
 
 # ---------------------------------------------------------------------------
