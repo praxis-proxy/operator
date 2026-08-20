@@ -1545,7 +1545,7 @@ impl TestContext {
     async fn deploy_echo_server(&self, name: &str, namespace: &str, port: i32) {
         use k8s_openapi::{
             api::{
-                apps::v1::{Deployment, DeploymentSpec},
+                apps::v1::DeploymentSpec,
                 core::v1::{Container, ContainerPort, PodSpec, PodTemplateSpec},
             },
             apimachinery::pkg::apis::meta::v1::LabelSelector,
