@@ -31,23 +31,23 @@ Build consensus with community members.
 
 ### 2. Sign-off
 
-A maintainer reviews the discussion and marks it as
+A reviewer reviews the discussion and marks it as
 approved. This confirms the project is open to the
 proposed direction.
 
-> **Note**: It's fair to directly ping maintainers
+> **Note**: It's fair to directly ping reviewers
 > asking for review and approval consideration when
 > things get stuck.
 
 ### 3. Issue
 
-Once the discussion is approved by a maintainer and
+Once the discussion is approved by a reviewer and
 resolved, create an `EPIC` issue from the discussion.
 Include first a link to the originating discussion,
 followed by a high-level summary. This is where all
 implementation work will be organized (as sub-tasks).
 
-> **Note**: Maintainers will assign epic and sub-task
+> **Note**: Reviewers will assign epic and sub-task
 > owners.
 
 ### 4. Proposal PR
@@ -71,7 +71,7 @@ the [template] for the full structure.
 
 Iterate on the proposal in subsequent PRs. Add the
 **How?** section with requirements and design details.
-Refine until a maintainer marks the proposal as
+Refine until a reviewer marks the proposal as
 accepted.
 
 ### 6. Experimental
@@ -89,8 +89,8 @@ nothing about them is guaranteed.
 
 ### 7. Release
 
-After a soak period determined by maintainers a
-maintainer may promote the feature from experimental
+After a soak period determined by reviewers a
+reviewer may promote the feature from experimental
 to released. The proposal status is updated to
 `released`.
 
