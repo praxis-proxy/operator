@@ -65,8 +65,8 @@ impl Health {
 pub async fn serve(health: Arc<Health>) {
     let listener = match TcpListener::bind(BIND_ADDRESS).await {
         Ok(listener) => listener,
-        Err(e) => {
-            warn!(%e, "observability endpoints unavailable; continuing without them");
+        Err(err) => {
+            warn!(%err, "observability endpoints unavailable; continuing without them");
             return;
         },
     };
@@ -87,7 +87,7 @@ async fn accept_loop(listener: TcpListener, health: Arc<Health>) -> ! {
                 let health = Arc::clone(&health);
                 drop(tokio::spawn(async move { handle(stream, health).await }));
             },
-            Err(e) => debug!(%e, "observability connection failed"),
+            Err(err) => debug!(%err, "observability connection failed"),
         }
     }
 }
@@ -114,8 +114,8 @@ async fn handle(mut stream: TcpStream, health: Arc<Health>) {
         _ => text_response(404, "not found"),
     };
 
-    if let Err(e) = stream.write_all(response.as_bytes()).await {
-        debug!(%e, "observability response failed");
+    if let Err(err) = stream.write_all(response.as_bytes()).await {
+        debug!(%err, "observability response failed");
     }
 }
 

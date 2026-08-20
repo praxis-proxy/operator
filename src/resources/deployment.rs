@@ -62,9 +62,9 @@ const DEFAULT_REPLICAS: i32 = 1;
 // -----------------------------------------------------------------------------
 
 /// Parameters for building a Praxis data-plane [`Deployment`].
-pub struct DeploymentParams<'a> {
+pub struct DeploymentParams<'gw> {
     /// Child resource name.
-    pub name: &'a str,
+    pub name: &'gw str,
 
     /// SHA-256 hex digest of the `ConfigMap` contents.
     ///
@@ -72,19 +72,19 @@ pub struct DeploymentParams<'a> {
     /// rolling restart. Required because Kubernetes `ConfigMap` volume mounts
     /// use atomic symlink swaps that `inotify`-based file watchers cannot
     /// detect.
-    pub config_hash: &'a str,
+    pub config_hash: &'gw str,
 
     /// Parent Gateway.
-    pub gateway: &'a Gateway,
+    pub gateway: &'gw Gateway,
 
     /// `(listener_name, port)` pairs from Gateway listeners.
-    pub listener_ports: &'a [(String, i32)],
+    pub listener_ports: &'gw [(String, i32)],
 
     /// Target namespace.
-    pub namespace: &'a str,
+    pub namespace: &'gw str,
 
     /// Deduplicated TLS secret names from HTTPS listeners.
-    pub tls_secret_names: &'a [String],
+    pub tls_secret_names: &'gw [String],
 }
 
 /// Builds a Deployment for the Praxis data-plane.
@@ -232,7 +232,7 @@ fn build_container_ports(listener_ports: &[(String, i32)]) -> Vec<ContainerPort>
         })
         .collect();
 
-    if listener_ports.iter().any(|(_, p)| *p == ADMIN_PORT) {
+    if listener_ports.iter().any(|(_, port)| *port == ADMIN_PORT) {
         tracing::warn!(
             port = ADMIN_PORT,
             "listener port collides with admin port; skipping dedicated admin port"
@@ -442,8 +442,6 @@ fn build_deployment_object(
 #[cfg(test)]
 #[expect(clippy::too_many_lines, clippy::default_trait_access, reason = "tests")]
 mod tests {
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-
     use super::*;
 
     fn test_gateway() -> Gateway {
@@ -459,7 +457,7 @@ mod tests {
         }
     }
 
-    fn test_params<'a>(gateway: &'a Gateway, ports: &'a [(String, i32)]) -> DeploymentParams<'a> {
+    fn test_params<'gw>(gateway: &'gw Gateway, ports: &'gw [(String, i32)]) -> DeploymentParams<'gw> {
         DeploymentParams {
             config_hash: "abc123",
             name: "praxis-deploy",

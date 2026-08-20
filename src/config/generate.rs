@@ -83,7 +83,7 @@ pub fn assemble_config(
 ) -> yaml_serde::Result<PraxisConfig> {
     let filter_chains: Vec<_> = listeners
         .iter()
-        .map(|l| build_filter_chain(l, routes, clusters, route_filters, listener_hostnames))
+        .map(|listener| build_filter_chain(listener, routes, clusters, route_filters, listener_hostnames))
         .collect::<yaml_serde::Result<Vec<_>>>()?;
 
     Ok(PraxisConfig {
@@ -121,11 +121,12 @@ fn build_filter_chain(
     let section_names = &listener.merged_section_names;
     let filtered: Vec<_> = routes
         .iter()
-        .filter(|r| {
-            r.listener_names.is_empty()
-                || r.listener_names
+        .filter(|route| {
+            route.listener_names.is_empty()
+                || route
+                    .listener_names
                     .iter()
-                    .any(|ln| ln.is_none() || ln.as_deref().is_some_and(|n| section_names.contains(&n.to_owned())))
+                    .any(|ln| ln.is_none() || ln.as_deref().is_some_and(|sn| section_names.contains(&sn.to_owned())))
         })
         .cloned()
         .collect();
@@ -159,7 +160,7 @@ fn inject_listener_hostnames(
 ) -> Vec<PraxisRoute> {
     routes
         .iter()
-        .flat_map(|r| expand_route_hostnames(r, listener_hostnames))
+        .flat_map(|route| expand_route_hostnames(route, listener_hostnames))
         .collect()
 }
 
@@ -184,9 +185,9 @@ fn expand_route_hostnames(
 
     hostnames
         .into_iter()
-        .map(|h| {
+        .map(|host| {
             let mut scoped = route.clone();
-            scoped.host = Some(h);
+            scoped.host = Some(host);
             scoped
         })
         .collect()

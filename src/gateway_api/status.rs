@@ -123,7 +123,7 @@ fn preserve_condition_list(desired: &mut Value, observed: &Value) {
 
 /// Finds the observed condition sharing a `type` and `status` with
 /// `desired`.
-fn matching_condition<'a>(observed: &'a [Value], desired: &Value) -> Option<&'a Value> {
+fn matching_condition<'cond>(observed: &'cond [Value], desired: &Value) -> Option<&'cond Value> {
     let type_ = desired.get("type")?;
     let status = desired.get("status")?;
 

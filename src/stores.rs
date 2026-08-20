@@ -164,9 +164,9 @@ fn sorted<K>(mut objects: Vec<Arc<K>>) -> Vec<Arc<K>>
 where
     K: Resource + 'static,
 {
-    objects.sort_by(|a, b| {
-        let left = (a.meta().namespace.as_deref(), a.meta().name.as_deref());
-        let right = (b.meta().namespace.as_deref(), b.meta().name.as_deref());
+    objects.sort_by(|lhs, rhs| {
+        let left = (lhs.meta().namespace.as_deref(), lhs.meta().name.as_deref());
+        let right = (rhs.meta().namespace.as_deref(), rhs.meta().name.as_deref());
         left.cmp(&right)
     });
     objects
@@ -189,8 +189,8 @@ where
     drop(tokio::spawn(async move {
         let mut stream = Box::pin(stream);
         while let Some(event) = stream.next().await {
-            if let Err(e) = event {
-                warn!(%e, kind, "watch error, cache may be briefly stale");
+            if let Err(err) = event {
+                warn!(%err, kind, "watch error, cache may be briefly stale");
             }
         }
         warn!(kind, "watch stream ended");

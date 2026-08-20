@@ -68,7 +68,7 @@ pub struct PraxisFilterEntry {
 
     /// Filter configuration (flattened into parent).
     #[serde(flatten)]
-    pub(crate) config: yaml_serde::Value,
+    pub config: yaml_serde::Value,
 }
 
 // -----------------------------------------------------------------------------
@@ -252,7 +252,7 @@ fn process_rule(
 
     let authorized: Vec<_> = raw_backends
         .iter()
-        .filter(|b| check_backend_authorized(b, route_ns, grants))
+        .filter(|backend| check_backend_authorized(backend, route_ns, grants))
         .collect();
 
     if authorized.is_empty() {
@@ -265,7 +265,7 @@ fn process_rule(
     backend_refs.extend(
         authorized
             .iter()
-            .filter_map(|b| process_backend_ref(b, route_ns, &cluster_name, seen_clusters)),
+            .filter_map(|backend| process_backend_ref(backend, route_ns, &cluster_name, seen_clusters)),
     );
 }
 
@@ -285,7 +285,7 @@ pub fn rule_has_authorized_backend(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .any(|b| is_backend_authorized(b, route_ns, grants))
+        .any(|backend| is_backend_authorized(backend, route_ns, grants))
 }
 
 /// Returns `true` if authorized; logs and returns `false` otherwise.
@@ -321,7 +321,7 @@ fn merged_cluster_name_from_refs(backends: &[&HttpRouteRulesBackendRefs], route_
     }
     backends
         .iter()
-        .map(|b| single_cluster_name(b, route_ns))
+        .map(|backend| single_cluster_name(backend, route_ns))
         .collect::<Vec<_>>()
         .join("+")
 }
@@ -385,8 +385,8 @@ fn create_routes_for_backend(
     if matches.is_empty() {
         emit_catchall_routes(cluster, hostnames, section_names, out);
     } else {
-        for m in matches {
-            emit_match_routes(cluster, m, hostnames, section_names, out);
+        for rule_match in matches {
+            emit_match_routes(cluster, rule_match, hostnames, section_names, out);
         }
     }
 }
@@ -416,14 +416,14 @@ fn emit_catchall_routes(
 /// prefix matching), each expanded across all hostnames.
 fn emit_match_routes(
     cluster: &str,
-    m: &HttpRouteRulesMatches,
+    rule_match: &HttpRouteRulesMatches,
     hostnames: &[String],
     section_names: &[Option<String>],
     out: &mut Vec<PraxisRoute>,
 ) {
-    let headers = extract_headers(&m.headers);
+    let headers = extract_headers(rule_match.headers.as_ref());
 
-    for (path, path_prefix) in extract_path_match(&m.path) {
+    for (path, path_prefix) in extract_path_match(rule_match.path.as_ref()) {
         let base = PraxisRoute {
             cluster: cluster.to_owned(),
             headers: headers.clone(),
@@ -466,15 +466,15 @@ fn push_per_hostname(base: PraxisRoute, hostnames: &[String], out: &mut Vec<Prax
 /// - `Exact`: single entry with `path` set, empty `path_prefix`.
 /// - Default / unsupported: single entry with prefix `"/"`.
 fn extract_path_match(
-    path: &Option<gateway_api::httproutes::HttpRouteRulesMatchesPath>,
+    path: Option<&gateway_api::httproutes::HttpRouteRulesMatchesPath>,
 ) -> Vec<(Option<String>, String)> {
-    let Some(p) = path.as_ref() else {
+    let Some(path_match) = path else {
         return vec![(None, "/".to_owned())];
     };
 
-    match &p.r#type {
+    match &path_match.r#type {
         Some(HttpRouteRulesMatchesPathType::PathPrefix) => {
-            let value = p.value.as_deref().unwrap_or("/");
+            let value = path_match.value.as_deref().unwrap_or("/");
             if value == "/" || value.ends_with('/') {
                 vec![(None, value.to_owned())]
             } else {
@@ -482,7 +482,7 @@ fn extract_path_match(
             }
         },
         Some(HttpRouteRulesMatchesPathType::Exact) => {
-            let value = p.value.clone().unwrap_or_else(|| "/".to_owned());
+            let value = path_match.value.clone().unwrap_or_else(|| "/".to_owned());
             vec![(Some(value), String::new())]
         },
         Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
@@ -499,9 +499,9 @@ fn extract_path_match(
 /// skipped with a warning. Per Gateway API spec, first entry wins for
 /// duplicate header names.
 fn extract_headers(
-    headers: &Option<Vec<gateway_api::httproutes::HttpRouteRulesMatchesHeaders>>,
+    headers: Option<&Vec<gateway_api::httproutes::HttpRouteRulesMatchesHeaders>>,
 ) -> Option<BTreeMap<String, String>> {
-    let hs = headers.as_ref().filter(|hs| !hs.is_empty())?;
+    let hs = headers.filter(|hs| !hs.is_empty())?;
     let map = collect_exact_headers(hs);
     if map.is_empty() { None } else { Some(map) }
 }
@@ -509,21 +509,21 @@ fn extract_headers(
 /// Collects exact-match headers into a map, skipping regex matches.
 fn collect_exact_headers(hs: &[gateway_api::httproutes::HttpRouteRulesMatchesHeaders]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    for h in hs {
-        if is_regex_header(h) {
-            warn!(header = %h.name, "RegularExpression header match not supported, skipping");
+    for header in hs {
+        if is_regex_header(header) {
+            warn!(header = %header.name, "RegularExpression header match not supported, skipping");
             continue;
         }
-        map.entry(h.name.clone()).or_insert_with(|| h.value.clone());
+        map.entry(header.name.clone()).or_insert_with(|| header.value.clone());
     }
     map
 }
 
 /// Returns `true` if the header match uses `RegularExpression` type.
-fn is_regex_header(h: &gateway_api::httproutes::HttpRouteRulesMatchesHeaders) -> bool {
-    h.r#type
-        .as_ref()
-        .is_some_and(|t| *t == gateway_api::httproutes::HttpRouteRulesMatchesHeadersType::RegularExpression)
+fn is_regex_header(header: &gateway_api::httproutes::HttpRouteRulesMatchesHeaders) -> bool {
+    header.r#type.as_ref().is_some_and(|match_type| {
+        *match_type == gateway_api::httproutes::HttpRouteRulesMatchesHeadersType::RegularExpression
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -533,9 +533,7 @@ fn is_regex_header(h: &gateway_api::httproutes::HttpRouteRulesMatchesHeaders) ->
 #[cfg(test)]
 #[expect(clippy::too_many_lines, reason = "tests")]
 mod tests {
-    use gateway_api::httproutes::{
-        HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteSpec,
-    };
+    use gateway_api::httproutes::{HttpRouteRules, HttpRouteRulesMatchesPath, HttpRouteSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     use super::*;

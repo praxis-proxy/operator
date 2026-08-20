@@ -114,7 +114,7 @@ pub async fn renew_until_lost(client: &Client, identity: &str) -> Result<()> {
                 warn!("lost leadership to another replica");
                 return Err(OperatorError::LeadershipLost);
             },
-            Err(e) => warn!(%e, "lease renewal failed, will retry"),
+            Err(err) => warn!(%err, "lease renewal failed, will retry"),
         }
     }
 }
@@ -125,7 +125,7 @@ async fn try_acquire(api: &Api<Lease>, identity: &str) -> Result<bool> {
     let observed = match api.get(LEASE_NAME).await {
         Ok(lease) => Some(lease),
         Err(kube::Error::Api(resp)) if resp.code == 404 => None,
-        Err(e) => return Err(e.into()),
+        Err(err) => return Err(err.into()),
     };
 
     if let Some(lease) = observed.as_ref()

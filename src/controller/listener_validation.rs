@@ -63,7 +63,7 @@ fn validate_route_kinds(listener: &GatewayListeners) -> (Vec<RouteGroupKind>, bo
     };
 
     let has_httproute = kinds.iter().any(is_httproute_kind);
-    let has_unsupported = kinds.iter().any(|k| !is_httproute_kind(k));
+    let has_unsupported = kinds.iter().any(|kind| !is_httproute_kind(kind));
     let supported = if has_httproute {
         httproute_supported_kinds()
     } else {
@@ -78,9 +78,9 @@ fn httproute_supported_kinds() -> Vec<RouteGroupKind> {
 }
 
 /// Checks whether a route kind ref is `HTTPRoute` in the Gateway API group.
-fn is_httproute_kind(k: &GatewayListenersAllowedRoutesKinds) -> bool {
-    let group = k.group.as_deref().unwrap_or("gateway.networking.k8s.io");
-    group == "gateway.networking.k8s.io" && k.kind == "HTTPRoute"
+fn is_httproute_kind(kind: &GatewayListenersAllowedRoutesKinds) -> bool {
+    let group = kind.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+    group == "gateway.networking.k8s.io" && kind.kind == "HTTPRoute"
 }
 
 /// Validates TLS certificate refs on a listener.
@@ -104,11 +104,11 @@ async fn validate_tls_cert_refs(
             ));
         }
         let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gateway_ns);
-        if let Some(c) = check_cross_ns_grant(ctx, generation, gateway_ns, secret_ns, &cert_ref.name) {
-            return Some(c);
+        if let Some(cert_condition) = check_cross_ns_grant(ctx, generation, gateway_ns, secret_ns, &cert_ref.name) {
+            return Some(cert_condition);
         }
-        if let Some(c) = check_secret_contents(&ctx.client, generation, secret_ns, &cert_ref.name).await {
-            return Some(c);
+        if let Some(cert_condition) = check_secret_contents(&ctx.client, generation, secret_ns, &cert_ref.name).await {
+            return Some(cert_condition);
         }
     }
     None
@@ -186,7 +186,7 @@ async fn check_secret_contents(
 
 /// Validates that a Secret's data contains well-formed TLS PEM entries.
 fn validate_tls_secret_data(data: Option<&BTreeMap<String, ByteString>>, generation: i64) -> Option<Condition> {
-    let has_keys = data.is_some_and(|d| d.contains_key("tls.crt") && d.contains_key("tls.key"));
+    let has_keys = data.is_some_and(|entries| entries.contains_key("tls.crt") && entries.contains_key("tls.key"));
     if !has_keys {
         return Some(conditions::unresolved_refs(
             generation,
@@ -195,7 +195,7 @@ fn validate_tls_secret_data(data: Option<&BTreeMap<String, ByteString>>, generat
         ));
     }
 
-    let is_pem = data.is_some_and(|d| is_pem_entry(d, "tls.crt") && is_pem_entry(d, "tls.key"));
+    let is_pem = data.is_some_and(|entries| is_pem_entry(entries, "tls.crt") && is_pem_entry(entries, "tls.key"));
     if !is_pem {
         return Some(conditions::unresolved_refs(
             generation,
@@ -210,7 +210,7 @@ fn validate_tls_secret_data(data: Option<&BTreeMap<String, ByteString>>, generat
 /// Checks whether a Secret data entry starts with a PEM header.
 fn is_pem_entry(data: &BTreeMap<String, ByteString>, key: &str) -> bool {
     data.get(key)
-        .is_some_and(|v| String::from_utf8_lossy(&v.0).starts_with("-----BEGIN "))
+        .is_some_and(|val| String::from_utf8_lossy(&val.0).starts_with("-----BEGIN "))
 }
 
 // -----------------------------------------------------------------------------
@@ -220,7 +220,7 @@ fn is_pem_entry(data: &BTreeMap<String, ByteString>, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use gateway_api::{
-        gateways::{GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesKinds, GatewayListenersTls},
+        gateways::{GatewayListenersAllowedRoutes, GatewayListenersTls},
         referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo},
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

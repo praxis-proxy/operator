@@ -390,7 +390,7 @@ fn merge_parent_statuses(observed: &Value, computed: &[Value]) -> Vec<Value> {
 
 /// Finds the entry in `entries` describing the same `parentRef` as
 /// `target`.
-fn find_by_parent_ref<'a>(entries: &'a [Value], target: &Value) -> Option<&'a Value> {
+fn find_by_parent_ref<'entry>(entries: &'entry [Value], target: &Value) -> Option<&'entry Value> {
     let key = target.get("parentRef")?;
     entries.iter().find(|entry| entry.get("parentRef") == Some(key))
 }

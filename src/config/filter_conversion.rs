@@ -132,9 +132,9 @@ pub struct RouteFilters {
 
 /// A rule paired with whether the gateway can forward its traffic.
 #[derive(Debug, Clone, Copy)]
-pub struct ServedRule<'a> {
+pub struct ServedRule<'rule> {
     /// The rule contributing filters.
-    pub rule: &'a HttpRouteRules,
+    pub rule: &'rule HttpRouteRules,
 
     /// Whether any `backendRef` on the rule survived reference checks.
     ///
@@ -163,11 +163,11 @@ pub fn convert_filters(rules: &[ServedRule<'_>]) -> RouteFilters {
     for (index, served) in rules.iter().enumerate() {
         let condition = rule_conditions(index, &scoped);
         if !served.resolvable && !rule_has_redirect(served.rule) {
-            emit_no_backend_response(&condition, &mut filters.terminating);
+            emit_no_backend_response(condition.as_ref(), &mut filters.terminating);
         }
-        emit_conditional_timeout(served.rule, &condition, &mut filters.transforming);
+        emit_conditional_timeout(served.rule, condition.as_ref(), &mut filters.transforming);
         if served.rule.filters.is_some() {
-            convert_rule_filters(served.rule, &condition, &mut filters);
+            convert_rule_filters(served.rule, condition.as_ref(), &mut filters);
         }
     }
     filters
@@ -177,24 +177,24 @@ pub fn convert_filters(rules: &[ServedRule<'_>]) -> RouteFilters {
 fn rule_has_redirect(rule: &HttpRouteRules) -> bool {
     rule.filters.as_ref().is_some_and(|fs| {
         fs.iter()
-            .any(|f| f.r#type == HttpRouteRulesFiltersType::RequestRedirect)
+            .any(|filter| filter.r#type == HttpRouteRulesFiltersType::RequestRedirect)
     })
 }
 
 /// What a rule's filters need to know about the rule that carries them.
-struct RuleContext<'a> {
+struct RuleContext<'cond> {
     /// The Praxis `conditions` list gating every filter of this rule.
-    condition: &'a Option<yaml_serde::Value>,
+    condition: Option<&'cond yaml_serde::Value>,
 
     /// The `PathPrefix` value the rule matched on, if it matched one.
     ///
     /// `ReplacePrefixMatch` replaces exactly this much of the request
     /// path, so the rewrite cannot be built without it.
-    prefix: Option<&'a str>,
+    prefix: Option<&'cond str>,
 }
 
 /// Converts filters from a single rule into conditional filter entries.
-fn convert_rule_filters(rule: &HttpRouteRules, condition: &Option<yaml_serde::Value>, filters: &mut RouteFilters) {
+fn convert_rule_filters(rule: &HttpRouteRules, condition: Option<&yaml_serde::Value>, filters: &mut RouteFilters) {
     let Some(rule_filters) = &rule.filters else {
         return;
     };
@@ -243,7 +243,9 @@ fn dispatch_filter(
             false
         },
         HttpRouteRulesFiltersType::UrlRewrite => dispatch_url_rewrite(filter, ctx, header_config, filters),
-        other => {
+        other @ (HttpRouteRulesFiltersType::RequestMirror
+        | HttpRouteRulesFiltersType::ExtensionRef
+        | HttpRouteRulesFiltersType::Cors) => {
             warn!(?other, "unsupported filter type, ignoring");
             false
         },
@@ -351,23 +353,23 @@ fn scope_rule(rule: &HttpRouteRules) -> ScopedRule {
 }
 
 /// Builds the predicate matching one rule's traffic.
-fn rule_predicate(m: &HttpRouteRulesMatches) -> Predicate {
+fn rule_predicate(rule_match: &HttpRouteRulesMatches) -> Predicate {
     let mut predicate = Predicate::new();
-    insert_path_predicate(m, &mut predicate);
-    insert_header_predicate(m, &mut predicate);
+    insert_path_predicate(rule_match, &mut predicate);
+    insert_header_predicate(rule_match, &mut predicate);
     predicate
 }
 
 /// Ranks one rule's match against its siblings.
-fn rule_precedence(m: &HttpRouteRulesMatches) -> Precedence {
-    let path = m.path.as_ref();
+fn rule_precedence(rule_match: &HttpRouteRulesMatches) -> Precedence {
+    let path = rule_match.path.as_ref();
     Precedence {
         exact_path: matches!(
-            path.and_then(|p| p.r#type.as_ref()),
+            path.and_then(|pm| pm.r#type.as_ref()),
             Some(HttpRouteRulesMatchesPathType::Exact)
         ),
-        path_len: path.and_then(|p| p.value.as_deref()).map_or(0, str::len),
-        headers: m.headers.as_deref().map_or(0, <[_]>::len),
+        path_len: path.and_then(|pm| pm.value.as_deref()).map_or(0, str::len),
+        headers: rule_match.headers.as_deref().map_or(0, <[_]>::len),
     }
 }
 
@@ -401,7 +403,7 @@ fn rule_conditions(index: usize, scoped: &[ScopedRule]) -> Option<yaml_serde::Va
 }
 
 /// Collects the distinct predicates of the rules that outrank `own`.
-fn outranking_predicates<'a>(own: &ScopedRule, scoped: &'a [ScopedRule]) -> Vec<&'a Predicate> {
+fn outranking_predicates<'scope>(own: &ScopedRule, scoped: &'scope [ScopedRule]) -> Vec<&'scope Predicate> {
     let mut collected: Vec<&Predicate> = Vec::new();
     for other in scoped {
         let outranks = other.precedence > own.precedence && !other.predicate.is_empty();
@@ -426,8 +428,8 @@ fn condition_entry(keyword: &str, predicate: &Predicate) -> yaml_serde::Value {
 /// match uses `path_prefix`. Collapsing both onto `path_prefix`, as this
 /// did before, made a filter scoped to exactly `/foo` fire on `/foo/bar`
 /// as well.
-fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut yaml_serde::Mapping) {
-    let Some(path) = m.path.as_ref() else { return };
+fn insert_path_predicate(rule_match: &HttpRouteRulesMatches, predicate: &mut yaml_serde::Mapping) {
+    let Some(path) = rule_match.path.as_ref() else { return };
     let Some(value) = path.value.as_deref() else { return };
 
     let field = match &path.r#type {
@@ -447,8 +449,8 @@ fn insert_path_predicate(m: &HttpRouteRulesMatches, predicate: &mut yaml_serde::
 /// Narrows the filter to the traffic its own rule matches. Without it a
 /// header modifier written for one route also fires for any other route
 /// sharing its path on the same listener.
-fn insert_header_predicate(m: &HttpRouteRulesMatches, predicate: &mut yaml_serde::Mapping) {
-    let Some(headers) = m.headers.as_deref().filter(|h| !h.is_empty()) else {
+fn insert_header_predicate(rule_match: &HttpRouteRulesMatches, predicate: &mut yaml_serde::Mapping) {
+    let Some(headers) = rule_match.headers.as_deref().filter(|hs| !hs.is_empty()) else {
         return;
     };
 
@@ -471,7 +473,7 @@ fn dispatch_request_header(filter: &HttpRouteRulesFilters, config: &mut HeaderFi
     filter
         .request_header_modifier
         .as_ref()
-        .is_some_and(|m| process_request_header_modifier(m, config))
+        .is_some_and(|modifier| process_request_header_modifier(modifier, config))
 }
 
 /// Dispatches a response header modifier filter.
@@ -479,7 +481,7 @@ fn dispatch_response_header(filter: &HttpRouteRulesFilters, config: &mut HeaderF
     filter
         .response_header_modifier
         .as_ref()
-        .is_some_and(|m| process_response_header_modifier(m, config))
+        .is_some_and(|modifier| process_response_header_modifier(modifier, config))
 }
 
 // -----------------------------------------------------------------------------
@@ -497,36 +499,36 @@ fn process_request_header_modifier(
     config: &mut HeaderFilterConfig,
 ) -> bool {
     let mut modified = false;
-    modified |= collect_request_add(&modifier.add, config);
-    modified |= collect_request_set(&modifier.set, config);
-    modified |= collect_request_remove(&modifier.remove, config);
+    modified |= collect_request_add(modifier.add.as_ref(), config);
+    modified |= collect_request_set(modifier.set.as_ref(), config);
+    modified |= collect_request_remove(modifier.remove.as_ref(), config);
     modified
 }
 
 /// Collects `add` headers into `request_add`.
 fn collect_request_add(
-    add: &Option<Vec<gateway_api::httproutes::HttpRouteRulesFiltersRequestHeaderModifierAdd>>,
+    add: Option<&Vec<gateway_api::httproutes::HttpRouteRulesFiltersRequestHeaderModifierAdd>>,
     config: &mut HeaderFilterConfig,
 ) -> bool {
     let Some(headers) = add else { return false };
-    let entries = to_header_entries(headers.iter().map(|h| (&h.name, &h.value)));
+    let entries = to_header_entries(headers.iter().map(|hdr| (&hdr.name, &hdr.value)));
     config.request_add.get_or_insert_with(Vec::new).extend(entries);
     true
 }
 
 /// Maps `set` headers to `request_set` (overwrite semantics).
 fn collect_request_set(
-    set: &Option<Vec<gateway_api::httproutes::HttpRouteRulesFiltersRequestHeaderModifierSet>>,
+    set: Option<&Vec<gateway_api::httproutes::HttpRouteRulesFiltersRequestHeaderModifierSet>>,
     config: &mut HeaderFilterConfig,
 ) -> bool {
     let Some(headers) = set else { return false };
-    let entries = to_header_entries(headers.iter().map(|h| (&h.name, &h.value)));
+    let entries = to_header_entries(headers.iter().map(|hdr| (&hdr.name, &hdr.value)));
     config.request_set.get_or_insert_with(Vec::new).extend(entries);
     true
 }
 
 /// Maps `remove` headers to `request_remove`.
-fn collect_request_remove(remove: &Option<Vec<String>>, config: &mut HeaderFilterConfig) -> bool {
+fn collect_request_remove(remove: Option<&Vec<String>>, config: &mut HeaderFilterConfig) -> bool {
     let Some(headers) = remove else { return false };
     config
         .request_remove
@@ -545,12 +547,12 @@ fn process_response_header_modifier(
     let mut modified = false;
 
     if let Some(add_headers) = &modifier.add {
-        let entries = to_header_entries(add_headers.iter().map(|h| (&h.name, &h.value)));
+        let entries = to_header_entries(add_headers.iter().map(|hdr| (&hdr.name, &hdr.value)));
         config.response_add.get_or_insert_with(Vec::new).extend(entries);
         modified = true;
     }
     if let Some(set_headers) = &modifier.set {
-        let entries = to_header_entries(set_headers.iter().map(|h| (&h.name, &h.value)));
+        let entries = to_header_entries(set_headers.iter().map(|hdr| (&hdr.name, &hdr.value)));
         config.response_set.get_or_insert_with(Vec::new).extend(entries);
         modified = true;
     }
@@ -566,7 +568,7 @@ fn process_response_header_modifier(
 }
 
 /// Converts name-value pairs into [`HeaderEntry`] values.
-fn to_header_entries<'a>(pairs: impl Iterator<Item = (&'a String, &'a String)>) -> Vec<HeaderEntry> {
+fn to_header_entries<'iter>(pairs: impl Iterator<Item = (&'iter String, &'iter String)>) -> Vec<HeaderEntry> {
     pairs
         .map(|(name, value)| HeaderEntry {
             name: name.clone(),
@@ -581,7 +583,7 @@ fn to_header_entries<'a>(pairs: impl Iterator<Item = (&'a String, &'a String)>) 
 /// fields (scheme, hostname, port) with `${path}${query}` placeholders.
 fn emit_conditional_redirect(
     redirect: &gateway_api::httproutes::HttpRouteRulesFiltersRequestRedirect,
-    condition: &Option<yaml_serde::Value>,
+    condition: Option<&yaml_serde::Value>,
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
     let location = build_redirect_location(redirect);
@@ -624,16 +626,16 @@ fn redirect_status(status_code: Option<i64>) -> u16 {
 
 /// Builds a redirect location URL template from Gateway API fields.
 fn build_redirect_location(redirect: &gateway_api::httproutes::HttpRouteRulesFiltersRequestRedirect) -> String {
-    let scheme = redirect.scheme.as_ref().map(|s| match s {
+    let scheme = redirect.scheme.as_ref().map(|sc| match sc {
         HttpRouteRulesFiltersRequestRedirectScheme::Http => "http",
         HttpRouteRulesFiltersRequestRedirectScheme::Https => "https",
     });
     let hostname = redirect.hostname.as_deref().unwrap_or("${host}");
 
     match (scheme, redirect.port) {
-        (Some(s), Some(p)) => format!("{s}://{hostname}:{p}${{path}}${{query}}"),
-        (Some(s), None) => format!("{s}://{hostname}${{path}}${{query}}"),
-        (None, Some(p)) => format!("${{scheme}}://{hostname}:{p}${{path}}${{query}}"),
+        (Some(sc), Some(port)) => format!("{sc}://{hostname}:{port}${{path}}${{query}}"),
+        (Some(sc), None) => format!("{sc}://{hostname}${{path}}${{query}}"),
+        (None, Some(port)) => format!("${{scheme}}://{hostname}:{port}${{path}}${{query}}"),
         (None, None) => format!("${{scheme}}://{hostname}${{path}}${{query}}"),
     }
 }
@@ -651,7 +653,7 @@ fn build_redirect_location(redirect: &gateway_api::httproutes::HttpRouteRulesFil
 /// filter.
 fn emit_conditional_timeout(
     rule: &HttpRouteRules,
-    condition: &Option<yaml_serde::Value>,
+    condition: Option<&yaml_serde::Value>,
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
     let Some(timeouts) = &rule.timeouts else { return };
@@ -689,7 +691,7 @@ fn parse_duration_ms(value: &str) -> Option<u64> {
     let mut rest = value;
 
     while !rest.is_empty() {
-        let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+        let digits = rest.find(|ch: char| !ch.is_ascii_digit())?;
         if digits == 0 {
             return None;
         }
@@ -875,7 +877,7 @@ fn escape_replacement(literal: &str) -> String {
 /// Emits a conditional header filter entry.
 fn emit_conditional_header_filter(
     config: &HeaderFilterConfig,
-    condition: &Option<yaml_serde::Value>,
+    condition: Option<&yaml_serde::Value>,
     filters: &mut Vec<PraxisFilterEntry>,
 ) {
     match yaml_serde::to_value(config) {
@@ -891,7 +893,7 @@ fn emit_conditional_header_filter(
 }
 
 /// Emits a `static_response` filter returning 500 for rules with no backends.
-fn emit_no_backend_response(condition: &Option<yaml_serde::Value>, filters: &mut Vec<PraxisFilterEntry>) {
+fn emit_no_backend_response(condition: Option<&yaml_serde::Value>, filters: &mut Vec<PraxisFilterEntry>) {
     let mut config = yaml_serde::Mapping::new();
     config.insert(
         yaml_serde::Value::String("status".to_owned()),
@@ -909,7 +911,7 @@ fn emit_no_backend_response(condition: &Option<yaml_serde::Value>, filters: &mut
 }
 
 /// Injects `conditions` into a filter config mapping.
-fn inject_conditions(mut config: yaml_serde::Value, condition: &Option<yaml_serde::Value>) -> yaml_serde::Value {
+fn inject_conditions(mut config: yaml_serde::Value, condition: Option<&yaml_serde::Value>) -> yaml_serde::Value {
     if let (Some(cond), Some(map)) = (condition, config.as_mapping_mut()) {
         map.insert(yaml_serde::Value::String("conditions".to_owned()), cond.clone());
     }
@@ -923,7 +925,7 @@ fn inject_conditions(mut config: yaml_serde::Value, condition: &Option<yaml_serd
 #[cfg(test)]
 #[expect(clippy::too_many_lines, reason = "tests")]
 mod tests {
-    use gateway_api::httproutes::{HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteRulesTimeouts};
+    use gateway_api::httproutes::{HttpRouteRulesBackendRefs, HttpRouteRulesTimeouts};
 
     use super::*;
 
@@ -1237,7 +1239,7 @@ mod tests {
         });
 
         let mut filters = Vec::new();
-        emit_conditional_timeout(&rule, &None, &mut filters);
+        emit_conditional_timeout(&rule, None, &mut filters);
 
         assert_eq!(
             filters.first().and_then(|f| f.config.get("timeout_ms")),
@@ -1255,7 +1257,7 @@ mod tests {
         });
 
         let mut filters = Vec::new();
-        emit_conditional_timeout(&rule, &None, &mut filters);
+        emit_conditional_timeout(&rule, None, &mut filters);
 
         assert!(
             filters.is_empty(),

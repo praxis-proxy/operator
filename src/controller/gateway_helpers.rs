@@ -126,11 +126,11 @@ fn is_api_not_found(e: &kube::Error) -> bool {
 
 /// Collects `HTTPRoute` resources attached to the Gateway, filtered by
 /// namespace policies.
-pub(super) async fn collect_routes<'a>(
+pub(super) async fn collect_routes<'route>(
     client: &kube::Client,
     gw: &Gateway,
-    all_routes: &'a [HTTPRoute],
-) -> Vec<AttachedRoute<'a>> {
+    all_routes: &'route [HTTPRoute],
+) -> Vec<AttachedRoute<'route>> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
@@ -553,18 +553,18 @@ fn validation_conditions(validation: &route_validation::RouteValidation, generat
 }
 
 /// Components used to build the Gateway status JSON payload.
-struct GatewayStatusParts<'a> {
+struct GatewayStatusParts<'status> {
     /// Gateway-level `Accepted` condition.
-    accepted: &'a Condition,
+    accepted: &'status Condition,
 
     /// Load-balancer addresses.
-    addresses: &'a [Value],
+    addresses: &'status [Value],
 
     /// Per-listener status entries.
-    listener_statuses: &'a [Value],
+    listener_statuses: &'status [Value],
 
     /// Gateway-level `Programmed` condition.
-    programmed: &'a Condition,
+    programmed: &'status Condition,
 }
 
 /// Constructs the `status` sub-object of the Gateway status patch.
@@ -1070,12 +1070,12 @@ fn is_pem_entry(data: &BTreeMap<String, ByteString>, key: &str) -> bool {
 ///
 /// A route is retained if at least one listener it targets allows its
 /// namespace. The default policy (when unspecified) is `Same`.
-async fn filter_routes_by_allowed_namespaces<'a>(
-    attached: &[AttachedRoute<'a>],
+async fn filter_routes_by_allowed_namespaces<'route>(
+    attached: &[AttachedRoute<'route>],
     listeners: &[GatewayListeners],
     gateway_ns: &str,
     client: &kube::Client,
-) -> Vec<AttachedRoute<'a>> {
+) -> Vec<AttachedRoute<'route>> {
     let all_namespaces = fetch_all_namespaces(client).await;
 
     attached

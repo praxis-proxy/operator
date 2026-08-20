@@ -67,7 +67,7 @@ pub fn build_service(
 #[cfg(test)]
 #[expect(clippy::too_many_lines, clippy::default_trait_access, reason = "tests")]
 mod tests {
-    use k8s_openapi::apimachinery::pkg::{apis::meta::v1::ObjectMeta, util::intstr::IntOrString};
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
     use super::{super::labels::GATEWAY_NAME_LABEL, *};
 

@@ -23,8 +23,9 @@ pub(super) async fn current_deployment_hash(client: &kube::Client, ns: &str, chi
         .get(child)
         .await
         .ok()
-        .and_then(|d| {
-            d.spec?
+        .and_then(|deploy| {
+            deploy
+                .spec?
                 .template
                 .metadata?
                 .annotations?
@@ -40,11 +41,11 @@ pub(super) async fn current_deployment_hash(client: &kube::Client, ns: &str, chi
 /// `ReplicaSet` has all desired pods ready. This is immune to
 /// stale-status races in back-to-back reconciliations.
 pub(super) async fn is_deployment_rolled_out(client: &kube::Client, ns: &str, child: &str) -> bool {
-    let Ok(d) = Api::<Deployment>::namespaced(client.clone(), ns).get(child).await else {
+    let Ok(deploy) = Api::<Deployment>::namespaced(client.clone(), ns).get(child).await else {
         return false;
     };
-    let generation = d.metadata.generation.unwrap_or(0);
-    let Some(status) = d.status.as_ref() else {
+    let generation = deploy.metadata.generation.unwrap_or(0);
+    let Some(status) = deploy.status.as_ref() else {
         return false;
     };
     if status.observed_generation.unwrap_or(0) < generation {
@@ -59,8 +60,8 @@ fn is_new_rs_available(status: &DeploymentStatus) -> bool {
     status
         .conditions
         .as_ref()
-        .and_then(|c| c.iter().find(|c| c.type_ == "Progressing"))
-        .is_some_and(|c| c.status == "True" && c.reason.as_deref() == Some("NewReplicaSetAvailable"))
+        .and_then(|conditions| conditions.iter().find(|cond| cond.type_ == "Progressing"))
+        .is_some_and(|cond| cond.status == "True" && cond.reason.as_deref() == Some("NewReplicaSetAvailable"))
 }
 
 // -----------------------------------------------------------------------------

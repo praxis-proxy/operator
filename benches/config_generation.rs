@@ -58,14 +58,14 @@ const ENDPOINTS_PER_SERVICE: usize = 3;
 // -----------------------------------------------------------------------------
 
 /// Measures the full route-to-YAML pipeline across growing route sets.
-fn bench_config_generation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("config_generation");
+fn bench_config_generation(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("config_generation");
     let listeners = listener_manifests();
 
     for count in ROUTE_COUNTS {
-        group.bench_function(format!("{count}_routes"), |b| {
+        group.bench_function(format!("{count}_routes"), |bencher| {
             let routes = route_manifests(count);
-            b.iter(|| black_box(generate_config(&listeners, &routes)));
+            bencher.iter(|| black_box(generate_config(&listeners, &routes)));
         });
     }
 
@@ -77,14 +77,14 @@ fn bench_config_generation(c: &mut Criterion) {
 /// Split out because it scales with the cluster-wide route count rather
 /// than with the routes that actually attach: a Gateway with no routes
 /// of its own still walks the whole list.
-fn bench_attachment(c: &mut Criterion) {
-    let mut group = c.benchmark_group("route_attachment");
+fn bench_attachment(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("route_attachment");
 
     for count in ROUTE_COUNTS {
-        group.bench_function(format!("{count}_routes"), |b| {
+        group.bench_function(format!("{count}_routes"), |bencher| {
             let routes = route_manifests(count);
             let listeners = listener_manifests();
-            b.iter(|| black_box(attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, &listeners, &routes).len()));
+            bencher.iter(|| black_box(attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, &listeners, &routes).len()));
         });
     }
 
@@ -102,12 +102,14 @@ criterion_main!(benches);
 /// serialized length, which keeps the optimizer from eliding the work.
 fn generate_config(listeners: &[GatewayListeners], routes: &[Arc<HTTPRoute>]) -> usize {
     let attached = attached_routes(GATEWAY_NAME, GATEWAY_NAMESPACE, listeners, routes);
-    let listener_hostnames: HashMap<String, Option<String>> =
-        listeners.iter().map(|l| (l.name.clone(), l.hostname.clone())).collect();
+    let listener_hostnames: HashMap<String, Option<String>> = listeners
+        .iter()
+        .map(|ls| (ls.name.clone(), ls.hostname.clone()))
+        .collect();
 
     let praxis_listeners: Vec<_> = listeners
         .iter()
-        .map(|l| convert_listener(l, &format!("{}-chain", l.name)))
+        .map(|ls| convert_listener(ls, &format!("{}-chain", ls.name)))
         .collect();
 
     let (praxis_routes, backend_refs) = convert_routes(&attached, &listener_hostnames, &[]);
@@ -132,7 +134,7 @@ fn synthesize_clusters(backend_refs: &[BackendRef]) -> Vec<PraxisCluster> {
         .iter()
         .map(|backend| {
             let endpoints = (0..ENDPOINTS_PER_SERVICE)
-                .map(|i| format!("10.0.{i}.1:{}", backend.port))
+                .map(|idx| format!("10.0.{idx}.1:{}", backend.port))
                 .collect();
             build_cluster(&backend.cluster_name, endpoints, None)
         })

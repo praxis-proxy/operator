@@ -142,49 +142,56 @@ fn reject_rule(rule: &HttpRouteRules) -> Option<RuleRejection> {
 }
 
 /// Returns the reason a match cannot be honoured, if any.
-fn reject_match(m: &HttpRouteRulesMatches) -> Option<RuleRejection> {
-    if has_regex_path(m) {
+fn reject_match(rule_match: &HttpRouteRulesMatches) -> Option<RuleRejection> {
+    if has_regex_path(rule_match) {
         return Some(RuleRejection::RegularExpression("path"));
     }
-    if has_regex_header(m) {
+    if has_regex_header(rule_match) {
         return Some(RuleRejection::RegularExpression("header"));
     }
-    if has_regex_query_param(m) {
+    if has_regex_query_param(rule_match) {
         return Some(RuleRejection::RegularExpression("query parameter"));
     }
-    if m.method.is_some() {
+    if rule_match.method.is_some() {
         return Some(RuleRejection::UnsupportedMatchField("method"));
     }
-    if m.query_params.as_deref().is_some_and(|q| !q.is_empty()) {
+    if rule_match
+        .query_params
+        .as_deref()
+        .is_some_and(|query| !query.is_empty())
+    {
         return Some(RuleRejection::UnsupportedMatchField("query parameter"));
     }
     None
 }
 
 /// Returns `true` when the match uses a regular-expression path.
-fn has_regex_path(m: &HttpRouteRulesMatches) -> bool {
-    m.path
+fn has_regex_path(rule_match: &HttpRouteRulesMatches) -> bool {
+    rule_match
+        .path
         .as_ref()
-        .and_then(|p| p.r#type.as_ref())
-        .is_some_and(|t| *t == HttpRouteRulesMatchesPathType::RegularExpression)
+        .and_then(|path| path.r#type.as_ref())
+        .is_some_and(|match_type| *match_type == HttpRouteRulesMatchesPathType::RegularExpression)
 }
 
 /// Returns `true` when any header match uses a regular expression.
-fn has_regex_header(m: &HttpRouteRulesMatches) -> bool {
-    m.headers.as_deref().unwrap_or(&[]).iter().any(|h| {
-        h.r#type
+fn has_regex_header(rule_match: &HttpRouteRulesMatches) -> bool {
+    rule_match.headers.as_deref().unwrap_or(&[]).iter().any(|header| {
+        header
+            .r#type
             .as_ref()
-            .is_some_and(|t| *t == HttpRouteRulesMatchesHeadersType::RegularExpression)
+            .is_some_and(|match_type| *match_type == HttpRouteRulesMatchesHeadersType::RegularExpression)
     })
 }
 
 /// Returns `true` when any query-parameter match uses a regular
 /// expression.
-fn has_regex_query_param(m: &HttpRouteRulesMatches) -> bool {
-    m.query_params.as_deref().unwrap_or(&[]).iter().any(|q| {
-        q.r#type
+fn has_regex_query_param(rule_match: &HttpRouteRulesMatches) -> bool {
+    rule_match.query_params.as_deref().unwrap_or(&[]).iter().any(|query| {
+        query
+            .r#type
             .as_ref()
-            .is_some_and(|t| *t == HttpRouteRulesMatchesQueryParamsType::RegularExpression)
+            .is_some_and(|match_type| *match_type == HttpRouteRulesMatchesQueryParamsType::RegularExpression)
     })
 }
 
@@ -194,8 +201,8 @@ fn reject_filters(rule: &HttpRouteRules) -> Option<RuleRejection> {
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .find(|f| !is_supported_filter(&f.r#type))
-        .map(|f| RuleRejection::UnsupportedFilter(format!("{:?}", f.r#type)))
+        .find(|filter| !is_supported_filter(&filter.r#type))
+        .map(|filter| RuleRejection::UnsupportedFilter(format!("{:?}", filter.r#type)))
 }
 
 /// Returns `true` for filter types the config generator implements.
@@ -220,8 +227,8 @@ fn reject_rewrites(rule: &HttpRouteRules) -> Option<RuleRejection> {
         rule.matches
             .as_deref()
             .and_then(<[_]>::first)
-            .and_then(|m| m.path.as_ref())
-            .and_then(|p| p.r#type.as_ref()),
+            .and_then(|rule_match| rule_match.path.as_ref())
+            .and_then(|path| path.r#type.as_ref()),
         Some(HttpRouteRulesMatchesPathType::PathPrefix)
     );
     if prefixed {
@@ -232,12 +239,12 @@ fn reject_rewrites(rule: &HttpRouteRules) -> Option<RuleRejection> {
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter_map(|f| f.url_rewrite.as_ref())
+        .filter_map(|filter| filter.url_rewrite.as_ref())
         .find(|rewrite| {
             rewrite
                 .path
                 .as_ref()
-                .is_some_and(|p| p.r#type == HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch)
+                .is_some_and(|path| path.r#type == HttpRouteRulesFiltersUrlRewritePathType::ReplacePrefixMatch)
         })
         .map(|_| RuleRejection::PrefixRewriteWithoutPrefixMatch)
 }
@@ -338,7 +345,7 @@ mod tests {
             "RequestMirror is not implemented and must be rejected rather than ignored"
         );
         assert!(
-            validation.message().is_some_and(|m| m.contains("not supported")),
+            validation.message().is_some_and(|msg| msg.contains("not supported")),
             "the rejection message should name the unsupported construct"
         );
     }
@@ -394,7 +401,7 @@ mod tests {
              nothing to replace — the Gateway API requires refusing the rule, not guessing"
         );
         assert!(
-            validation.message().is_some_and(|m| m.contains("PathPrefix")),
+            validation.message().is_some_and(|msg| msg.contains("PathPrefix")),
             "the message should say what the rule is missing"
         );
     }
@@ -489,7 +496,7 @@ mod tests {
         assert!(
             validate_route(&route)
                 .message()
-                .is_some_and(|m| m.starts_with("rule 1:")),
+                .is_some_and(|msg| msg.starts_with("rule 1:")),
             "the message should identify which rule was rejected"
         );
     }

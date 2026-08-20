@@ -75,8 +75,8 @@ pub(super) async fn build_praxis_config(
     let conflicts = listener_conflict::detect_conflicts(listeners);
     let supported: Vec<_> = listeners
         .iter()
-        .filter(|l| ListenerProtocol::is_supported(&l.protocol))
-        .filter(|l| !conflicts.contains_key(&l.name))
+        .filter(|listener| ListenerProtocol::is_supported(&listener.protocol))
+        .filter(|listener| !conflicts.contains_key(&listener.name))
         .collect();
 
     let listener_hostnames = build_listener_hostname_map(&supported);
@@ -103,8 +103,8 @@ pub(super) async fn build_praxis_config(
 /// listener, combining TLS certificates from all listeners in the group.
 fn merge_listeners_by_port(supported: &[&GatewayListeners]) -> Vec<PraxisListener> {
     let mut by_port: BTreeMap<i32, Vec<&GatewayListeners>> = BTreeMap::new();
-    for l in supported {
-        by_port.entry(l.port).or_default().push(l);
+    for listener in supported {
+        by_port.entry(listener.port).or_default().push(listener);
     }
 
     by_port
@@ -113,7 +113,7 @@ fn merge_listeners_by_port(supported: &[&GatewayListeners]) -> Vec<PraxisListene
             let first = group.first()?;
             let chain_name = format!("{}-chain", first.name);
             let mut listener = convert_listener(first, &chain_name);
-            listener.merged_section_names = group.iter().map(|l| l.name.clone()).collect();
+            listener.merged_section_names = group.iter().map(|gl| gl.name.clone()).collect();
             merge_tls_certs(&mut listener, &group);
             Some(listener)
         })
@@ -128,11 +128,11 @@ fn merge_tls_certs(listener: &mut PraxisListener, group: &[&GatewayListeners]) {
     let mut all_certs: Vec<PraxisCertificate> = listener
         .tls
         .as_ref()
-        .map(|t| t.certificates.clone())
+        .map(|tls| tls.certificates.clone())
         .unwrap_or_default();
 
-    for l in group.iter().skip(1) {
-        collect_listener_certs(l, &mut all_certs);
+    for group_listener in group.iter().skip(1) {
+        collect_listener_certs(group_listener, &mut all_certs);
     }
 
     if !all_certs.is_empty() {
@@ -143,12 +143,12 @@ fn merge_tls_certs(listener: &mut PraxisListener, group: &[&GatewayListeners]) {
 }
 
 /// Collects TLS certificates from a single listener into the cert list.
-fn collect_listener_certs(l: &GatewayListeners, certs: &mut Vec<PraxisCertificate>) {
-    let Some(tls) = &l.tls else { return };
+fn collect_listener_certs(listener: &GatewayListeners, certs: &mut Vec<PraxisCertificate>) {
+    let Some(tls) = &listener.tls else { return };
     let Some(refs) = &tls.certificate_refs else { return };
     for cert_ref in refs {
-        let (server_names, default) = match &l.hostname {
-            Some(h) => (Some(vec![h.clone()]), None),
+        let (server_names, default) = match &listener.hostname {
+            Some(hostname) => (Some(vec![hostname.clone()]), None),
             None => (None, Some(true)),
         };
         certs.push(PraxisCertificate {
@@ -162,7 +162,10 @@ fn collect_listener_certs(l: &GatewayListeners, certs: &mut Vec<PraxisCertificat
 
 /// Builds a map from listener section name to its hostname constraint.
 fn build_listener_hostname_map(listeners: &[&GatewayListeners]) -> HashMap<String, Option<String>> {
-    listeners.iter().map(|l| (l.name.clone(), l.hostname.clone())).collect()
+    listeners
+        .iter()
+        .map(|listener| (listener.name.clone(), listener.hostname.clone()))
+        .collect()
 }
 
 /// Converts attached routes to Praxis routes and collects backend refs.
@@ -261,8 +264,8 @@ fn collect_tls_secret_names(listeners: &[&GatewayListeners]) -> Vec<String> {
     let mut seen = HashSet::new();
     listeners
         .iter()
-        .filter(|l| ListenerProtocol::terminates_tls(&l.protocol))
-        .filter_map(|l| l.tls.as_ref())
+        .filter(|listener| ListenerProtocol::terminates_tls(&listener.protocol))
+        .filter_map(|listener| listener.tls.as_ref())
         .flat_map(|tls| tls.certificate_refs.as_deref().unwrap_or(&[]))
         .filter(|cert_ref| seen.insert(cert_ref.name.clone()))
         .map(|cert_ref| cert_ref.name.clone())
@@ -274,8 +277,8 @@ fn collect_listener_ports(listeners: &[&GatewayListeners]) -> Vec<(String, i32)>
     let mut seen = HashSet::new();
     listeners
         .iter()
-        .filter(|l| seen.insert(l.port))
-        .map(|l| (l.name.clone(), l.port))
+        .filter(|listener| seen.insert(listener.port))
+        .map(|listener| (listener.name.clone(), listener.port))
         .collect()
 }
 

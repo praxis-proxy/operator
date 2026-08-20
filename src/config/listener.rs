@@ -116,7 +116,7 @@ fn build_tls_config(listener: &GatewayListeners) -> Option<PraxisTls> {
             .as_ref()
             .map(|refs| {
                 refs.iter()
-                    .map(|cert_ref| build_certificate(cert_ref, &listener.hostname))
+                    .map(|cert_ref| build_certificate(cert_ref, listener.hostname.as_ref()))
                     .collect()
             })
             .unwrap_or_default();
@@ -128,11 +128,11 @@ fn build_tls_config(listener: &GatewayListeners) -> Option<PraxisTls> {
 /// Builds a single certificate entry with SNI routing metadata.
 fn build_certificate(
     cert_ref: &gateway_api::gateways::GatewayListenersTlsCertificateRefs,
-    listener_hostname: &Option<String>,
+    listener_hostname: Option<&String>,
 ) -> PraxisCertificate {
     let secret_name = cert_ref.name.as_str();
     let (server_names, default) = match listener_hostname {
-        Some(h) => (Some(vec![h.clone()]), None),
+        Some(hostname) => (Some(vec![hostname.clone()]), None),
         None => (None, Some(true)),
     };
     PraxisCertificate {

@@ -1,5 +1,6 @@
-.PHONY: all build release check test lint fmt doc audit clean
-.PHONY: coverage-check
+.PHONY: all build release check test lint lint-extra fmt doc audit clean
+.PHONY: mutants semver coverage-check
+.PHONY: check-prereqs-extra
 .PHONY: require-container-engine images container praxis-image
 .PHONY: kind-up kind-down kind-reset conformance smoke-test
 .PHONY: dev-env dev-conformance dev-cycle dev-integration dev-push
@@ -12,7 +13,11 @@
 
 CONTAINER_ENGINE  ?= $(shell command -v podman 2>/dev/null \
                      || command -v docker 2>/dev/null)
+NIGHTLY           ?= nightly
 V                 ?=
+
+# Tools verified by check-prereqs-extra before lint-extra runs.
+LINT_EXTRA_CMDS   := typos taplo shellcheck actionlint
 KIND_CLUSTER_NAME ?= praxis-conformance
 PRAXIS_DIR        ?= $(shell cd "$(CURDIR)/../praxis" 2>/dev/null && pwd)
 PRAXIS_IMAGE      ?= praxis:dev
@@ -27,7 +32,7 @@ endif
 # Build
 # ---------------------------------------------------------------------------
 
-all: build fmt lint test audit
+all: build fmt lint lint-extra test audit
 
 build:
 	cargo build
@@ -44,10 +49,24 @@ check:
 
 lint:
 	cargo clippy --all-targets -- -D warnings
-	cargo +nightly fmt --all -- --check
+	cargo +$(NIGHTLY) fmt --all -- --check
+
+lint-extra: check-prereqs-extra
+	typos
+	taplo fmt --check
+	shellcheck .hooks/pre-commit
+	actionlint
+
+check-prereqs-extra:
+	@for cmd in $(LINT_EXTRA_CMDS); do \
+		command -v "$$cmd" >/dev/null 2>&1 || { \
+			echo "\"$$cmd\" is not installed - install it before running make" >&2; \
+			exit 1; \
+		}; \
+	done
 
 fmt:
-	cargo +nightly fmt --all
+	cargo +$(NIGHTLY) fmt --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
@@ -55,6 +74,12 @@ doc:
 audit:
 	cargo audit
 	cargo deny check
+
+mutants:
+	cargo mutants --workspace
+
+semver:
+	cargo semver-checks
 
 clean:
 	cargo clean
@@ -166,6 +191,7 @@ run:
 # ---------------------------------------------------------------------------
 
 setup-hooks:
+	@mkdir -p .git/hooks
 	@ln -sf ../../.hooks/pre-commit .git/hooks/pre-commit
 	@echo "Git hooks installed"
 
@@ -183,7 +209,7 @@ help:
 	@echo "  OPERATOR_IMAGE     operator container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all                build + lint + test + audit"
+	@echo "  all                build + lint + lint-extra + test + audit"
 	@echo ""
 	@echo "Build:"
 	@echo "  build              cargo build"
@@ -197,10 +223,13 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint               clippy + nightly rustfmt check"
+	@echo "  lint-extra         typos + taplo + shellcheck + actionlint"
 	@echo "  fmt                format with nightly rustfmt"
 	@echo "  doc                build docs with warnings denied"
 	@echo "  audit              cargo audit + cargo deny"
-	@echo "  coverage-check     fail if line coverage < 80%%"
+	@echo "  mutants            mutation testing (cargo-mutants)"
+	@echo "  semver             cargo semver-checks"
+	@echo "  coverage-check     fail if line coverage < 95%%"
 	@echo ""
 	@echo "Container:"
 	@echo "  container          build operator container image"

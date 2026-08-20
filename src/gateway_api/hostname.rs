@@ -122,7 +122,10 @@ pub fn hostname_intersection(route_host: &str, listener_host: &str) -> Option<St
 /// assert_eq!(intersect_hostnames(&routes, &[None]), routes.to_vec());
 /// ```
 pub fn intersect_hostnames(route_hostnames: &[String], listener_hostnames: &[Option<String>]) -> Vec<String> {
-    let constrained: Vec<_> = listener_hostnames.iter().filter_map(|h| h.as_deref()).collect();
+    let constrained: Vec<_> = listener_hostnames
+        .iter()
+        .filter_map(|hostname| hostname.as_deref())
+        .collect();
     if constrained.is_empty() || constrained.len() < listener_hostnames.len() {
         return route_hostnames.to_vec();
     }

@@ -203,7 +203,7 @@ fn parent_ref_selects_a_listener(gw: &Gateway, parent_ref: &HttpRouteParentRefs)
     gw.spec
         .listeners
         .iter()
-        .any(|l| listener_matches_parent_ref(l, parent_ref))
+        .any(|listener| listener_matches_parent_ref(listener, parent_ref))
 }
 
 /// Returns `true` when the route's namespace is allowed by listeners.
@@ -234,9 +234,12 @@ fn route_allowed_by_listeners(
 }
 
 /// Returns listeners targeted by a section name (or all if `None`).
-fn targeted_listeners<'a>(listeners: &'a [GatewayListeners], section_name: Option<&str>) -> Vec<&'a GatewayListeners> {
+fn targeted_listeners<'listen>(
+    listeners: &'listen [GatewayListeners],
+    section_name: Option<&str>,
+) -> Vec<&'listen GatewayListeners> {
     match section_name {
-        Some(name) => listeners.iter().filter(|l| l.name == name).collect(),
+        Some(name) => listeners.iter().filter(|ls| ls.name == name).collect(),
         None => listeners.iter().collect(),
     }
 }

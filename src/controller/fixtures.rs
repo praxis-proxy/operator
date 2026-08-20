@@ -141,7 +141,7 @@ pub(super) fn expression(
 /// unsupported `RegularExpression` path match.
 pub(super) fn regex_route(rules: usize) -> HTTPRoute {
     use gateway_api::httproutes::{
-        HttpRouteRules, HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType, HttpRouteSpec,
+        HttpRouteRules, HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
     };
 
     let built = (0..rules)

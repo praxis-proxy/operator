@@ -58,16 +58,16 @@ pub async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Action> {
     finalizer::finalizer(&api, GATEWAY_FINALIZER, gw, |event| {
         Box::pin(async {
             match event {
-                FinalizerEvent::Apply(gw) => Box::pin(apply(gw, &ctx)).await,
-                FinalizerEvent::Cleanup(gw) => {
-                    cleanup(&gw, &ctx).await;
+                FinalizerEvent::Apply(gateway) => Box::pin(apply(gateway, &ctx)).await,
+                FinalizerEvent::Cleanup(gateway) => {
+                    cleanup(&gateway, &ctx).await;
                     Ok(Action::await_change())
                 },
             }
         })
     })
     .await
-    .map_err(|e| OperatorError::Finalizer(Box::new(e)))
+    .map_err(|err| OperatorError::Finalizer(Box::new(err)))
 }
 
 /// Error policy for Gateway reconciliation failures.
@@ -77,7 +77,12 @@ pub async fn reconcile(gw: Arc<Gateway>, ctx: Arc<Context>) -> Result<Action> {
 pub fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>) -> Action {
     let delay = match error {
         OperatorError::Kube(_) | OperatorError::Finalizer(_) => Duration::from_secs(15),
-        _ => Duration::from_secs(30),
+        OperatorError::MissingObjectKey(_)
+        | OperatorError::GatewayClassNotFound(_)
+        | OperatorError::LeadershipLost
+        | OperatorError::CacheSync(_)
+        | OperatorError::Serialization(_)
+        | OperatorError::YamlSerialization(_) => Duration::from_secs(30),
     };
     error!(
         %error, "Gateway reconciliation failed, retrying in {delay:?}"
@@ -133,7 +138,7 @@ async fn apply_config_if_supported(
         .spec
         .listeners
         .iter()
-        .any(|l| ListenerProtocol::is_supported(&l.protocol));
+        .any(|listener| ListenerProtocol::is_supported(&listener.protocol));
     if !has_supported {
         return Ok(false);
     }
@@ -201,8 +206,8 @@ async fn publish_rejection(ctx: &Context, gw: &Gateway, reason: &str, message: &
         type_: EventType::Warning,
     };
 
-    if let Err(e) = ctx.recorder.publish(&event, &gw.object_ref(&())).await {
-        debug!(%e, "could not publish rejection event");
+    if let Err(err) = ctx.recorder.publish(&event, &gw.object_ref(&())).await {
+        debug!(%err, "could not publish rejection event");
     }
 }
 
@@ -272,8 +277,8 @@ async fn clear_route_parent_statuses(ctx: &Context, gw_name: &str, gw_ns: &str) 
     let client = &ctx.client;
 
     for route in &ctx.stores.routes() {
-        if let Err(e) = route_status::clear_parent_statuses(client, route, gw_name, gw_ns).await {
-            tracing::warn!(%e, route = route.name_any(), "could not clear parent status");
+        if let Err(err) = route_status::clear_parent_statuses(client, route, gw_name, gw_ns).await {
+            tracing::warn!(%err, route = route.name_any(), "could not clear parent status");
         }
     }
 }
@@ -418,7 +423,7 @@ fn find_gateway_parent_ref(
 mod tests {
     use gateway_api::{
         gateways::GatewayAddresses,
-        httproutes::{HTTPRoute, HttpRouteParentRefs, HttpRouteSpec},
+        httproutes::{HttpRouteParentRefs, HttpRouteSpec},
         referencegrants::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo},
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

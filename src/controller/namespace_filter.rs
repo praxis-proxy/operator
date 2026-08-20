@@ -33,12 +33,12 @@ use crate::{
 ///
 /// A route is retained if at least one listener it targets allows its
 /// namespace. The default policy (when unspecified) is `Same`.
-pub(super) fn filter_routes_by_allowed_namespaces<'a>(
-    attached: &[AttachedRoute<'a>],
+pub(super) fn filter_routes_by_allowed_namespaces<'route>(
+    attached: &[AttachedRoute<'route>],
     listeners: &[GatewayListeners],
     gateway_ns: &str,
     stores: &Stores,
-) -> Vec<AttachedRoute<'a>> {
+) -> Vec<AttachedRoute<'route>> {
     let all_namespaces = Some(stores.namespaces());
 
     attached
@@ -67,7 +67,7 @@ fn route_allowed_by_any_listener(
     let route_ns = route_status::route_namespace(route);
     section_names.iter().any(|section| {
         let matching: Vec<&GatewayListeners> = match section {
-            Some(name) => listeners.iter().filter(|l| l.name == *name).collect(),
+            Some(name) => listeners.iter().filter(|ls| ls.name == *name).collect(),
             None => listeners.iter().collect(),
         };
         matching
@@ -137,7 +137,7 @@ fn matches_label_selector(ns_obj: &Namespace, selector: &GatewayListenersAllowed
         };
         if !match_labels
             .iter()
-            .all(|(k, v)| labels.get(k).is_some_and(|lv| lv == v))
+            .all(|(key, val)| labels.get(key).is_some_and(|lv| lv == val))
         {
             return false;
         }
@@ -167,8 +167,8 @@ fn evaluate_match_expression(
     let label_val = labels.get(key).map(String::as_str);
 
     match op {
-        "In" => label_val.is_some_and(|v| values.iter().any(|ev| ev == v)),
-        "NotIn" => label_val.is_none_or(|v| !values.iter().any(|ev| ev == v)),
+        "In" => label_val.is_some_and(|val| values.iter().any(|ev| ev == val)),
+        "NotIn" => label_val.is_none_or(|val| !values.iter().any(|ev| ev == val)),
         "Exists" => has_key,
         "DoesNotExist" => !has_key,
         _ => false,

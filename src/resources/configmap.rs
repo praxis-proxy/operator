@@ -52,8 +52,6 @@ pub fn build_configmap(
 #[cfg(test)]
 #[expect(clippy::too_many_lines, clippy::default_trait_access, reason = "tests")]
 mod tests {
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-
     use super::*;
 
     #[test]

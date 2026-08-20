@@ -20,9 +20,9 @@ use gateway_api::{
 /// carries one entry per matching `parentRef`. A `None` entry means that
 /// ref named no `sectionName` and therefore targets every listener.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AttachedRoute<'a> {
+pub struct AttachedRoute<'route> {
     /// The route itself.
-    pub route: &'a HTTPRoute,
+    pub route: &'route HTTPRoute,
 
     /// Listener section names this route targets.
     pub section_names: Vec<Option<String>>,
@@ -98,12 +98,12 @@ fn targeted_sections(parent: &HttpRouteParentRefs, listeners: &[GatewayListeners
 /// Each entry pairs a route with the listener section names its
 /// `parentRefs` resolve to. A `None` section name means the route
 /// attaches to all listeners.
-pub fn attached_routes<'a>(
+pub fn attached_routes<'route>(
     gateway_name: &str,
     gateway_ns: &str,
     listeners: &[GatewayListeners],
-    routes: &'a [Arc<HTTPRoute>],
-) -> Vec<AttachedRoute<'a>> {
+    routes: &'route [Arc<HTTPRoute>],
+) -> Vec<AttachedRoute<'route>> {
     let mut result = Vec::new();
 
     for route in routes {

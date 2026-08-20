@@ -67,6 +67,7 @@ pub fn distribute_service_weights(service_data: &[ResolvedBackend]) -> (Vec<Stri
         }
 
         let count = endpoint_count(endpoints);
+        #[expect(clippy::arithmetic_side_effects, reason = "count >= 1 from endpoint_count")]
         let ep_weight = i64::from(*service_weight).saturating_mul(lcm_denominator) / count;
         for ep in endpoints {
             all_endpoints.push(ep.clone());
@@ -94,11 +95,14 @@ fn endpoint_count(endpoints: &[String]) -> i64 {
 
 /// Divides all positive weights by their GCD to minimise cycle length.
 fn reduce_weights_by_gcd(weights: &mut [i64]) {
-    let g = weights.iter().copied().filter(|w| *w > 0).fold(0, gcd);
-    if g > 1 {
-        for w in weights.iter_mut() {
-            if *w > 0 {
-                *w /= g;
+    let divisor = weights.iter().copied().filter(|wt| *wt > 0).fold(0, gcd);
+    if divisor > 1 {
+        for wt in weights.iter_mut() {
+            if *wt > 0 {
+                #[expect(clippy::arithmetic_side_effects, reason = "divisor > 1 and wt > 0")]
+                {
+                    *wt /= divisor;
+                }
             }
         }
     }
@@ -112,34 +116,39 @@ fn scale_weights_into_range(weights: &[i64]) -> Vec<i32> {
     let largest = weights.iter().copied().max().unwrap_or(0);
     let divisor = (largest.saturating_add(MAX_ENDPOINT_WEIGHT - 1) / MAX_ENDPOINT_WEIGHT).max(1);
 
-    weights.iter().map(|w| scale_weight(*w, divisor)).collect()
+    weights.iter().map(|wt| scale_weight(*wt, divisor)).collect()
 }
 
 /// Scales a single weight into `i32` range.
 fn scale_weight(weight: i64, divisor: i64) -> i32 {
+    #[expect(clippy::arithmetic_side_effects, reason = "divisor >= 1 from caller")]
     let scaled = weight / divisor;
     let floored = if weight > 0 { scaled.max(1) } else { scaled };
     i32::try_from(floored).unwrap_or(i32::MAX)
 }
 
 /// Greatest common divisor (Euclidean algorithm).
-fn gcd(mut a: i64, mut b: i64) -> i64 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
+fn gcd(mut lhs: i64, mut rhs: i64) -> i64 {
+    while rhs != 0 {
+        let temp = rhs;
+        #[expect(clippy::arithmetic_side_effects, reason = "Euclidean algorithm, rhs != 0")]
+        {
+            rhs = lhs % rhs;
+        }
+        lhs = temp;
     }
-    a.saturating_abs()
+    lhs.saturating_abs()
 }
 
 /// Least common multiple, capped at [`MAX_LCM_DENOMINATOR`].
-fn lcm(a: i64, b: i64) -> i64 {
-    if a == 0 || b == 0 {
+fn lcm(lhs: i64, rhs: i64) -> i64 {
+    if lhs == 0 || rhs == 0 {
         return 0;
     }
 
-    (a / gcd(a, b))
-        .checked_mul(b)
+    #[expect(clippy::arithmetic_side_effects, reason = "gcd(lhs,rhs) >= 1 when both non-zero")]
+    (lhs / gcd(lhs, rhs))
+        .checked_mul(rhs)
         .map_or(MAX_LCM_DENOMINATOR, i64::saturating_abs)
         .min(MAX_LCM_DENOMINATOR)
 }
@@ -257,7 +266,7 @@ mod tests {
         assert_eq!(eps.len(), 48, "every pod of every backend should be emitted");
         assert_eq!(weights.len(), 48, "each endpoint needs a weight");
         assert!(
-            weights.iter().all(|w| *w > 0),
+            weights.iter().all(|wt| *wt > 0),
             "coprime pod counts at the maximum Gateway API weight must not zero out or abort"
         );
     }
@@ -272,7 +281,7 @@ mod tests {
         let (_, weights) = distribute_service_weights(&data);
 
         assert!(
-            weights.iter().all(|w| *w > 0),
+            weights.iter().all(|wt| *wt > 0),
             "extreme weights must stay representable instead of overflowing"
         );
     }
@@ -307,7 +316,7 @@ mod tests {
 
         assert_eq!(scaled.len(), 2, "every weight should be scaled");
         assert!(
-            scaled.iter().all(|w| *w > 0),
+            scaled.iter().all(|wt| *wt > 0),
             "scaling must keep every endpoint in the rotation"
         );
     }
@@ -340,6 +349,6 @@ mod tests {
 
     /// Builds an owned endpoint address list.
     fn endpoints(addrs: &[&str]) -> Vec<String> {
-        addrs.iter().map(|a| (*a).to_owned()).collect()
+        addrs.iter().map(|addr| (*addr).to_owned()).collect()
     }
 }

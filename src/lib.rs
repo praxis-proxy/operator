@@ -8,6 +8,20 @@
 //! benchmarked; `main` is a thin shim over [`run`].
 
 #![deny(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::min_ident_chars,
+        clippy::panic,
+        clippy::redundant_test_prefix,
+        clippy::shadow_unrelated,
+        clippy::unwrap_used,
+        reason = "test comfort lints, migration from allow-in-tests tracked separately"
+    )
+)]
 
 pub mod config;
 pub mod context;
@@ -23,7 +37,7 @@ pub mod stores;
 #[cfg(test)]
 mod testing;
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use ::gateway_api::{
     gatewayclasses::GatewayClass, gateways::Gateway, httproutes::HTTPRoute, referencegrants::ReferenceGrant,
@@ -152,9 +166,9 @@ fn build_gc_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
                     observability::metrics::global().record_reconcile(observability::metrics::Controller::GatewayClass);
                     info!("reconciled GatewayClass {obj}");
                 },
-                Err(e) => {
+                Err(err) => {
                     observability::metrics::global().record_error(observability::metrics::Controller::GatewayClass);
-                    tracing::warn!("GatewayClass reconcile error: {e:?}");
+                    tracing::warn!("GatewayClass reconcile error: {err:?}");
                 },
             }
         })
@@ -179,9 +193,9 @@ fn build_gw_controller(client: &Client, ctx: Arc<context::Context>) -> impl Futu
                     observability::metrics::global().record_reconcile(observability::metrics::Controller::Gateway);
                     info!("reconciled Gateway {obj}");
                 },
-                Err(e) => {
+                Err(err) => {
                     observability::metrics::global().record_error(observability::metrics::Controller::Gateway);
-                    tracing::warn!("Gateway reconcile error: {e:?}");
+                    tracing::warn!("Gateway reconcile error: {err:?}");
                 },
             }
         })
@@ -236,9 +250,9 @@ fn build_route_controller(client: &Client, ctx: Arc<context::Context>) -> impl F
                     observability::metrics::global().record_reconcile(observability::metrics::Controller::HttpRoute);
                     info!("reconciled HTTPRoute {obj}");
                 },
-                Err(e) => {
+                Err(err) => {
                     observability::metrics::global().record_error(observability::metrics::Controller::HttpRoute);
-                    tracing::warn!("HTTPRoute reconcile error: {e:?}");
+                    tracing::warn!("HTTPRoute reconcile error: {err:?}");
                 },
             }
         })

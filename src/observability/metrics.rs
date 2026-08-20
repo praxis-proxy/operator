@@ -175,23 +175,23 @@ impl fmt::Display for Metrics {
 // -----------------------------------------------------------------------------
 
 /// Writes one counter family labelled by controller.
-fn write_counter(f: &mut fmt::Formatter<'_>, name: &str, help: &str, counters: &[AtomicU64; 3]) -> fmt::Result {
-    writeln!(f, "# HELP {name} {help}")?;
-    writeln!(f, "# TYPE {name} counter")?;
+fn write_counter(fmt: &mut fmt::Formatter<'_>, name: &str, help: &str, counters: &[AtomicU64; 3]) -> fmt::Result {
+    writeln!(fmt, "# HELP {name} {help}")?;
+    writeln!(fmt, "# TYPE {name} counter")?;
 
     for (index, controller) in CONTROLLER_NAMES.iter().enumerate() {
-        let value = counters.get(index).map_or(0, |c| c.load(Ordering::Relaxed));
-        writeln!(f, "{name}{{controller=\"{controller}\"}} {value}")?;
+        let value = counters.get(index).map_or(0, |ctr| ctr.load(Ordering::Relaxed));
+        writeln!(fmt, "{name}{{controller=\"{controller}\"}} {value}")?;
     }
 
     Ok(())
 }
 
 /// Writes one unlabelled counter.
-fn write_scalar(f: &mut fmt::Formatter<'_>, name: &str, help: &str, value: u64) -> fmt::Result {
-    writeln!(f, "# HELP {name} {help}")?;
-    writeln!(f, "# TYPE {name} counter")?;
-    writeln!(f, "{name} {value}")
+fn write_scalar(fmt: &mut fmt::Formatter<'_>, name: &str, help: &str, value: u64) -> fmt::Result {
+    writeln!(fmt, "# HELP {name} {help}")?;
+    writeln!(fmt, "# TYPE {name} counter")?;
+    writeln!(fmt, "{name} {value}")
 }
 
 // -----------------------------------------------------------------------------

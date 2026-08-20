@@ -116,7 +116,7 @@ async fn resolve_lb_addresses(client: &kube::Client, ns: &str, child: &str) -> V
         .await
         .ok()
         .and_then(|svc| svc.status)
-        .and_then(|s| s.load_balancer)
+        .and_then(|svc_status| svc_status.load_balancer)
         .and_then(|lb| lb.ingress)
         .map(|ingress| {
             ingress
@@ -136,8 +136,8 @@ async fn is_deployment_ready(client: &kube::Client, ns: &str, child: &str) -> bo
         .get(child)
         .await
         .ok()
-        .and_then(|d| d.status)
-        .is_some_and(|s| s.ready_replicas.unwrap_or(0) > 0)
+        .and_then(|deploy| deploy.status)
+        .is_some_and(|deploy_status| deploy_status.ready_replicas.unwrap_or(0) > 0)
 }
 
 /// Builds per-listener status entries.
@@ -155,23 +155,23 @@ async fn build_listener_statuses(
     let mut any_accepted = false;
     let mut any_rejected = false;
 
-    for l in listeners {
-        if let Some(reason) = conflicts.get(&l.name) {
+    for listener in listeners {
+        if let Some(reason) = conflicts.get(&listener.name) {
             any_rejected = true;
-            statuses.push(conflicted_listener_status(l, generation, *reason));
+            statuses.push(conflicted_listener_status(listener, generation, *reason));
             continue;
         }
 
-        let protocol_supported = ListenerProtocol::is_supported(&l.protocol);
+        let protocol_supported = ListenerProtocol::is_supported(&listener.protocol);
         if !protocol_supported {
             any_rejected = true;
-            statuses.push(unsupported_listener_status(l, generation));
+            statuses.push(unsupported_listener_status(listener, generation));
             continue;
         }
 
         any_accepted = true;
-        let count = count_attached_routes(attached, l);
-        let status = accepted_listener_status(l, generation, gateway_ns, ctx, count).await;
+        let count = count_attached_routes(attached, listener);
+        let status = accepted_listener_status(listener, generation, gateway_ns, ctx, count).await;
         statuses.push(status);
     }
 
@@ -184,12 +184,12 @@ async fn build_listener_statuses(
 /// no routes: it never reaches the data plane, so claiming otherwise
 /// would misreport what is serving traffic.
 fn conflicted_listener_status(
-    l: &GatewayListeners,
+    listener: &GatewayListeners,
     generation: i64,
     reason: listener_conflict::ConflictReason,
 ) -> ListenerStatus {
     ListenerStatus {
-        name: l.name.clone(),
+        name: listener.name.clone(),
         attached_routes: 0,
         supported_kinds: vec![],
         conditions: vec![
@@ -201,9 +201,9 @@ fn conflicted_listener_status(
 }
 
 /// Builds a status entry for an unsupported-protocol listener.
-fn unsupported_listener_status(l: &GatewayListeners, generation: i64) -> ListenerStatus {
+fn unsupported_listener_status(listener: &GatewayListeners, generation: i64) -> ListenerStatus {
     ListenerStatus {
-        name: l.name.clone(),
+        name: listener.name.clone(),
         attached_routes: 0,
         supported_kinds: vec![],
         conditions: vec![
@@ -235,14 +235,14 @@ fn count_attached_routes(attached: &[AttachedRoute<'_>], listener: &GatewayListe
 
 /// Builds a status entry for an accepted listener.
 async fn accepted_listener_status(
-    l: &GatewayListeners,
+    listener: &GatewayListeners,
     generation: i64,
     gateway_ns: &str,
     ctx: &Context,
     count: usize,
 ) -> ListenerStatus {
     let (supported_kinds, resolved_refs_condition) =
-        listener_validation::listener_resolved_refs(l, generation, gateway_ns, ctx).await;
+        listener_validation::listener_resolved_refs(listener, generation, gateway_ns, ctx).await;
 
     let refs_resolved = resolved_refs_condition.status == "True";
     let programmed_condition = if refs_resolved {
@@ -252,7 +252,7 @@ async fn accepted_listener_status(
     };
 
     ListenerStatus {
-        name: l.name.clone(),
+        name: listener.name.clone(),
         attached_routes: count,
         supported_kinds,
         conditions: vec![
@@ -618,12 +618,12 @@ mod tests {
     }
 
     /// Returns the status of the named Gateway-level condition.
-    fn condition_status<'a>(status: &'a Value, kind: &str) -> Option<&'a str> {
+    fn condition_status<'status>(status: &'status Value, kind: &str) -> Option<&'status str> {
         status
             .pointer("/conditions")?
             .as_array()?
             .iter()
-            .find(|c| c["type"] == kind)?
+            .find(|cond| cond["type"] == kind)?
             .get("status")?
             .as_str()
     }

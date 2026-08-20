@@ -130,7 +130,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::{controller::fixtures::regex_route, gateway_api::route_validation, testing};
+    use crate::{controller::fixtures::regex_route, testing};
 
     #[test]
     fn test_validation_conditions_accepts_a_supported_route() {

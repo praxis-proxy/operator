@@ -90,8 +90,10 @@ pub fn detect_conflicts(listeners: &[GatewayListeners]) -> HashMap<String, Confl
 /// Groups listeners by the port they bind.
 ///
 /// Ordered so that conflict reporting is stable across reconciles.
-fn group_by_port_refs<'a>(listeners: &[&'a GatewayListeners]) -> BTreeMap<i32, Vec<&'a GatewayListeners>> {
-    let mut by_port: BTreeMap<i32, Vec<&'a GatewayListeners>> = BTreeMap::new();
+fn group_by_port_refs<'listen>(
+    listeners: &[&'listen GatewayListeners],
+) -> BTreeMap<i32, Vec<&'listen GatewayListeners>> {
+    let mut by_port: BTreeMap<i32, Vec<&'listen GatewayListeners>> = BTreeMap::new();
     for listener in listeners {
         by_port.entry(listener.port).or_default().push(listener);
     }
@@ -104,7 +106,7 @@ fn mark_protocol_conflicts(group: &[&GatewayListeners], conflicts: &mut HashMap<
         return;
     };
 
-    if group.iter().all(|l| l.protocol == first.protocol) {
+    if group.iter().all(|ls| ls.protocol == first.protocol) {
         return;
     }
 
@@ -147,7 +149,7 @@ fn hostname_key(listener: &GatewayListeners) -> String {
     listener
         .hostname
         .as_ref()
-        .map_or_else(|| "*".to_owned(), |h| h.to_ascii_lowercase())
+        .map_or_else(|| "*".to_owned(), |host| host.to_ascii_lowercase())
 }
 
 // -----------------------------------------------------------------------------

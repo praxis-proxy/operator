@@ -80,7 +80,7 @@ pub async fn resolve_endpoints(
     match resolve_via_endpoint_slices(client, namespace, service_name, &target).await {
         Ok(eps) if !eps.is_empty() => return Ok(eps),
         Ok(_) => {},
-        Err(e) => debug!("EndpointSlice lookup failed, falling back to Endpoints: {e}"),
+        Err(err) => debug!("EndpointSlice lookup failed, falling back to Endpoints: {err}"),
     }
 
     let Some(ep) = get_or_none::<Endpoints>(client, namespace, service_name, "endpoints").await? else {
@@ -154,11 +154,15 @@ fn resolve_slice_port(slice: &EndpointSlice, target: &TargetPort) -> i32 {
         .and_then(|ports| {
             ports
                 .iter()
-                .find(|p| target.matches_name(p.name.as_deref()))
-                .or_else(|| target.number.and_then(|n| ports.iter().find(|p| p.port == Some(n))))
+                .find(|port_entry| target.matches_name(port_entry.name.as_deref()))
+                .or_else(|| {
+                    target
+                        .number
+                        .and_then(|num| ports.iter().find(|port_entry| port_entry.port == Some(num)))
+                })
                 .or_else(|| ports.first())
         })
-        .and_then(|p| p.port)
+        .and_then(|port_entry| port_entry.port)
         .unwrap_or_else(|| target.fallback())
 }
 
@@ -175,20 +179,20 @@ where
 {
     let api = Api::<K>::namespaced(client.clone(), namespace);
     match api.get(name).await {
-        Ok(r) => Ok(Some(r)),
-        Err(e) => not_found_to_none(e, kind_label, namespace, name),
+        Ok(resource) => Ok(Some(resource)),
+        Err(err) => not_found_to_none(err, kind_label, namespace, name),
     }
 }
 
 /// Converts a 404 API error to `Ok(None)`, propagating all other errors.
-fn not_found_to_none<T>(e: kube::Error, kind: &str, ns: &str, name: &str) -> Result<Option<T>> {
-    if let kube::Error::Api(resp) = &e
+fn not_found_to_none<T>(err: kube::Error, kind: &str, ns: &str, name: &str) -> Result<Option<T>> {
+    if let kube::Error::Api(resp) = &err
         && resp.code == 404
     {
         debug!("{kind} {ns}/{name} not found");
         return Ok(None);
     }
-    Err(e.into())
+    Err(err.into())
 }
 
 // -----------------------------------------------------------------------------
@@ -210,11 +214,15 @@ fn collect_endpoint_addresses(ep: Endpoints, target: &TargetPort) -> Vec<String>
                 .and_then(|ports| {
                     ports
                         .iter()
-                        .find(|p| target.matches_name(p.name.as_deref()))
-                        .or_else(|| target.number.and_then(|n| ports.iter().find(|p| p.port == n)))
+                        .find(|port_entry| target.matches_name(port_entry.name.as_deref()))
+                        .or_else(|| {
+                            target
+                                .number
+                                .and_then(|num| ports.iter().find(|port_entry| port_entry.port == num))
+                        })
                         .or_else(|| ports.first())
                 })
-                .map_or_else(|| target.fallback(), |p| p.port);
+                .map_or_else(|| target.fallback(), |port_entry| port_entry.port);
 
             subset
                 .addresses
@@ -240,7 +248,7 @@ fn resolve_target_port(svc: &Service, service_port: i32) -> TargetPort {
         .spec
         .as_ref()
         .and_then(|spec| spec.ports.as_ref())
-        .and_then(|ports| ports.iter().find(|p| p.port == service_port));
+        .and_then(|ports| ports.iter().find(|port_entry| port_entry.port == service_port));
 
     let Some(sp) = matching else {
         return TargetPort {
@@ -251,12 +259,12 @@ fn resolve_target_port(svc: &Service, service_port: i32) -> TargetPort {
     };
 
     let number = match sp.target_port.as_ref() {
-        Some(IntOrString::Int(n)) => Some(*n),
+        Some(IntOrString::Int(num)) => Some(*num),
         Some(IntOrString::String(_)) | None => None,
     };
 
     TargetPort {
-        name: sp.name.clone().filter(|n| !n.is_empty()),
+        name: sp.name.clone().filter(|nm| !nm.is_empty()),
         number,
         service_port,
     }
@@ -269,12 +277,9 @@ fn resolve_target_port(svc: &Service, service_port: i32) -> TargetPort {
 #[cfg(test)]
 #[expect(clippy::default_trait_access, reason = "tests")]
 mod tests {
-    use k8s_openapi::{
-        api::{
-            core::v1::{EndpointAddress, EndpointPort, EndpointSubset, ServicePort, ServiceSpec},
-            discovery::v1::{Endpoint, EndpointConditions},
-        },
-        apimachinery::pkg::util::intstr::IntOrString,
+    use k8s_openapi::api::{
+        core::v1::{EndpointAddress, EndpointPort, EndpointSubset, ServicePort, ServiceSpec},
+        discovery::v1::{Endpoint, EndpointConditions},
     };
     use kube::core::Status;
 

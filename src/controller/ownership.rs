@@ -50,23 +50,23 @@ pub(super) async fn validate_gateway_class(client: &kube::Client, gw: &Gateway) 
 /// Fetches a `GatewayClass` by name, mapping API errors.
 async fn fetch_gateway_class(client: &kube::Client, gc_name: &str) -> Result<GatewayClass> {
     let api = Api::<GatewayClass>::all(client.clone());
-    api.get(gc_name).await.map_err(|e| map_gc_error(e, gc_name))
+    api.get(gc_name).await.map_err(|err| map_gc_error(err, gc_name))
 }
 
 /// Maps a `GatewayClass` lookup error to an operator error.
-fn map_gc_error(e: kube::Error, gc_name: &str) -> OperatorError {
-    if is_api_not_found(&e) {
+fn map_gc_error(err: kube::Error, gc_name: &str) -> OperatorError {
+    if is_api_not_found(&err) {
         debug!("GatewayClass {gc_name} not found");
         return OperatorError::GatewayClassNotFound(gc_name.to_owned());
     }
 
-    debug!(%e, "GatewayClass lookup failed");
-    OperatorError::Kube(e)
+    debug!(%err, "GatewayClass lookup failed");
+    OperatorError::Kube(err)
 }
 
 /// Returns `true` when the error is a 404 API response.
-fn is_api_not_found(e: &kube::Error) -> bool {
-    matches!(e, kube::Error::Api(resp) if resp.code == 404)
+fn is_api_not_found(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(resp) if resp.code == 404)
 }
 
 // -----------------------------------------------------------------------------
@@ -75,11 +75,11 @@ fn is_api_not_found(e: &kube::Error) -> bool {
 
 /// Collects `HTTPRoute` resources attached to the Gateway, filtered by
 /// namespace policies.
-pub(super) fn collect_routes<'a>(
+pub(super) fn collect_routes<'route>(
     gw: &Gateway,
-    all_routes: &'a [Arc<HTTPRoute>],
+    all_routes: &'route [Arc<HTTPRoute>],
     stores: &Stores,
-) -> Vec<AttachedRoute<'a>> {
+) -> Vec<AttachedRoute<'route>> {
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
