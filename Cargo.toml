@@ -29,7 +29,7 @@ harness = false
 
 [dev-dependencies]
 bytes = "1.12.1"
-criterion = "0.7.0"
+criterion = "0.8.2"
 http = "1.4.2"
 http-body-util = "0.1.4"
 tower = { version = "0.5.3", features = ["util"] }
