@@ -5,7 +5,7 @@ Praxis operator.
 
 ## Prerequisites
 
-- Rust stable 1.94+ (edition 2024)
+- Rust stable 1.96+ (edition 2024)
 - Rust nightly (for `rustfmt`; `group_imports` and
   `imports_granularity` are nightly-only)
 - Docker or Podman (container builds)
