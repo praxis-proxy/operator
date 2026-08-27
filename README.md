@@ -58,6 +58,6 @@ yourself with the following documentation first:
 For larger changes, open a [discussion] and follow
 the [proposal process](docs/proposals.md).
 
-[Issues]: https://github.com/praxis-proxy/praxis-operator/issues/new
-[pull requests]: https://github.com/praxis-proxy/praxis-operator/compare
-[discussion]: https://github.com/praxis-proxy/praxis-operator/discussions
+[Issues]: https://github.com/praxis-proxy/operator/issues/new
+[pull requests]: https://github.com/praxis-proxy/operator/compare
+[discussion]: https://github.com/praxis-proxy/operator/discussions
