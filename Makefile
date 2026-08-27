@@ -50,6 +50,7 @@ check:
 lint:
 	cargo clippy --all-targets -- -D warnings
 	cargo +$(NIGHTLY) fmt --all -- --check
+	cargo machete
 
 lint-extra: check-prereqs-extra
 	typos
