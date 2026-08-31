@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Shane Utt
 
 //! Binary entry point for the Praxis Gateway API operator.
