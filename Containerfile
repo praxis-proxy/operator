@@ -48,7 +48,7 @@ RUN touch src/main.rs \
 
 FROM alpine:3.23
 
-LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/praxis-operator" \
+LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/operator" \
       org.opencontainers.image.description="Praxis Gateway API operator" \
       org.opencontainers.image.licenses="MIT"
 
