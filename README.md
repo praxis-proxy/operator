@@ -61,3 +61,7 @@ the [proposal process](docs/proposals.md).
 [Issues]: https://github.com/praxis-proxy/operator/issues/new
 [pull requests]: https://github.com/praxis-proxy/operator/compare
 [discussion]: https://github.com/praxis-proxy/operator/discussions
+
+## License
+
+Apache-2.0
