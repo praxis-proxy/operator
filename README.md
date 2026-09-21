@@ -1,13 +1,13 @@
 # Praxis Kubernetes Operator
 
 [Kubernetes] operator that manages [Praxis] proxy
-instances via the [Gateway API].
+instances via [Gateway API].
 
 > **Note**: Supports Gateway API `v1.5.1`
 
-[Kubernetes]: https://kubernetes.io/
-[Praxis]: https://github.com/praxis-proxy/praxis
-[Gateway API]: https://gateway-api.sigs.k8s.io/
+[Kubernetes]:https://kubernetes.io/
+[Praxis]:https://github.com/praxis-proxy/praxis
+[Gateway API]:https://github.com/kube-rs/gateway-api-rs
 
 ## Quick Start
 
