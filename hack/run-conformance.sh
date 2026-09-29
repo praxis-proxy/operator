@@ -66,9 +66,9 @@ go test ./conformance -run TestConformance \
     --allow-crds-mismatch \
     --report-output=/tmp/conformance-report.yaml \
     --organization=praxis-proxy \
-    --project=praxis-operator \
+    --project=operator \
     --version=v0.1.0 \
-    --url=https://github.com/praxis-proxy/praxis-operator \
+    --url=https://github.com/praxis-proxy/operator \
     --contact=@shaneutt \
     2>&1 | tee "${RAW_LOG}" | "${LOG_FILTER}"
 status="${PIPESTATUS[0]}"

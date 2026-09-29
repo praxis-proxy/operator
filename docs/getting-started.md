@@ -22,9 +22,9 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/downloa
 Apply the operator manifests:
 
 ```console
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/praxis-operator/main/deploy/rbac.yaml
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/praxis-operator/main/deploy/deployment.yaml
-kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/praxis-operator/main/deploy/gatewayclass.yaml
+kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/operator/main/deploy/rbac.yaml
+kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/operator/main/deploy/deployment.yaml
+kubectl apply -f https://raw.githubusercontent.com/praxis-proxy/operator/main/deploy/gatewayclass.yaml
 ```
 
 This creates:
