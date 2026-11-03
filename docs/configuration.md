@@ -12,13 +12,13 @@ files for the operator itself.
 Container image used for data-plane pods. Set on the
 operator Deployment.
 
-- **Default:** `ghcr.io/praxis-proxy/praxis:latest`
-- **Deploy manifest:** `ghcr.io/praxis-proxy/praxis:0.3.0`
+- **Default:** `ghcr.io/praxis-proxy/praxis:0.7.5`
+- **Deploy manifest:** `ghcr.io/praxis-proxy/praxis:0.7.5`
 
 ```yaml
 env:
   - name: PRAXIS_IMAGE
-    value: "ghcr.io/praxis-proxy/praxis:0.3.0"
+    value: "ghcr.io/praxis-proxy/praxis:0.7.5"
 ```
 
 ### `RUST_LOG`

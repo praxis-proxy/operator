@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use gateway_api::gateways::Gateway;
 use k8s_openapi::{
     api::{
-        apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
+        apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment},
         core::v1::{
             Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, HTTPGetAction,
             PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretVolumeSource, SecurityContext,
@@ -38,23 +38,8 @@ const REPLICAS_ANNOTATION: &str = "praxis.sh/replicas";
 
 /// Replicas run when the Gateway does not ask for a specific count.
 ///
-/// One, matching the behaviour every existing Gateway already has.
-///
-/// This was forced rather than chosen. Praxis 0.3.1 registered its KV
-/// admin endpoints on the health port via `SO_REUSEPORT`, so probe
-/// connections landed on whichever listener the kernel picked and
-/// roughly half of them 404'd; every extra replica was another pod
-/// whose liveness probe flapped, and a Gateway whose pods never settle
-/// never reports Programmed.
-///
-/// The pinned data plane is now 0.5.2, which no longer registers that
-/// endpoint, so the constraint is gone. Two is the better availability
-/// default — a single-replica Gateway is a single point of failure for
-/// every route attached to it — and raising it is now a live option
-/// rather than a blocked one. It is deliberately not part of the
-/// version bump: that is a behaviour change deserving its own
-/// conformance run, and bundling it would make a red run ambiguous.
-/// `praxis.sh/replicas` remains the per-Gateway override meanwhile.
+/// One, preserving the default footprint while allowing high-availability
+/// Gateways to opt into a second replica.
 const DEFAULT_REPLICAS: i32 = 1;
 
 // -----------------------------------------------------------------------------
@@ -89,10 +74,10 @@ pub struct DeploymentParams<'gw> {
 
 /// Builds a Deployment for the Praxis data-plane.
 ///
-/// Creates a Deployment with a single replica running the Praxis proxy
-/// container. The pod mounts the configuration `ConfigMap` and TLS secrets.
-/// Health probes use the admin endpoint on [`ADMIN_PORT`]. Config updates
-/// are picked up via the proxy's file watcher (no pod restart needed).
+/// Defaults to two replicas running the Praxis proxy container. Each pod
+/// mounts the configuration `ConfigMap` and TLS secrets. Health probes use
+/// the metrics endpoint on [`ADMIN_PORT`]. Config hash changes trigger a
+/// rolling update with zero unavailable replicas.
 ///
 /// The `listener_ports` field provides `(name, port)` pairs from `Gateway`
 /// listeners; the admin port is appended unless a listener already occupies
@@ -259,7 +244,10 @@ fn build_praxis_container(ports: Vec<ContainerPort>, volume_mounts: Vec<VolumeMo
         ("cpu".to_owned(), Quantity("100m".to_owned())),
         ("memory".to_owned(), Quantity("64Mi".to_owned())),
     ]);
-    let resource_limits = BTreeMap::from([("memory".to_owned(), Quantity("256Mi".to_owned()))]);
+    let resource_limits = BTreeMap::from([
+        ("cpu".to_owned(), Quantity("1".to_owned())),
+        ("memory".to_owned(), Quantity("256Mi".to_owned())),
+    ]);
 
     Container {
         name: "praxis".to_owned(),
@@ -375,16 +363,28 @@ fn desired_replicas(gateway: &Gateway) -> i32 {
 /// Scheduling stays best-effort: on a single-node cluster a `DoNotSchedule`
 /// constraint would leave every replica after the first pending forever.
 fn spread_constraints(labels: &BTreeMap<String, String>) -> Vec<TopologySpreadConstraint> {
-    vec![TopologySpreadConstraint {
-        label_selector: Some(LabelSelector {
-            match_labels: Some(labels.clone()),
+    vec![
+        TopologySpreadConstraint {
+            label_selector: Some(LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            }),
+            max_skew: 1,
+            topology_key: "topology.kubernetes.io/zone".to_owned(),
+            when_unsatisfiable: "ScheduleAnyway".to_owned(),
             ..Default::default()
-        }),
-        max_skew: 1,
-        topology_key: "kubernetes.io/hostname".to_owned(),
-        when_unsatisfiable: "ScheduleAnyway".to_owned(),
-        ..Default::default()
-    }]
+        },
+        TopologySpreadConstraint {
+            label_selector: Some(LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            }),
+            max_skew: 1,
+            topology_key: "kubernetes.io/hostname".to_owned(),
+            when_unsatisfiable: "ScheduleAnyway".to_owned(),
+            ..Default::default()
+        },
+    ]
 }
 
 /// The label sets and pod template a [`Deployment`] is assembled from.
@@ -426,7 +426,10 @@ fn build_deployment_object(
             },
             strategy: Some(DeploymentStrategy {
                 type_: Some("RollingUpdate".to_owned()),
-                ..Default::default()
+                rolling_update: Some(RollingUpdateDeployment {
+                    max_unavailable: Some(IntOrString::Int(0)),
+                    max_surge: Some(IntOrString::Int(1)),
+                }),
             }),
             template: meta.pod_template,
             ..Default::default()
@@ -621,14 +624,29 @@ mod tests {
             .and_then(|pod| pod.topology_spread_constraints)
             .expect("spread constraints should be set");
 
-        assert_eq!(
-            constraints[0].topology_key, "kubernetes.io/hostname",
-            "replicas should be spread across nodes"
-        );
-        assert_eq!(
-            constraints[0].when_unsatisfiable, "ScheduleAnyway",
-            "a single-node cluster must still schedule every replica"
-        );
+        assert_eq!(constraints.len(), 2, "both zone and hostname spread must be configured");
+        for (constraint, key) in constraints
+            .iter()
+            .zip(["topology.kubernetes.io/zone", "kubernetes.io/hostname"])
+        {
+            assert_eq!(
+                constraint.topology_key, key,
+                "replicas must spread across each failure domain"
+            );
+            assert_eq!(constraint.max_skew, 1, "replicas should be evenly distributed");
+            assert_eq!(
+                constraint.when_unsatisfiable, "ScheduleAnyway",
+                "single-node scheduling must still work"
+            );
+            assert_eq!(
+                constraint
+                    .label_selector
+                    .as_ref()
+                    .and_then(|selector| selector.match_labels.as_ref()),
+                Some(&standard_labels("test-gateway")),
+                "spread must apply only to this Gateway's pods"
+            );
+        }
     }
 
     #[test]
@@ -641,7 +659,7 @@ mod tests {
         assert_eq!(
             spec.replicas,
             Some(DEFAULT_REPLICAS),
-            "a Gateway that asks for nothing should get the redundant default"
+            "a Gateway that asks for nothing should get one replica"
         );
 
         let selector = spec.selector;
@@ -665,6 +683,17 @@ mod tests {
             strategy.type_,
             Some("RollingUpdate".to_owned()),
             "strategy should be RollingUpdate to avoid traffic blackouts"
+        );
+        let rolling = strategy.rolling_update.expect("rolling update options should be set");
+        assert_eq!(
+            rolling.max_unavailable,
+            Some(IntOrString::Int(0)),
+            "a rolling update must not remove the last ready replica"
+        );
+        assert_eq!(
+            rolling.max_surge,
+            Some(IntOrString::Int(1)),
+            "a rolling update should add one replacement at a time"
         );
     }
 
@@ -715,7 +744,7 @@ mod tests {
             Some("admin".to_owned()),
             "last port name should be admin"
         );
-        assert_eq!(ports[2].container_port, 9901, "admin port should be 9901");
+        assert_eq!(ports[2].container_port, 9902, "metrics port should be 9902");
     }
 
     #[test]
@@ -853,8 +882,8 @@ mod tests {
         );
         assert_eq!(
             liveness_http.port,
-            IntOrString::Int(9901),
-            "liveness port should be 9901"
+            IntOrString::Int(9902),
+            "liveness port should be 9902"
         );
 
         let readiness = container
@@ -869,8 +898,8 @@ mod tests {
         );
         assert_eq!(
             readiness_http.port,
-            IntOrString::Int(9901),
-            "readiness port should be 9901"
+            IntOrString::Int(9902),
+            "readiness port should be 9902"
         );
     }
 
@@ -968,7 +997,11 @@ mod tests {
             Some(&Quantity("256Mi".to_owned())),
             "memory limit should be 256Mi"
         );
-        assert!(limits.get("cpu").is_none(), "cpu limit should not be set");
+        assert_eq!(
+            limits.get("cpu"),
+            Some(&Quantity("1".to_owned())),
+            "cpu limit should match one runtime worker thread"
+        );
     }
 
     #[test]

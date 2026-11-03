@@ -19,12 +19,19 @@ The format follows [Keep a Changelog], and this project adheres to
 - Kubernetes events explaining why a Gateway was rejected.
 - Configurable data-plane replicas via the `praxis.sh/replicas`
   annotation, a `PodDisruptionBudget`, and pod spread across nodes.
+- Gateway data planes can request two instances through the
+  `praxis.sh/replicas` annotation, with zero-unavailable rolling updates and
+  zone and hostname spread.
+- Kubernetes reference and rollout-test assets, plus the GitHub Actions
+  workflow that runs the Praxis rollout acceptance suite against them.
 - `method` and `queryParams` route matches are now detected and
   reported rather than silently ignored.
 - Listener protocol and hostname conflict detection.
 
 ### Fixed
 
+- Generated data-plane configuration now targets Praxis 0.7.5, including its
+  metrics-only admin endpoint and routeless-listener support.
 - Status writes no longer restamp unchanged conditions, which had kept
   the operator in a permanent reconcile loop.
 - Endpoint weight distribution no longer overflows `i32` and aborts the

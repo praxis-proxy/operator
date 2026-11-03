@@ -1,0 +1,72 @@
+name: Rollout
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/rollout.yaml"
+      - "src/resources/deployment.rs"
+      - "deploy/**"
+
+concurrency:
+  group: rollout-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CONTAINER_ENGINE: docker
+
+jobs:
+  kind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out operator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out praxis
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: praxis-proxy/praxis
+          path: praxis
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@f671c1215f89562d286310a6cabdcbaa5da9605c # v0.4.0
+
+      - name: Install KIND
+        run: |
+          curl --fail --location --show-error --silent \
+            --output ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl --fail --location --show-error --silent \
+            --output ./kubectl \
+            "https://dl.k8s.io/release/v1.33.3/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Run rollout suite
+        working-directory: praxis
+        run: make test-rollout ROLLOUT_MANIFEST_DIR=../deploy/rollout-test
+
+      - name: Dump cluster state
+        if: failure()
+        run: |
+          kubectl --context kind-praxis-rollout -n praxis get pods -o wide || true
+          kubectl --context kind-praxis-rollout -n praxis get events --sort-by=.lastTimestamp || true

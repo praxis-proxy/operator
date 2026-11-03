@@ -40,13 +40,13 @@ use gateway_api::{
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
-        core::v1::{ConfigMap, Namespace, Service, ServicePort, ServiceSpec},
+        core::v1::{ConfigMap, Namespace, Pod, Service, ServicePort, ServiceSpec},
     },
     apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta},
 };
 use kube::{
     Api, Client,
-    api::{DeleteParams, PostParams},
+    api::{DeleteParams, ListParams, PostParams},
 };
 
 // ---------------------------------------------------------------------------
@@ -1190,14 +1190,9 @@ async fn httproute_attached_count_reflected_in_listener() {
 // Data-Plane Verification Tests
 // ---------------------------------------------------------------------------
 
-// Requires MetalLB and stable proxy pods (no concurrent rolling updates).
 #[tokio::test]
 #[ignore]
 async fn data_plane_health_probes_respond() {
-    if std::env::var("RUN_DATAPLANE_TESTS").is_err() {
-        eprintln!("skipped: set RUN_DATAPLANE_TESTS=1 (requires MetalLB)");
-        return;
-    }
     let ctx = TestContext::new().await;
     let gc = ctx.create_gateway_class("dp-health-gc").await;
     ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
@@ -1208,30 +1203,52 @@ async fn data_plane_health_probes_respond() {
     ctx.await_gateway_condition(&gw, &ns, "Programmed", "True", RECONCILE_TIMEOUT_SECS)
         .await;
 
-    let gw_api: Api<Gateway> = Api::namespaced(ctx.client.clone(), &ns);
-    let addr = await_gateway_address(&gw_api, &gw, DATA_PLANE_TIMEOUT_SECS).await;
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    await_deployment_replicas_ready(&deployments, &format!("praxis-{gw}"), 1, DATA_PLANE_TIMEOUT_SECS).await;
 
-    let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .expect("failed to build reqwest client");
-
-    let healthy_url = format!("http://{addr}:9901/healthy");
-    let healthy_resp = retry_http_get(&http, &healthy_url, DATA_PLANE_TIMEOUT_SECS).await;
-    assert!(
-        healthy_resp.status().is_success(),
-        "admin /healthy endpoint should return 2xx"
-    );
-
-    let ready_url = format!("http://{addr}:9901/ready");
-    let ready_resp = retry_http_get(&http, &ready_url, DATA_PLANE_TIMEOUT_SECS).await;
-    assert!(
-        ready_resp.status().is_success(),
-        "admin /ready endpoint should return 2xx"
-    );
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+    let replicas = pods
+        .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={gw}")))
+        .await
+        .expect("data-plane pods should be listed");
+    assert_eq!(replicas.items.len(), 1, "Gateways should run one replica by default");
+    for pod in replicas.items {
+        let name = pod.metadata.name.expect("pod name should be set");
+        for path in ["healthy", "ready", "metrics"] {
+            let request = http::Request::get(format!("/api/v1/namespaces/{ns}/pods/{name}:9902/proxy/{path}"))
+                .body(Vec::new())
+                .expect("pod proxy request should be valid");
+            ctx.client
+                .request_text(request)
+                .await
+                .expect("each replica should serve health and metrics on port 9902");
+        }
+    }
 
     ctx.cleanup_gateway(&gw, &ns).await;
+    ctx.cleanup_gateway_class(&gc).await;
+    ctx.cleanup_namespace(&ns).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn gateway_replica_annotation_creates_two_instances() {
+    let ctx = TestContext::new().await;
+    let gc = ctx.create_gateway_class("dp-replicas-gc").await;
+    ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+
+    let ns = ctx.create_test_namespace("dp-replicas").await;
+    let gw_name = ctx
+        .create_gateway_with_replicas("dp-replicas-gw", &ns, &gc, 8103, 2)
+        .await;
+
+    ctx.await_gateway_condition(&gw_name, &ns, "Programmed", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    await_deployment_replicas_ready(&deployments, &format!("praxis-{gw_name}"), 2, DATA_PLANE_TIMEOUT_SECS).await;
+
+    ctx.cleanup_gateway(&gw_name, &ns).await;
     ctx.cleanup_gateway_class(&gc).await;
     ctx.cleanup_namespace(&ns).await;
 }
@@ -1478,6 +1495,47 @@ impl TestContext {
             .create(&PostParams::default(), &gw)
             .await
             .expect("failed to create Gateway");
+        name
+    }
+
+    async fn create_gateway_with_replicas(
+        &self,
+        prefix: &str,
+        namespace: &str,
+        gc_name: &str,
+        port: i32,
+        replicas: i32,
+    ) -> String {
+        let name = unique_name(prefix);
+        let gw_api: Api<Gateway> = Api::namespaced(self.client.clone(), namespace);
+        let gw = Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(namespace.to_owned()),
+                annotations: Some(std::collections::BTreeMap::from([(
+                    "praxis.sh/replicas".to_owned(),
+                    replicas.to_string(),
+                )])),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: gc_name.to_owned(),
+                listeners: vec![GatewayListeners {
+                    name: "http".to_owned(),
+                    port,
+                    protocol: "HTTP".to_owned(),
+                    hostname: None,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                ..Default::default()
+            },
+            status: None,
+        };
+        gw_api
+            .create(&PostParams::default(), &gw)
+            .await
+            .expect("failed to create Gateway with replica override");
         name
     }
 
@@ -1801,14 +1859,18 @@ async fn await_listener_count(api: &Api<Gateway>, name: &str, expected: usize, t
 }
 
 async fn await_deployment_ready(api: &Api<Deployment>, name: &str, timeout_secs: u64) {
+    await_deployment_replicas_ready(api, name, 1, timeout_secs).await;
+}
+
+async fn await_deployment_replicas_ready(api: &Api<Deployment>, name: &str, expected: i32, timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
         if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for Deployment {name} to be ready");
+            panic!("timed out waiting for {expected} replicas on Deployment {name}");
         }
         if let Ok(deploy) = api.get(name).await {
             let ready = deploy.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
-            if ready >= 1 {
+            if ready >= expected {
                 return;
             }
         }
