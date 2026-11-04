@@ -3,6 +3,7 @@
 
 //! Kubernetes controllers for Gateway API resources.
 
+mod child_cleanup;
 #[cfg(test)]
 mod fixtures;
 pub mod gateway;

@@ -12,14 +12,22 @@ files for the operator itself.
 Container image used for data-plane pods. Set on the
 operator Deployment.
 
-- **Default:** `ghcr.io/praxis-proxy/praxis:latest`
-- **Deploy manifest:** `ghcr.io/praxis-proxy/praxis:0.3.0`
+- **Default:** `ghcr.io/praxis-proxy/praxis:0.7.5`
+- **Deploy manifest:** `__PRAXIS_IMAGE__` (substituted during deployment)
 
 ```yaml
 env:
   - name: PRAXIS_IMAGE
-    value: "ghcr.io/praxis-proxy/praxis:0.3.0"
+    value: "ghcr.io/praxis-proxy/praxis:0.7.5"
 ```
+
+The data plane reserves port 9902 for health and metrics. A Gateway listener
+requesting that port reports `Accepted=False` with reason `PortUnavailable`;
+other valid listeners remain supported. If no usable listeners remain, including
+when all listeners conflict, the operator removes the Gateway’s managed proxy
+resources and recreates them when a usable listener is restored. Attached
+HTTPRoutes update their parent status when listeners move to or from the
+reserved port.
 
 ### `RUST_LOG`
 
@@ -92,7 +100,7 @@ permissions:
 
 | Resource | Request | Limit |
 |----------|---------|-------|
-| CPU      | 100m    | none  |
+| CPU      | 100m    | 1     |
 | Memory   | 64Mi    | 256Mi |
 
 These are defaults in the deploy manifests and
@@ -153,10 +161,11 @@ directly.
 
 - **ConfigMap:** `praxis-{gateway-name}` with key
   `config.yaml`
-- **Admin port:** 9901 (health probes, diagnostics)
-- **Config changes:** a SHA-256 hash annotation
-  (`praxis.sh/config-hash`) on the pod template
-  triggers a rolling update when config changes
+- **Metrics port:** 9902 (health probes, metrics)
+- **Config changes:** route and filter changes update
+  the ConfigMap for hot reload; a topology hash
+  (`praxis.sh/config-hash`) rolls pods only when
+  listener or TLS Secret topology changes
 
 See [Architecture](architecture.md) for details on
 how Gateway API resources are translated to Praxis

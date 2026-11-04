@@ -71,7 +71,7 @@ mod tests {
             "praxis-config",
             "default",
             &gateway,
-            "admin:\n  address: 0.0.0.0:9901\n",
+            "admin:\n  metrics_address: 0.0.0.0:9902\n",
         )
         .unwrap();
 
@@ -127,7 +127,7 @@ mod tests {
             status: None,
         };
 
-        let yaml_content = "admin:\n  address: 0.0.0.0:9901\nlisteners: []\n";
+        let yaml_content = "admin:\n  metrics_address: 0.0.0.0:9902\nlisteners: []\n";
         let config = build_configmap("praxis-config", "default", &gateway, yaml_content).unwrap();
 
         let data = config.data.expect("data should be set");

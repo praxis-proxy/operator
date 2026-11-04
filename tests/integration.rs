@@ -40,13 +40,14 @@ use gateway_api::{
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
-        core::v1::{ConfigMap, Namespace, Service, ServicePort, ServiceSpec},
+        core::v1::{ConfigMap, Namespace, Pod, Service, ServicePort, ServiceSpec},
+        policy::v1::PodDisruptionBudget,
     },
     apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta},
 };
 use kube::{
     Api, Client,
-    api::{DeleteParams, PostParams},
+    api::{DeleteParams, ListParams, PostParams},
 };
 
 // ---------------------------------------------------------------------------
@@ -324,6 +325,321 @@ async fn gateway_invalid_gateway_class_not_accepted() {
 
     ctx.cleanup_gateway(&gw_name, &ns).await;
     ctx.cleanup_namespace(&ns).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn reserved_or_conflicting_listeners_do_not_leave_stale_children() {
+    let ctx = TestContext::new().await;
+    let gc = ctx.create_gateway_class("reserved-port-gc").await;
+    ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+    let ns = ctx.create_test_namespace("reserved-port").await;
+    let name = ctx.create_gateway("reserved-port", &ns, &gc, 9902).await;
+    ctx.await_gateway_condition(&name, &ns, "Accepted", "False", RECONCILE_TIMEOUT_SECS)
+        .await;
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    assert!(
+        matches!(deployments.get(&format!("praxis-{name}")).await,
+        Err(kube::Error::Api(response)) if response.code == 404),
+        "a Gateway with only the reserved listener must not create a broken data plane"
+    );
+    let gateways: Api<Gateway> = Api::namespaced(ctx.client.clone(), &ns);
+    let patch = serde_json::json!({"spec": {"listeners": [
+        {"name": "http", "port": 9902, "protocol": "HTTP"},
+        {"name": "valid", "port": 8085, "protocol": "HTTP"}
+    ]}});
+    gateways
+        .patch(
+            &name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(patch),
+        )
+        .await
+        .expect("add a usable listener");
+    ctx.await_gateway_condition(&name, &ns, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+    let gateway = gateways.get(&name).await.expect("Gateway status");
+    let listeners = gateway.status.expect("status").listeners.expect("listener statuses");
+    let reserved = listeners
+        .iter()
+        .find(|listener| listener.name == "http")
+        .expect("reserved listener status");
+    assert!(
+        reserved.conditions.iter().any(|condition| condition.type_ == "Accepted"
+            && condition.status == "False"
+            && condition.reason == "PortUnavailable"),
+        "the reserved listener must report its port conflict"
+    );
+    let configmaps: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
+    let config = configmaps
+        .get(&format!("praxis-{name}"))
+        .await
+        .expect("valid listener config");
+    let yaml = config
+        .data
+        .expect("config data")
+        .get("config.yaml")
+        .expect("config YAML")
+        .clone();
+    let config: yaml_serde::Value = yaml_serde::from_str(&yaml).expect("generated YAML");
+    let listeners = config
+        .get("listeners")
+        .and_then(yaml_serde::Value::as_sequence)
+        .expect("proxy listeners");
+    assert_eq!(listeners.len(), 1, "only the supported listener may reach the proxy");
+    assert_eq!(
+        listeners
+            .first()
+            .and_then(|listener| listener.get("address"))
+            .and_then(yaml_serde::Value::as_str),
+        Some("0.0.0.0:8085"),
+        "the metrics port must remain separate from Gateway listeners"
+    );
+    let child = format!("praxis-{name}");
+    await_deployment_ready(&deployments, &child, DATA_PLANE_TIMEOUT_SECS).await;
+    for rejected_listeners in [
+        serde_json::json!({"spec":{"listeners":[{"name":"http", "port":9902, "protocol":"HTTP"}]}}),
+        serde_json::json!({"spec":{"listeners":[
+            {"name":"http", "port":8085, "protocol":"HTTP"},
+            {"name":"https", "port":8085, "protocol":"HTTPS", "tls":{
+                "mode":"Terminate", "certificateRefs":[{"kind":"Secret", "name":"unused-during-conflict"}]
+            }}
+        ]}}),
+    ] {
+        let previous_uid = deployments.get(&child).await.unwrap().metadata.uid;
+        gateways
+            .patch(
+                &name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(rejected_listeners),
+            )
+            .await
+            .unwrap();
+        ctx.await_gateway_condition(&name, &ns, "Accepted", "False", RECONCILE_TIMEOUT_SECS)
+            .await;
+        let services: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
+        let budgets: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
+        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(DATA_PLANE_TIMEOUT_SECS))
+            .expect("test timeout fits the clock");
+        loop {
+            if deployments.get_opt(&child).await.unwrap().is_none()
+                && services.get_opt(&child).await.unwrap().is_none()
+                && configmaps.get_opt(&child).await.unwrap().is_none()
+                && budgets.get_opt(&child).await.unwrap().is_none()
+                && pods
+                    .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={name}")))
+                    .await
+                    .unwrap()
+                    .items
+                    .is_empty()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "rejecting the final usable listener must remove stale children and proxies"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+        let restored_listener =
+            serde_json::json!({"spec":{"listeners":[{"name":"valid", "port":8085, "protocol":"HTTP"}]}});
+        gateways
+            .patch(
+                &name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(restored_listener),
+            )
+            .await
+            .unwrap();
+        ctx.await_gateway_condition(&name, &ns, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+            .await;
+        await_deployment_ready(&deployments, &child, DATA_PLANE_TIMEOUT_SECS).await;
+        assert_ne!(
+            deployments.get(&child).await.unwrap().metadata.uid,
+            previous_uid,
+            "restoring a usable listener must recreate the data plane"
+        );
+    }
+    ctx.cleanup_gateway(&name, &ns).await;
+    ctx.cleanup_gateway_class(&gc).await;
+    ctx.cleanup_namespace(&ns).await;
+}
+
+#[cfg(test)]
+mod reserved_listener_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn reserved_listener_transition_rejects_existing_route_parents() {
+        let ctx = TestContext::new().await;
+        let gc = ctx.create_gateway_class("reserved-route-gc").await;
+        ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+            .await;
+        let ns = ctx.create_test_namespace("reserved-route").await;
+        let gateway = ctx.create_gateway("reserved-route", &ns, &gc, 8080).await;
+        let gateways: Api<Gateway> = Api::namespaced(ctx.client.clone(), &ns);
+        let listeners = |port| {
+            serde_json::json!({"spec":{"listeners":[
+                {"name":"http", "port":port, "protocol":"HTTP"},
+                {"name":"sibling", "port":8085, "protocol":"HTTP"}
+            ]}})
+        };
+        gateways
+            .patch(
+                &gateway,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(listeners(8080)),
+            )
+            .await
+            .unwrap();
+        let backend = ctx.create_backend_service("route-backend", &ns, 80).await;
+        ctx.deploy_echo_server("route-backend", &ns, 80).await;
+        let backend_deadline = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(DATA_PLANE_TIMEOUT_SECS))
+            .expect("test timeout fits the clock");
+        while praxis_operator::endpoints::resolve_endpoints(&ctx.client, &ns, &backend, 80)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            assert!(
+                tokio::time::Instant::now() < backend_deadline,
+                "the route fixture must have a ready backend before configuration"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+        let routes: Api<HTTPRoute> = Api::namespaced(ctx.client.clone(), &ns);
+        let mut created = Vec::new();
+        for (prefix, sections) in [("blocked", vec!["http"]), ("both", vec!["http", "sibling"])] {
+            let name = unique_name(prefix);
+            let route = HTTPRoute {
+                metadata: ObjectMeta {
+                    name: Some(name.clone()),
+                    namespace: Some(ns.clone()),
+                    ..Default::default()
+                },
+                spec: HttpRouteSpec {
+                    parent_refs: Some(
+                        sections
+                            .iter()
+                            .map(|section| HttpRouteParentRefs {
+                                name: gateway.clone(),
+                                section_name: Some((*section).to_owned()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    rules: Some(vec![HttpRouteRules {
+                        matches: Some(vec![HttpRouteRulesMatches {
+                            path: Some(HttpRouteRulesMatchesPath {
+                                r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
+                                value: Some(format!("/{prefix}")),
+                            }),
+                            ..Default::default()
+                        }]),
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: backend.clone(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                status: None,
+            };
+            routes.create(&PostParams::default(), &route).await.unwrap();
+            let expected: Vec<_> = sections.iter().map(|section| (*section, "True")).collect();
+            await_route_section_statuses(&routes, &name, &expected).await;
+            created.push(name);
+        }
+        gateways
+            .patch(
+                &gateway,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(listeners(9902)),
+            )
+            .await
+            .unwrap();
+        let blocked = created.first().unwrap();
+        let both = created.get(1).unwrap();
+        let rejected = await_route_section_statuses(&routes, blocked, &[("http", "False")]).await;
+        assert_eq!(
+            find_httproute_parent_condition(&rejected, "Accepted", "False")
+                .unwrap()
+                .reason,
+            "NoMatchingParent",
+            "the reserved parent is no longer eligible"
+        );
+        await_route_section_statuses(&routes, both, &[("http", "False"), ("sibling", "True")]).await;
+        let maps: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(RECONCILE_TIMEOUT_SECS))
+            .expect("test timeout fits the clock");
+        loop {
+            let map = maps.get(&format!("praxis-{gateway}")).await.unwrap();
+            let yaml = map.data.as_ref().unwrap().get("config.yaml").unwrap();
+            let config: yaml_serde::Value = yaml_serde::from_str(yaml).unwrap();
+            let reserved = config
+                .get("listeners")
+                .and_then(yaml_serde::Value::as_sequence)
+                .unwrap()
+                .iter()
+                .any(|listener| listener.get("address").and_then(yaml_serde::Value::as_str) == Some("0.0.0.0:9902"));
+            if !yaml.contains("/blocked") && yaml.contains("/both") && !reserved {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only usable sibling routing may remain configured"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+        gateways
+            .patch(
+                &gateway,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(listeners(8080)),
+            )
+            .await
+            .unwrap();
+        await_route_section_statuses(&routes, blocked, &[("http", "True")]).await;
+        await_route_section_statuses(&routes, both, &[("http", "True"), ("sibling", "True")]).await;
+        ctx.cleanup_gateway(&gateway, &ns).await;
+        ctx.cleanup_gateway_class(&gc).await;
+        ctx.cleanup_namespace(&ns).await;
+    }
+
+    async fn await_route_section_statuses(api: &Api<HTTPRoute>, name: &str, expected: &[(&str, &str)]) -> HTTPRoute {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(DATA_PLANE_TIMEOUT_SECS))
+            .expect("test timeout fits the clock");
+        loop {
+            let route = api.get(name).await.unwrap();
+            if route.status.as_ref().is_some_and(|status| {
+                expected.iter().all(|(section, value)| {
+                    status.parents.iter().any(|parent| {
+                        parent.parent_ref.section_name.as_deref() == Some(*section)
+                            && parent
+                                .conditions
+                                .iter()
+                                .any(|condition| condition.type_ == "Accepted" && condition.status == *value)
+                    })
+                })
+            }) {
+                return route;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "route {name} must converge to parent statuses {expected:?}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1190,14 +1506,9 @@ async fn httproute_attached_count_reflected_in_listener() {
 // Data-Plane Verification Tests
 // ---------------------------------------------------------------------------
 
-// Requires MetalLB and stable proxy pods (no concurrent rolling updates).
 #[tokio::test]
 #[ignore]
 async fn data_plane_health_probes_respond() {
-    if std::env::var("RUN_DATAPLANE_TESTS").is_err() {
-        eprintln!("skipped: set RUN_DATAPLANE_TESTS=1 (requires MetalLB)");
-        return;
-    }
     let ctx = TestContext::new().await;
     let gc = ctx.create_gateway_class("dp-health-gc").await;
     ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
@@ -1208,30 +1519,52 @@ async fn data_plane_health_probes_respond() {
     ctx.await_gateway_condition(&gw, &ns, "Programmed", "True", RECONCILE_TIMEOUT_SECS)
         .await;
 
-    let gw_api: Api<Gateway> = Api::namespaced(ctx.client.clone(), &ns);
-    let addr = await_gateway_address(&gw_api, &gw, DATA_PLANE_TIMEOUT_SECS).await;
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    await_deployment_replicas_ready(&deployments, &format!("praxis-{gw}"), 1, DATA_PLANE_TIMEOUT_SECS).await;
 
-    let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .expect("failed to build reqwest client");
-
-    let healthy_url = format!("http://{addr}:9901/healthy");
-    let healthy_resp = retry_http_get(&http, &healthy_url, DATA_PLANE_TIMEOUT_SECS).await;
-    assert!(
-        healthy_resp.status().is_success(),
-        "admin /healthy endpoint should return 2xx"
-    );
-
-    let ready_url = format!("http://{addr}:9901/ready");
-    let ready_resp = retry_http_get(&http, &ready_url, DATA_PLANE_TIMEOUT_SECS).await;
-    assert!(
-        ready_resp.status().is_success(),
-        "admin /ready endpoint should return 2xx"
-    );
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+    let replicas = pods
+        .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={gw}")))
+        .await
+        .expect("data-plane pods should be listed");
+    assert_eq!(replicas.items.len(), 1, "Gateways should run one replica by default");
+    for pod in replicas.items {
+        let name = pod.metadata.name.expect("pod name should be set");
+        for path in ["healthy", "ready", "metrics"] {
+            let request = http::Request::get(format!("/api/v1/namespaces/{ns}/pods/{name}:9902/proxy/{path}"))
+                .body(Vec::new())
+                .expect("pod proxy request should be valid");
+            ctx.client
+                .request_text(request)
+                .await
+                .expect("each replica should serve health and metrics on port 9902");
+        }
+    }
 
     ctx.cleanup_gateway(&gw, &ns).await;
+    ctx.cleanup_gateway_class(&gc).await;
+    ctx.cleanup_namespace(&ns).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn gateway_replica_annotation_creates_two_instances() {
+    let ctx = TestContext::new().await;
+    let gc = ctx.create_gateway_class("dp-replicas-gc").await;
+    ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+
+    let ns = ctx.create_test_namespace("dp-replicas").await;
+    let gw_name = ctx
+        .create_gateway_with_replicas("dp-replicas-gw", &ns, &gc, 8103, 2)
+        .await;
+
+    ctx.await_gateway_condition(&gw_name, &ns, "Programmed", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    await_deployment_replicas_ready(&deployments, &format!("praxis-{gw_name}"), 2, DATA_PLANE_TIMEOUT_SECS).await;
+
+    ctx.cleanup_gateway(&gw_name, &ns).await;
     ctx.cleanup_gateway_class(&gc).await;
     ctx.cleanup_namespace(&ns).await;
 }
@@ -1270,11 +1603,11 @@ async fn data_plane_routes_traffic_to_backend() {
         .expect("failed to build reqwest client");
 
     let url = format!("http://{addr}:8102/test");
-    let resp = retry_http_get(&http, &url, DATA_PLANE_TIMEOUT_SECS).await;
-    assert!(
-        resp.status().is_success() || resp.status().as_u16() == 404,
-        "proxy should forward traffic (got status {status})",
-        status = resp.status()
+    let resp = await_echo_response(&http, &url, DATA_PLANE_TIMEOUT_SECS).await;
+    assert_eq!(
+        resp.text().await.expect("echo response body").trim(),
+        "ok",
+        "the hot-reloaded route must reach the echo backend"
     );
 
     ctx.cleanup_httproute(&route, &ns).await;
@@ -1451,6 +1784,18 @@ impl TestContext {
     }
 
     async fn create_gateway(&self, prefix: &str, namespace: &str, gc_name: &str, port: i32) -> String {
+        self.create_gateway_with_annotations(prefix, namespace, gc_name, port, None)
+            .await
+    }
+
+    async fn create_gateway_with_annotations(
+        &self,
+        prefix: &str,
+        namespace: &str,
+        gc_name: &str,
+        port: i32,
+        annotations: Option<std::collections::BTreeMap<String, String>>,
+    ) -> String {
         let name = unique_name(prefix);
         let gw_api: Api<Gateway> = Api::namespaced(self.client.clone(), namespace);
 
@@ -1458,6 +1803,7 @@ impl TestContext {
             metadata: ObjectMeta {
                 name: Some(name.clone()),
                 namespace: Some(namespace.to_owned()),
+                annotations,
                 ..Default::default()
             },
             spec: GatewaySpec {
@@ -1479,6 +1825,27 @@ impl TestContext {
             .await
             .expect("failed to create Gateway");
         name
+    }
+
+    async fn create_gateway_with_replicas(
+        &self,
+        prefix: &str,
+        namespace: &str,
+        gc_name: &str,
+        port: i32,
+        replicas: i32,
+    ) -> String {
+        self.create_gateway_with_annotations(
+            prefix,
+            namespace,
+            gc_name,
+            port,
+            Some(std::collections::BTreeMap::from([(
+                "praxis.sh/replicas".to_owned(),
+                replicas.to_string(),
+            )])),
+        )
+        .await
     }
 
     async fn create_backend_service(&self, name: &str, namespace: &str, port: i32) -> String {
@@ -1801,14 +2168,25 @@ async fn await_listener_count(api: &Api<Gateway>, name: &str, expected: usize, t
 }
 
 async fn await_deployment_ready(api: &Api<Deployment>, name: &str, timeout_secs: u64) {
+    await_deployment_replicas_ready(api, name, 1, timeout_secs).await;
+}
+
+async fn await_deployment_replicas_ready(api: &Api<Deployment>, name: &str, expected: i32, timeout_secs: u64) {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
         if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for Deployment {name} to be ready");
+            panic!("timed out waiting for {expected} replicas on Deployment {name}");
         }
         if let Ok(deploy) = api.get(name).await {
-            let ready = deploy.status.as_ref().and_then(|s| s.ready_replicas).unwrap_or(0);
-            if ready >= 1 {
+            let desired = deploy.spec.as_ref().and_then(|spec| spec.replicas).unwrap_or_default();
+            let generation = deploy.metadata.generation.unwrap_or_default();
+            if let Some(status) = deploy.status.as_ref()
+                && desired == expected
+                && status.observed_generation.unwrap_or_default() >= generation
+                && status.updated_replicas.unwrap_or_default() == expected
+                && status.ready_replicas.unwrap_or_default() == expected
+                && status.available_replicas.unwrap_or_default() == expected
+            {
                 return;
             }
         }
@@ -1816,17 +2194,20 @@ async fn await_deployment_ready(api: &Api<Deployment>, name: &str, timeout_secs:
     }
 }
 
-async fn retry_http_get(client: &reqwest::Client, url: &str, timeout_secs: u64) -> reqwest::Response {
+/// Waits for the route to reach the echo backend after ConfigMap propagation.
+async fn await_echo_response(client: &reqwest::Client, url: &str, timeout_secs: u64) -> reqwest::Response {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    let mut last_response = "no request completed".to_owned();
     loop {
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for HTTP response from {url}");
-        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "route did not hot-reload at {url}: {last_response}"
+        );
         match client.get(url).send().await {
-            Ok(resp) => return resp,
-            Err(_) => {
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            },
+            Ok(response) if response.status() == reqwest::StatusCode::OK => return response,
+            Ok(response) => last_response = format!("HTTP {}", response.status()),
+            Err(error) => last_response = error.to_string(),
         }
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 }

@@ -6,8 +6,9 @@
 //! Turns the listeners and attached routes of one Gateway into the
 //! configuration document the data plane reads, then applies the
 //! `ConfigMap`, `Deployment`, `Service`, and `PodDisruptionBudget` that carry
-//! it. The config hash computed here is what tells the Gateway
-//! controller whether a rollout is still in flight.
+//! it. The rollout hash computed here covers only listener and TLS topology,
+//! so hot-reloadable route changes update the `ConfigMap` without restarting
+//! the data plane.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -29,6 +30,7 @@ use crate::{
         routing::{BackendRef, PraxisRoute, convert_routes, rule_has_authorized_backend},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},
     },
+    context::ADMIN_PORT,
     endpoints,
     error::Result,
     gateway_api::{attachment::AttachedRoute, listener_conflict, protocol::ListenerProtocol},
@@ -62,6 +64,9 @@ pub(super) struct PraxisConfigOutput {
 
     /// TLS secret names referenced by HTTPS listeners (deduplicated).
     pub(super) tls_secret_names: Vec<String>,
+
+    /// TLS topology used to decide whether a rollout is required.
+    pub(super) listener_tls: Vec<(String, Option<PraxisTls>)>,
 }
 
 /// Converts Gateway listeners, attached routes, and resolved endpoints
@@ -72,18 +77,14 @@ pub(super) async fn build_praxis_config(
     attached: &[AttachedRoute<'_>],
     grants: &[ReferenceGrant],
 ) -> Result<PraxisConfigOutput> {
-    let conflicts = listener_conflict::detect_conflicts(listeners);
-    let supported: Vec<_> = listeners
-        .iter()
-        .filter(|listener| ListenerProtocol::is_supported(&listener.protocol))
-        .filter(|listener| !conflicts.contains_key(&listener.name))
-        .collect();
+    let supported = usable_listeners(listeners);
 
     let listener_hostnames = build_listener_hostname_map(&supported);
     let praxis_listeners = merge_listeners_by_port(&supported);
     let (praxis_routes, backend_refs) = convert_attached_routes(attached, &listener_hostnames, grants);
     let route_filters = collect_filters(attached, grants);
     let clusters = resolve_clusters(client, &backend_refs).await?;
+    let listener_tls = collect_listener_tls(&praxis_listeners);
     let config = assemble_config(
         praxis_listeners,
         &praxis_routes,
@@ -96,7 +97,27 @@ pub(super) async fn build_praxis_config(
         config_yaml: yaml_serde::to_string(&config)?,
         listener_ports: collect_listener_ports(&supported),
         tls_secret_names: collect_tls_secret_names(&supported),
+        listener_tls,
     })
+}
+
+/// Selects supported, unreserved listeners that have no binding conflicts.
+pub(super) fn usable_listeners(listeners: &[GatewayListeners]) -> Vec<&GatewayListeners> {
+    let conflicts = listener_conflict::detect_conflicts(listeners);
+    listeners
+        .iter()
+        .filter(|listener| ListenerProtocol::is_supported(&listener.protocol))
+        .filter(|listener| listener.port != ADMIN_PORT)
+        .filter(|listener| !conflicts.contains_key(&listener.name))
+        .collect()
+}
+
+/// Collects the TLS definitions that cannot hot-reload in Praxis.
+fn collect_listener_tls(listeners: &[PraxisListener]) -> Vec<(String, Option<PraxisTls>)> {
+    listeners
+        .iter()
+        .map(|listener| (listener.address.clone(), listener.tls.clone()))
+        .collect()
 }
 
 /// Merges Gateway listeners on the same port into a single Praxis
@@ -302,7 +323,7 @@ pub(super) async fn apply_child_resources(
     let cm = build_configmap(&child, &ns, gw, &config_output.config_yaml)?;
     super::gateway::apply_resource(client, &ns, &cm).await?;
 
-    let config_hash = sha256_hex(&config_output.config_yaml);
+    let config_hash = rollout_hash(config_output)?;
     let deploy = build_deployment(&DeploymentParams {
         name: &child,
         config_hash: &config_hash,
@@ -321,6 +342,16 @@ pub(super) async fn apply_child_resources(
     super::gateway::apply_resource(client, &ns, &budget).await?;
 
     Ok(config_hash)
+}
+
+/// Hashes the parts of the generated config that require a Deployment rollout.
+fn rollout_hash(config_output: &PraxisConfigOutput) -> Result<String> {
+    let identity = serde_json::json!({
+        "listeners": config_output.listener_ports,
+        "tlsSecrets": config_output.tls_secret_names,
+        "listenerTls": config_output.listener_tls,
+    });
+    Ok(sha256_hex(&serde_json::to_string(&identity)?))
 }
 
 /// Converts `(name, port)` pairs into Kubernetes `ServicePort` entries.
@@ -519,6 +550,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn usable_listeners_exclude_conflicts_and_preserve_a_valid_sibling() {
+        let http = http_listener();
+        let mut https = http.clone();
+        https.name = "https".to_owned();
+        https.protocol = "HTTPS".to_owned();
+        assert!(
+            usable_listeners(&[http.clone(), https.clone()]).is_empty(),
+            "a protocol-conflicting pair contributes no usable listeners"
+        );
+        let mut valid = http.clone();
+        valid.name = "valid".to_owned();
+        valid.port = 8085;
+        let listeners = [http, https, valid];
+        let selected: Vec<_> = usable_listeners(&listeners)
+            .into_iter()
+            .map(|listener| listener.name.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["valid"],
+            "conflicting listeners must not remove an independent listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_metrics_port_is_excluded_without_discarding_other_listeners() {
+        let (client, _) = testing::fake_client(vec![]);
+        let valid = http_listener();
+        let mut reserved = valid.clone();
+        reserved.name = "reserved".to_owned();
+        reserved.port = ADMIN_PORT;
+        let output = build_praxis_config(&client, &[valid, reserved], &[], &[])
+            .await
+            .expect("the valid listener must still generate configuration");
+        assert_eq!(
+            output.listener_ports,
+            vec![("http".to_owned(), 80)],
+            "the metrics port must not become a proxy listener or Service port"
+        );
+        let yaml: yaml_serde::Value = yaml_serde::from_str(&output.config_yaml).expect("generated YAML");
+        assert_eq!(
+            yaml.get("listeners")
+                .and_then(yaml_serde::Value::as_sequence)
+                .map(Vec::len),
+            Some(1),
+            "only the valid proxy listener may be configured"
+        );
+    }
+
     #[tokio::test]
     async fn test_an_unsupported_listener_contributes_nothing() {
         let (client, _) = testing::fake_client(vec![]);
@@ -571,6 +652,7 @@ mod tests {
             config_yaml: "listeners: []\n".to_owned(),
             listener_ports: vec![("http".to_owned(), 80)],
             tls_secret_names: vec![],
+            listener_tls: vec![],
         };
 
         let hash = Box::pin(apply_child_resources(&client, &gateway(), &output))
@@ -579,9 +661,8 @@ mod tests {
 
         assert_eq!(
             hash,
-            sha256_hex(&output.config_yaml),
-            "the returned hash is what the pod template is annotated with, so it has to be the \
-             hash of the config that was actually applied"
+            rollout_hash(&output).expect("rollout hash"),
+            "the returned hash must be the topology hash applied to the Deployment"
         );
         for kind in ["/configmaps", "/deployments", "/services", "/poddisruptionbudgets"] {
             assert_eq!(
@@ -592,6 +673,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rollout_hash_keeps_hot_reload_changes_stable() {
+        let output = test_config_output("route: v1\n", vec![("http".to_owned(), 80)], vec![], vec![]);
+        let route_changed = test_config_output("route: v2\n", output.listener_ports.clone(), vec![], vec![]);
+
+        assert_eq!(
+            rollout_hash(&output).expect("base hash"),
+            rollout_hash(&route_changed).expect("route hash"),
+            "route and filter changes must hot-reload without changing the pod template"
+        );
+    }
+
+    #[test]
+    fn rollout_hash_changes_for_topology_changes() {
+        let output = test_config_output("route: v1\n", vec![("http".to_owned(), 80)], vec![], vec![]);
+        let mut listener_added = test_config_output("route: v2\n", output.listener_ports.clone(), vec![], vec![]);
+        listener_added.listener_ports.push(("extra".to_owned(), 8081));
+        let mut tls_added = test_config_output("route: v2\n", output.listener_ports.clone(), vec![], vec![]);
+        tls_added.tls_secret_names.push("praxis-tls".to_owned());
+
+        assert_ne!(
+            rollout_hash(&output).expect("base hash"),
+            rollout_hash(&listener_added).expect("listener hash"),
+            "a new listener port cannot hot-reload and must roll the pods"
+        );
+        assert_ne!(
+            rollout_hash(&output).expect("base hash"),
+            rollout_hash(&tls_added).expect("TLS hash"),
+            "a new TLS Secret mount cannot hot-reload and must roll the pods"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollout_hash_changes_when_https_hostname_changes() {
+        let (client, _) = testing::fake_client(vec![]);
+        let mut https = https_listener("https", 8443, "praxis-tls");
+        https.hostname = Some("before.example.com".to_owned());
+        let before = build_praxis_config(&client, &[https.clone()], &[], &[])
+            .await
+            .expect("initial HTTPS config");
+        https.hostname = Some("after.example.com".to_owned());
+        let after = build_praxis_config(&client, &[https], &[], &[])
+            .await
+            .expect("updated HTTPS config");
+        assert_ne!(
+            rollout_hash(&before).expect("initial hash"),
+            rollout_hash(&after).expect("updated hash"),
+            "changing only an HTTPS hostname must roll pods to update SNI"
+        );
+        assert_eq!(before.listener_ports, after.listener_ports, "ports are unchanged");
+        assert_eq!(
+            before.tls_secret_names, after.tls_secret_names,
+            "Secret mounts are unchanged"
+        );
+    }
+
+    #[test]
+    fn rollout_hash_changes_when_tls_moves_between_listeners() {
+        let listener_ports = vec![("http".to_owned(), 80), ("https".to_owned(), 8443)];
+        let tls = test_listener_tls("example.com");
+        let output = test_config_output(
+            "route: v1\n",
+            listener_ports.clone(),
+            vec!["praxis-tls".to_owned()],
+            vec![
+                ("0.0.0.0:80".to_owned(), None),
+                ("0.0.0.0:8443".to_owned(), Some(tls.clone())),
+            ],
+        );
+        let tls_moved = test_config_output(
+            "route: v1\n",
+            listener_ports,
+            vec!["praxis-tls".to_owned()],
+            vec![("0.0.0.0:80".to_owned(), Some(tls)), ("0.0.0.0:8443".to_owned(), None)],
+        );
+
+        assert_ne!(
+            rollout_hash(&output).expect("base hash"),
+            rollout_hash(&tls_moved).expect("moved TLS hash"),
+            "moving TLS between unchanged listener ports changes topology and must roll the pods"
+        );
+    }
+
+    fn test_config_output(
+        config_yaml: &str,
+        listener_ports: Vec<(String, i32)>,
+        tls_secret_names: Vec<String>,
+        listener_tls: Vec<(String, Option<PraxisTls>)>,
+    ) -> PraxisConfigOutput {
+        PraxisConfigOutput {
+            config_yaml: config_yaml.to_owned(),
+            listener_ports,
+            tls_secret_names,
+            listener_tls,
+        }
+    }
+
+    fn test_listener_tls(hostname: &str) -> PraxisTls {
+        PraxisTls {
+            certificates: vec![PraxisCertificate {
+                cert_path: "/tls/praxis-tls/tls.crt".to_owned(),
+                key_path: "/tls/praxis-tls/tls.key".to_owned(),
+                server_names: Some(vec![hostname.to_owned()]),
+                default: None,
+            }],
+        }
+    }
+
     #[tokio::test]
     async fn test_a_refused_apply_stops_the_rest() {
         let (client, journal) = testing::failing_client();
@@ -599,6 +788,7 @@ mod tests {
             config_yaml: "listeners: []\n".to_owned(),
             listener_ports: vec![],
             tls_secret_names: vec![],
+            listener_tls: vec![],
         };
 
         Box::pin(apply_child_resources(&client, &gateway(), &output))
