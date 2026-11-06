@@ -36,6 +36,15 @@ const PROXY_UID: i64 = 100;
 /// Time for Service endpoint removal to propagate before SIGTERM.
 const ENDPOINT_PROPAGATION_SECONDS: i64 = 5;
 
+/// Seconds a rollout may make no progress before the `Deployment`
+/// controller reports `ProgressDeadlineExceeded`.
+///
+/// With `maxUnavailable: 0` a replacement that cannot schedule or start
+/// leaves the old pod serving indefinitely, so the failure has to be
+/// bounded somewhere: this is the Deployment controller's own default,
+/// stated explicitly because the rollout strategy below depends on it.
+const PROGRESS_DEADLINE_SECONDS: i32 = 600;
+
 /// Annotation overriding the data-plane replica count.
 const REPLICAS_ANNOTATION: &str = "praxis.sh/replicas";
 
@@ -436,6 +445,7 @@ fn build_deployment_object(
         },
         spec: Some(DeploymentSpec {
             replicas: Some(desired_replicas(gateway)),
+            progress_deadline_seconds: Some(PROGRESS_DEADLINE_SECONDS),
             selector: LabelSelector {
                 match_labels: Some(meta.selector),
                 ..Default::default()
@@ -710,6 +720,22 @@ mod tests {
             rolling.max_surge,
             Some(IntOrString::Int(1)),
             "a rolling update should add one replacement at a time"
+        );
+    }
+
+    #[test]
+    fn test_build_deployment_bounds_a_stuck_rollout() {
+        let gateway = test_gateway();
+        let ports = vec![("http".to_owned(), 8080)];
+        let deployment = build_deployment(&test_params(&gateway, &ports)).unwrap();
+
+        let spec = deployment.spec.expect("spec should be set");
+        assert_eq!(
+            spec.progress_deadline_seconds,
+            Some(PROGRESS_DEADLINE_SECONDS),
+            "maxUnavailable: 0 keeps the old pod serving a replacement that never becomes ready, \
+             so the progress deadline is the only thing that turns a stuck rollout into a \
+             reported failure instead of waiting on it forever"
         );
     }
 

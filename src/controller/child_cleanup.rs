@@ -23,14 +23,22 @@ use crate::{
 };
 
 /// Removes only children controlled by this Gateway, tolerating prior deletion.
+///
+/// Every child is attempted even when one delete fails. Stopping at the
+/// first error would leave the Gateway's children half-dismantled until
+/// the retry, and a second failure would extend that window again; the
+/// first error is still returned so reconciliation repeats.
 pub(super) async fn delete_children(client: &kube::Client, gw: &Gateway) -> Result<()> {
     let namespace = gw.namespace().unwrap_or_default();
     let name = child_name(&gw.name_any());
     let owner_uid = gw.uid().ok_or(OperatorError::MissingObjectKey(".metadata.uid"))?;
-    delete_owned::<Service>(client, &namespace, &name, &owner_uid).await?;
-    Box::pin(delete_owned::<Deployment>(client, &namespace, &name, &owner_uid)).await?;
-    delete_owned::<ConfigMap>(client, &namespace, &name, &owner_uid).await?;
-    delete_owned::<PodDisruptionBudget>(client, &namespace, &name, &owner_uid).await
+    let deletions = [
+        delete_owned::<Service>(client, &namespace, &name, &owner_uid).await,
+        Box::pin(delete_owned::<Deployment>(client, &namespace, &name, &owner_uid)).await,
+        delete_owned::<ConfigMap>(client, &namespace, &name, &owner_uid).await,
+        delete_owned::<PodDisruptionBudget>(client, &namespace, &name, &owner_uid).await,
+    ];
+    deletions.into_iter().collect::<Result<Vec<()>>>().map(|_| ())
 }
 
 /// Checks controller ownership and guards deletion against concurrent replacement.
@@ -116,6 +124,35 @@ mod tests {
             assert!(
                 journal.requests().iter().all(|request| request.method != "DELETE"),
                 "a matching resource name is not ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_attempts_every_child_even_after_a_failure() {
+        let (ctx, journal) = testing::fake_context(vec![testing::Canned::server_error("")], testing::Cached::default());
+        let gateway = Gateway {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("gw".to_owned()),
+                namespace: Some("infra".to_owned()),
+                uid: Some("gateway-uid".to_owned()),
+                ..Default::default()
+            },
+            spec: gateway_api::gateways::GatewaySpec::default(),
+            status: None,
+        };
+
+        let result = delete_children(&ctx.client, &gateway).await;
+
+        assert!(
+            result.is_err(),
+            "a delete the API server refused has to fail the reconcile so it is retried"
+        );
+        for kind in ["/services/", "/deployments/", "/configmaps/", "/poddisruptionbudgets/"] {
+            assert!(
+                !journal.matching(kind).is_empty(),
+                "every owned child must be attempted, or one transient error leaves the Gateway \
+                 half-dismantled until the next retry: {kind}"
             );
         }
     }
