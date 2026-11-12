@@ -14,7 +14,7 @@ use gateway_api::{gatewayclasses::GatewayClass, gateways::Gateway, httproutes::H
 use kube::{Api, ResourceExt as _};
 use tracing::debug;
 
-use super::namespace_filter;
+use super::{namespace_filter, praxis_config};
 use crate::{
     context::CONTROLLER_NAME,
     error::{OperatorError, Result},
@@ -75,6 +75,12 @@ fn is_api_not_found(err: &kube::Error) -> bool {
 
 /// Collects `HTTPRoute` resources attached to the Gateway, filtered by
 /// namespace policies.
+///
+/// Only listeners the data plane can actually serve take part: a
+/// listener on the reserved port, with an unsupported protocol, or in a
+/// binding conflict is rejected in status, so attaching routes to it
+/// would report an attachment the Gateway does not have. The same
+/// predicate as config generation is used so the two cannot drift.
 pub(super) fn collect_routes<'route>(
     gw: &Gateway,
     all_routes: &'route [Arc<HTTPRoute>],
@@ -83,8 +89,9 @@ pub(super) fn collect_routes<'route>(
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
-    let attached = attachment::attached_routes(&name, &ns, &gw.spec.listeners, all_routes);
-    namespace_filter::filter_routes_by_allowed_namespaces(&attached, &gw.spec.listeners, &ns, stores)
+    let listeners = praxis_config::usable_listeners(&gw.spec.listeners);
+    let attached = attachment::attached_routes(&name, &ns, &listeners, all_routes);
+    namespace_filter::filter_routes_by_allowed_namespaces(&attached, &listeners, &ns, stores)
 }
 
 // -----------------------------------------------------------------------------
@@ -191,6 +198,29 @@ mod tests {
             collect_routes(&gateway(), &routes, &stores).is_empty(),
             "a Gateway with no attached routes gets an empty route table, not every route"
         );
+    }
+
+    #[test]
+    fn test_collect_routes_ignores_listeners_that_are_never_programmed() {
+        use crate::context::ADMIN_PORT;
+
+        let routes = vec![Arc::new(route("mine", "gw"))];
+        let stores = Stores::fake(vec![], vec![], vec![]);
+        for (port, protocol) in [(ADMIN_PORT, "HTTP"), (80, "TCP")] {
+            let mut gw = gateway();
+            gw.spec.listeners = vec![GatewayListeners {
+                name: "rejected".to_owned(),
+                port,
+                protocol: protocol.to_owned(),
+                ..Default::default()
+            }];
+
+            assert!(
+                collect_routes(&gw, &routes, &stores).is_empty(),
+                "a listener the data plane never serves must not attach routes, or route status \
+                 would report an attachment this Gateway does not have: {protocol} on {port}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

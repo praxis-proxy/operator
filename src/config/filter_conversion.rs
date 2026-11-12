@@ -136,14 +136,17 @@ pub struct ServedRule<'rule> {
     /// The rule contributing filters.
     pub rule: &'rule HttpRouteRules,
 
-    /// Whether any `backendRef` on the rule survived reference checks.
+    /// Whether the rule has a backend the gateway can forward to.
     ///
-    /// A rule whose every backend was refused — a cross-namespace
-    /// reference with no `ReferenceGrant` covering it — produces no
-    /// route, and the router answers a request for it with 404. The
-    /// Gateway API prescribes 500 for an unresolvable reference, so
-    /// such a rule gets the same static response as one that named no
-    /// backend at all.
+    /// `false` covers two cases: every `backendRef` was refused — a
+    /// cross-namespace reference with no `ReferenceGrant` covering it —
+    /// or the backends are authorized but their cluster has no ready
+    /// endpoints yet. Either way the rule produces no route, and the
+    /// router answers a request for it with 404. The Gateway API
+    /// prescribes 500 for an unresolvable reference, and a Service
+    /// with no ready endpoints can take no traffic either, so both
+    /// get the same static response as a rule that named no backend
+    /// at all.
     pub resolvable: bool,
 }
 

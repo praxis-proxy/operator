@@ -8,6 +8,8 @@
 //! whole job here, and it is arithmetic that has already overflowed
 //! once, so it lives apart from the reconciler with its own tests.
 
+use std::collections::HashMap;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -19,8 +21,11 @@
 /// arithmetic that cannot run away.
 const MAX_LCM_DENOMINATOR: i64 = 1_000_000; // 1e6
 
-/// Largest weight the generated data-plane config can carry.
-const MAX_ENDPOINT_WEIGHT: i64 = 2_147_483_647; // i32::MAX
+/// Largest per-endpoint weight the data plane accepts.
+///
+/// The proxy validates each endpoint weight and rejects anything above
+/// this ceiling, so the split scales down to fit it.
+const MAX_ENDPOINT_WEIGHT: i64 = 1_000;
 
 // -----------------------------------------------------------------------------
 // Type Aliases
@@ -53,16 +58,24 @@ pub fn sort_service_endpoints(service_data: &mut [ResolvedBackend]) {
 /// reduced by their GCD to minimise the round-robin cycle length,
 /// which improves distribution accuracy for small request batches.
 ///
+/// A service with weight 0 contributes no endpoints: the Gateway API
+/// reserves 0 for "this backend receives no traffic", and the data plane
+/// rejects a weight-0 endpoint outright. An address selected by more
+/// than one service (or listed by more than one of its slices) appears
+/// once, carrying the sum of its per-service weights, because the data
+/// plane rejects a repeated address — "use `weight` to bias traffic".
+///
 /// All arithmetic runs in `i64` and saturates. The release profile
 /// combines `overflow-checks` with `panic = "abort"`, so an overflow
 /// here would kill the operator rather than mis-route a request.
 pub fn distribute_service_weights(service_data: &[ResolvedBackend]) -> (Vec<String>, Vec<i32>) {
     let lcm_denominator = endpoint_count_lcm(service_data);
     let mut all_endpoints = Vec::new();
-    let mut all_weights = Vec::new();
+    let mut all_weights: Vec<i64> = Vec::new();
+    let mut positions: HashMap<&str, usize> = HashMap::new();
 
     for (service_weight, endpoints) in service_data {
-        if endpoints.is_empty() {
+        if *service_weight <= 0 || endpoints.is_empty() {
             continue;
         }
 
@@ -70,8 +83,15 @@ pub fn distribute_service_weights(service_data: &[ResolvedBackend]) -> (Vec<Stri
         #[expect(clippy::arithmetic_side_effects, reason = "count >= 1 from endpoint_count")]
         let ep_weight = i64::from(*service_weight).saturating_mul(lcm_denominator) / count;
         for ep in endpoints {
-            all_endpoints.push(ep.clone());
-            all_weights.push(ep_weight);
+            if let Some(&position) = positions.get(ep.as_str()) {
+                if let Some(weight) = all_weights.get_mut(position) {
+                    *weight = weight.saturating_add(ep_weight);
+                }
+            } else {
+                positions.insert(ep.as_str(), all_endpoints.len());
+                all_endpoints.push(ep.clone());
+                all_weights.push(ep_weight);
+            }
         }
     }
 
@@ -255,10 +275,10 @@ mod tests {
     #[test]
     fn test_distribute_weights_survives_adversarial_endpoint_counts() {
         let data = [
-            (1_000_000, endpoints(&["10.0.0.1:80"; 7])),
-            (1_000_000, endpoints(&["10.0.1.1:80"; 11])),
-            (1_000_000, endpoints(&["10.0.2.1:80"; 13])),
-            (1_000_000, endpoints(&["10.0.3.1:80"; 17])),
+            (1_000_000, distinct_endpoints("10.0.0.", 7)),
+            (1_000_000, distinct_endpoints("10.0.1.", 11)),
+            (1_000_000, distinct_endpoints("10.0.2.", 13)),
+            (1_000_000, distinct_endpoints("10.0.3.", 17)),
         ];
 
         let (eps, weights) = distribute_service_weights(&data);
@@ -283,6 +303,54 @@ mod tests {
         assert!(
             weights.iter().all(|wt| *wt > 0),
             "extreme weights must stay representable instead of overflowing"
+        );
+    }
+
+    #[test]
+    fn test_distribute_weights_skips_zero_weight_services() {
+        let data = [(0, endpoints(&["10.0.0.1:80"])), (1, endpoints(&["10.0.1.1:80"]))];
+        let (eps, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            eps,
+            vec!["10.0.1.1:80".to_owned()],
+            "a weight-0 backend receives no traffic and emits no endpoints"
+        );
+        assert_eq!(weights, vec![1], "only the weighted service contributes");
+    }
+
+    #[test]
+    fn test_distribute_weights_merges_repeated_addresses() {
+        let data = [
+            (1, endpoints(&["10.0.0.1:80"])),
+            (3, endpoints(&["10.0.0.1:80", "10.0.1.1:80"])),
+        ];
+        let (eps, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            eps,
+            vec!["10.0.0.1:80".to_owned(), "10.0.1.1:80".to_owned()],
+            "an address selected by two services appears once"
+        );
+        assert_eq!(
+            weights,
+            vec![5, 3],
+            "a shared address carries the sum of its per-service weights"
+        );
+    }
+
+    #[test]
+    fn test_distribute_weights_fits_the_data_plane_ceiling() {
+        let data = [
+            (1_000_000, endpoints(&["10.0.0.1:80"])),
+            (1, endpoints(&["10.0.1.1:80"])),
+        ];
+        let (_, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            weights,
+            vec![1000, 1],
+            "weights must scale into the data plane's 1..=1000 range"
         );
     }
 
@@ -350,5 +418,11 @@ mod tests {
     /// Builds an owned endpoint address list.
     fn endpoints(addrs: &[&str]) -> Vec<String> {
         addrs.iter().map(|addr| (*addr).to_owned()).collect()
+    }
+
+    /// Builds `count` distinct addresses under one `/24`, for services
+    /// whose endpoint lists must not overlap.
+    fn distinct_endpoints(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|idx| format!("{prefix}{idx}:80")).collect()
     }
 }

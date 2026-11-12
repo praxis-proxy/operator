@@ -53,7 +53,7 @@ use crate::{
 /// rather than appending, so conformance asked for
 /// `append-val-1,header-val-2` and got `header-val-2`.
 ///
-/// Praxis 0.5.2, now the pinned data plane, appends: `request_add`
+/// Praxis 0.7.5, now the pinned data plane, appends: `request_add`
 /// reads the existing values and combines them. Both header-modification
 /// features are claimed again on that basis, and the conformance suites
 /// they gate are no longer skipped.

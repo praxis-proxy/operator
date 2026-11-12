@@ -3,7 +3,7 @@
 
 //! Route attachment logic for `HTTPRoute` `parentRefs`.
 
-use std::sync::Arc;
+use std::{borrow::Borrow, sync::Arc};
 
 use gateway_api::{
     gateways::GatewayListeners,
@@ -81,13 +81,18 @@ pub fn listener_matches_parent_ref(listener: &GatewayListeners, parent: &HttpRou
 /// Gateway may have several, told apart by hostname. A ref naming
 /// neither targets all of them, which is spelled `None` so that a
 /// route does not have to be re-derived when listeners change.
-fn targeted_sections(parent: &HttpRouteParentRefs, listeners: &[GatewayListeners]) -> Vec<Option<String>> {
+/// Resolves the listener section names a parent reference targets.
+fn targeted_sections<L>(parent: &HttpRouteParentRefs, listeners: &[L]) -> Vec<Option<String>>
+where
+    L: Borrow<GatewayListeners>,
+{
     if parent.section_name.is_none() && parent.port.is_none() {
         return vec![None];
     }
 
     listeners
         .iter()
+        .map(Borrow::borrow)
         .filter(|listener| listener_matches_parent_ref(listener, parent))
         .map(|listener| Some(listener.name.clone()))
         .collect()
@@ -98,12 +103,15 @@ fn targeted_sections(parent: &HttpRouteParentRefs, listeners: &[GatewayListeners
 /// Each entry pairs a route with the listener section names its
 /// `parentRefs` resolve to. A `None` section name means the route
 /// attaches to all listeners.
-pub fn attached_routes<'route>(
+pub fn attached_routes<'route, L>(
     gateway_name: &str,
     gateway_ns: &str,
-    listeners: &[GatewayListeners],
+    listeners: &[L],
     routes: &'route [Arc<HTTPRoute>],
-) -> Vec<AttachedRoute<'route>> {
+) -> Vec<AttachedRoute<'route>>
+where
+    L: Borrow<GatewayListeners>,
+{
     let mut result = Vec::new();
 
     for route in routes {

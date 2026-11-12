@@ -7,4 +7,5 @@ pub mod configmap;
 pub mod deployment;
 pub mod disruption;
 pub mod labels;
+pub mod monitoring;
 pub mod service;

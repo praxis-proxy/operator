@@ -12,6 +12,7 @@ use gateway_api::{
 use serde::Serialize;
 use tracing::warn;
 
+use super::cluster::cluster_name as backend_cluster_name;
 use crate::gateway_api::{
     attachment::AttachedRoute, hostname::intersect_hostnames, reference_grant::is_reference_allowed,
     route_validation::validate_route,
@@ -81,7 +82,7 @@ pub struct PraxisFilterEntry {
 /// `Service` endpoints into cluster `IP:port` pairs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendRef {
-    /// Cluster name (format: `namespace~service~port`).
+    /// Cluster name (format: `namespace_service_port`).
     pub cluster_name: String,
 
     /// Kubernetes namespace of the backend Service.
@@ -269,23 +270,34 @@ fn process_rule(
     );
 }
 
-/// Returns `true` when a rule has at least one backend the gateway may
-/// forward to.
+/// Returns `true` when a rule has a backend the gateway may forward to
+/// right now.
 ///
 /// A rule whose every `backendRef` was refused is not the same as a
 /// rule that named none: it still has to answer, with the 500 the
 /// Gateway API prescribes for an unresolvable reference, so the caller
-/// needs to tell the two apart.
-pub fn rule_has_authorized_backend(
+/// needs to tell the two apart. A rule whose backends are all
+/// authorized but share a cluster with no ready endpoints is in the
+/// same position — the reference resolves, but no upstream can take
+/// the traffic yet — so it counts as not serving too.
+///
+/// A rule mixing a ready backend with an endpointless one serves: its
+/// backends merge into one cluster, and the ready service's endpoints
+/// keep it populated.
+pub fn rule_has_serving_backend(
     rule: &gateway_api::httproutes::HttpRouteRules,
     route_ns: &str,
     grants: &[ReferenceGrant],
+    pending: &HashSet<String>,
 ) -> bool {
-    rule.backend_refs
+    let authorized: Vec<_> = rule
+        .backend_refs
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .any(|backend| is_backend_authorized(backend, route_ns, grants))
+        .filter(|backend| is_backend_authorized(backend, route_ns, grants))
+        .collect();
+    !authorized.is_empty() && !pending.contains(&merged_cluster_name_from_refs(&authorized, route_ns))
 }
 
 /// Returns `true` if authorized; logs and returns `false` otherwise.
@@ -321,9 +333,15 @@ fn merged_cluster_name_from_refs(backends: &[&HttpRouteRulesBackendRefs], route_
     }
     backends
         .iter()
-        .map(|backend| single_cluster_name(backend, route_ns))
+        .map(|backend| {
+            format!(
+                "{}_w{}",
+                single_cluster_name(backend, route_ns),
+                backend.weight.unwrap_or(1)
+            )
+        })
         .collect::<Vec<_>>()
-        .join("+")
+        .join("__")
 }
 
 /// Builds a cluster name for a single backend ref.
@@ -331,7 +349,7 @@ fn single_cluster_name(backend: &HttpRouteRulesBackendRefs, route_ns: &str) -> S
     let namespace = backend.namespace.as_deref().unwrap_or(route_ns);
     let service = backend.name.as_str();
     let port = backend.port.unwrap_or(80);
-    format!("{namespace}~{service}~{port}")
+    backend_cluster_name(namespace, service, port)
 }
 
 /// Resolves a single backend ref into a [`BackendRef`].
@@ -355,7 +373,7 @@ fn process_backend_ref(
     let namespace = backend.namespace.as_deref().unwrap_or(route_ns);
     let service = backend.name.as_str();
     let port = backend.port.unwrap_or(80);
-    let dedup_key = format!("{cluster_name}:{namespace}~{service}~{port}");
+    let dedup_key = format!("{cluster_name}:{}", backend_cluster_name(namespace, service, port));
 
     if !seen.insert(dedup_key) {
         return None;
@@ -594,14 +612,14 @@ mod tests {
 
         for r in &praxis_routes {
             assert_eq!(
-                r.cluster, "default~my-svc~8080",
+                r.cluster, "default_my-svc_8080",
                 "cluster should match namespace-service-port"
             );
         }
 
         assert_eq!(backend_refs.len(), 1, "should have one backend ref");
         assert_eq!(
-            backend_refs[0].cluster_name, "default~my-svc~8080",
+            backend_refs[0].cluster_name, "default_my-svc_8080",
             "backend ref cluster name should match"
         );
         assert_eq!(backend_refs[0].service, "my-svc", "backend ref service should match");
@@ -714,11 +732,11 @@ mod tests {
         );
 
         assert!(
-            backend_refs.iter().any(|b| b.cluster_name == "default~api-svc~8080"),
+            backend_refs.iter().any(|b| b.cluster_name == "default_api-svc_8080"),
             "should have api-svc backend ref"
         );
         assert!(
-            backend_refs.iter().any(|b| b.cluster_name == "default~web-svc~80"),
+            backend_refs.iter().any(|b| b.cluster_name == "default_web-svc_80"),
             "should have web-svc backend ref"
         );
     }
@@ -806,12 +824,12 @@ mod tests {
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(
-            praxis_routes[0].cluster, "other-ns~svc~80",
+            praxis_routes[0].cluster, "other-ns_svc_80",
             "cluster should use backend namespace"
         );
 
         assert!(
-            backend_refs.iter().any(|b| b.cluster_name == "other-ns~svc~80"),
+            backend_refs.iter().any(|b| b.cluster_name == "other-ns_svc_80"),
             "backend refs should use backend namespace"
         );
         assert_eq!(
@@ -1383,7 +1401,7 @@ mod tests {
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
-            praxis_routes[0].cluster, "infra~local~80",
+            praxis_routes[0].cluster, "infra_local_80",
             "the cluster name must describe only the backends that actually resolve, or the \
              generated name promises endpoints the cluster will never contain"
         );

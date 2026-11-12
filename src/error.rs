@@ -26,6 +26,10 @@ pub enum OperatorError {
     #[error("gatewayclass not found: {0}")]
     GatewayClassNotFound(String),
 
+    /// A monitoring selector would grant ambiguous or incomplete access.
+    #[error("invalid PRAXIS_MONITORING_POD_SELECTOR: expected unique, non-empty key=value entries")]
+    InvalidMonitoringSelector,
+
     /// Leadership was taken by another replica.
     #[error("leadership lost to another replica")]
     LeadershipLost,

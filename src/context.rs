@@ -29,8 +29,11 @@ pub const GATEWAY_FINALIZER: &str = "gateway.praxis.sh/finalizer";
 /// them.
 pub const FIELD_MANAGER: &str = "praxis-operator";
 
-/// Admin port on the Praxis data-plane container.
-pub const ADMIN_PORT: i32 = 9901;
+/// Health and metrics port on the Praxis data-plane container.
+pub const ADMIN_PORT: i32 = 9902;
+
+/// Named health and metrics port on the Praxis data-plane container.
+pub(crate) const ADMIN_PORT_NAME: &str = "admin";
 
 /// Image used when `PRAXIS_IMAGE` is unset.
 ///
@@ -38,7 +41,10 @@ pub const ADMIN_PORT: i32 = 9901;
 /// every data plane it creates, so `latest` would let an unreviewed
 /// proxy release change the behaviour of an unchanged operator, and the
 /// version CI exercises would drift from the version users run.
-const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:0.5.2";
+///
+/// The deploy manifest substitutes `__PRAXIS_IMAGE__` with the image the
+/// deployment tooling selects; local development uses `praxis:dev`.
+const DEFAULT_PRAXIS_IMAGE: &str = "ghcr.io/praxis-proxy/praxis:0.7.5";
 
 // -----------------------------------------------------------------------------
 // Data Plane Image
@@ -128,6 +134,6 @@ mod tests {
 
     #[test]
     fn test_admin_port_matches_the_praxis_default() {
-        assert_eq!(ADMIN_PORT, 9901, "probes target the Praxis admin endpoint");
+        assert_eq!(ADMIN_PORT, 9902, "probes target the Praxis metrics endpoint");
     }
 }

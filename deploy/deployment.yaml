@@ -32,6 +32,8 @@ spec:
           env:
             - name: PRAXIS_IMAGE
               value: "__PRAXIS_IMAGE__"
+            - name: PRAXIS_MONITORING_ENABLED
+              value: "false"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
