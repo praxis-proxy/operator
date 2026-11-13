@@ -25,7 +25,7 @@ use crate::{
     config::{
         cluster::{PraxisCluster, build_cluster},
         filter_conversion::{RouteFilters, ServedRule, convert_filters},
-        generate::assemble_config,
+        generate::{assemble_config_with_listener_filters},
         listener::{PraxisCertificate, PraxisListener, PraxisTls, convert_listener},
         routing::{BackendRef, PraxisRoute, convert_routes, rule_has_authorized_backend},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},
@@ -82,10 +82,10 @@ pub(super) async fn build_praxis_config(
     let listener_hostnames = build_listener_hostname_map(&supported);
     let praxis_listeners = merge_listeners_by_port(&supported);
     let (praxis_routes, backend_refs) = convert_attached_routes(attached, &listener_hostnames, grants);
-    let route_filters = collect_filters(attached, grants);
+    let route_filters = collect_filters_by_listener(attached, grants, &praxis_listeners);
     let clusters = resolve_clusters(client, &backend_refs).await?;
     let listener_tls = collect_listener_tls(&praxis_listeners);
-    let config = assemble_config(
+    let config = assemble_config_with_listener_filters(
         praxis_listeners,
         &praxis_routes,
         &clusters,
@@ -203,25 +203,38 @@ fn convert_attached_routes(
 /// Each rule is paired with whether any of its backends survived the
 /// reference checks, which is what decides between a rule the router
 /// will serve and one that has to answer 500 on its own.
-fn collect_filters(attached: &[AttachedRoute<'_>], grants: &[ReferenceGrant]) -> RouteFilters {
-    let all_rules: Vec<_> = attached
+fn collect_filters_by_listener(
+    attached: &[AttachedRoute<'_>],
+    grants: &[ReferenceGrant],
+    listeners: &[PraxisListener],
+) -> BTreeMap<String, RouteFilters> {
+    listeners
         .iter()
-        .flat_map(|attached| {
-            let namespace = attached.route.namespace().unwrap_or_default();
-            attached
-                .route
-                .spec
-                .rules
-                .as_deref()
-                .unwrap_or(&[])
+        .map(|listener| {
+            let mut rules = Vec::new();
+            for attached_route in attached
                 .iter()
-                .map(move |rule| ServedRule {
-                    rule,
-                    resolvable: rule_has_authorized_backend(rule, &namespace, grants),
-                })
+                .filter(|attached_route| route_serves_listener(attached_route, listener))
+            {
+                let namespace = attached_route.route.namespace().unwrap_or_default();
+                for rule in attached_route.route.spec.rules.as_deref().unwrap_or(&[]) {
+                    rules.push(ServedRule {
+                        rule,
+                        resolvable: rule_has_authorized_backend(rule, &namespace, grants),
+                    });
+                }
+            }
+            (listener.name.clone(), convert_filters(&rules))
         })
-        .collect();
-    convert_filters(&all_rules)
+        .collect()
+}
+
+/// Whether a route attaches to any Gateway listener merged into `listener`.
+fn route_serves_listener(attached: &AttachedRoute<'_>, listener: &PraxisListener) -> bool {
+    attached.section_names.iter().any(|section| match section {
+        None => true,
+        Some(name) => listener.merged_section_names.iter().any(|merged| merged == name),
+    })
 }
 
 /// Resolves Kubernetes endpoints for each backend ref into clusters.
@@ -818,6 +831,58 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "fixture setup plus three scoping assertions")]
+    fn filters_are_scoped_to_the_listener_and_unauthorized_backends_rejected() {
+        let allowed = route();
+        let mut denied = route();
+        denied.metadata.name = Some("denied".to_owned());
+        if let Some(rules) = denied.spec.rules.as_mut()
+            && let Some(refs) = rules[0].backend_refs.as_mut()
+        {
+            refs[0].namespace = Some("other".to_owned());
+        }
+        let attached = vec![
+            AttachedRoute {
+                route: &allowed,
+                section_names: vec![Some("http".to_owned())],
+            },
+            AttachedRoute {
+                route: &denied,
+                section_names: vec![Some("denied-listener".to_owned())],
+            },
+        ];
+        let listener = |name: &str, sections: &[&str]| PraxisListener {
+            name: name.to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: Vec::new(),
+            protocol: None,
+            hostname: None,
+            merged_section_names: sections.iter().map(|section| (*section).to_owned()).collect(),
+            tls: None,
+        };
+        let listeners = vec![
+            listener("http", &["http"]),
+            listener("denied", &["denied-listener"]),
+            listener("routeless", &["routeless"]),
+        ];
+
+        let filters = collect_filters_by_listener(&attached, &[], &listeners);
+        assert!(
+            filters["http"].terminating.is_empty(),
+            "a resolvable backend needs no terminating filter"
+        );
+        assert!(
+            !filters["denied"].terminating.is_empty(),
+            "every unauthorized backend ref must answer with a terminating response"
+        );
+        assert!(
+            filters["routeless"].terminating.is_empty(),
+            "another listener's filters must not leak into a routeless listener"
+        );
+        assert!(filters["routeless"].transforming.is_empty());
+    }
 
     /// Builds a plain HTTP listener on port 80.
     fn http_listener() -> GatewayListeners {

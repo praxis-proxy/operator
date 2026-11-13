@@ -81,9 +81,35 @@ pub fn assemble_config(
     route_filters: &RouteFilters,
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisConfig> {
+    let by_listener: BTreeMap<String, RouteFilters> = listeners
+        .iter()
+        .map(|listener| (listener.name.clone(), route_filters.clone()))
+        .collect();
+    assemble_config_with_listener_filters(listeners, routes, clusters, &by_listener, listener_hostnames)
+}
+
+/// Assembles a Praxis configuration with filters scoped to each listener.
+///
+/// Route filters belong to the listener whose routes contributed them; a
+/// listener with no routes must not inherit filters from another listener.
+///
+/// # Errors
+///
+/// Returns an error if filter config serialization fails.
+pub fn assemble_config_with_listener_filters(
+    listeners: Vec<PraxisListener>,
+    routes: &[PraxisRoute],
+    clusters: &[PraxisCluster],
+    route_filters: &BTreeMap<String, RouteFilters>,
+    listener_hostnames: &std::collections::HashMap<String, Option<String>>,
+) -> yaml_serde::Result<PraxisConfig> {
+    let empty = RouteFilters::default();
     let filter_chains: Vec<_> = listeners
         .iter()
-        .map(|listener| build_filter_chain(listener, routes, clusters, route_filters, listener_hostnames))
+        .map(|listener| {
+            let filters = route_filters.get(&listener.name).unwrap_or(&empty);
+            build_filter_chain(listener, routes, clusters, filters, listener_hostnames)
+        })
         .collect::<yaml_serde::Result<Vec<_>>>()?;
 
     Ok(PraxisConfig {
@@ -124,6 +150,9 @@ fn build_filter_chain(
         config: yaml_serde::Value::Null,
     }];
     if scoped_refs.is_empty() {
+        // A listener with no routes still serves its terminating filters
+        // (for example a redirect-only rule); the 404 answers everything else.
+        filters.extend_from_slice(&route_filters.terminating);
         filters.push(PraxisFilterEntry {
             filter: "static_response".to_owned(),
             config: yaml_serde::to_value(serde_json::json!({"status": 404}))?,
@@ -728,6 +757,48 @@ mod tests {
     }
 
     #[test]
+    fn routeless_listener_keeps_its_own_terminating_filters() {
+        let listener = PraxisListener {
+            name: "routeless".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: vec!["routeless-chain".to_owned()],
+            protocol: None,
+            hostname: None,
+            merged_section_names: vec!["routeless".to_owned()],
+            tls: None,
+        };
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert(
+            "routeless".to_owned(),
+            RouteFilters {
+                terminating: vec![PraxisFilterEntry {
+                    filter: "redirect".to_owned(),
+                    config: yaml_serde::Value::Null,
+                }],
+                transforming: Vec::new(),
+            },
+        );
+        let config = assemble_config_with_listener_filters(
+            vec![listener],
+            &[],
+            &[],
+            &by_listener,
+            &Default::default(),
+        )
+        .unwrap();
+        let names: Vec<_> = config.filter_chains[0]
+            .filters
+            .iter()
+            .map(|filter| filter.filter.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["request_id", "redirect", "static_response"],
+            "a routeless listener must keep its own terminating filters before the 404"
+        );
+    }
+
+    #[test]
     fn routeless_listeners_do_not_inherit_terminating_filters() {
         let routed = PraxisListener {
             name: "routed".to_owned(),
@@ -764,11 +835,13 @@ mod tests {
             transforming: Vec::new(),
         };
 
-        let config = assemble_config(
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert("routed".to_owned(), route_filters);
+        let config = assemble_config_with_listener_filters(
             vec![routed, routeless],
             std::slice::from_ref(&route),
             std::slice::from_ref(&cluster),
-            &route_filters,
+            &by_listener,
             &Default::default(),
         )
         .unwrap();
