@@ -1,4 +1,6 @@
 # Praxis Kubernetes Operator
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Foperator.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Foperator?ref=badge_shield)
+
 
 [Kubernetes] operator that manages [Praxis] proxy
 instances via [Gateway API].
@@ -65,3 +67,6 @@ the [proposal process](docs/proposals.md).
 ## License
 
 Apache-2.0
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Foperator.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Foperator?ref=badge_large)
