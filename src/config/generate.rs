@@ -778,14 +778,8 @@ mod tests {
                 transforming: Vec::new(),
             },
         );
-        let config = assemble_config_with_listener_filters(
-            vec![listener],
-            &[],
-            &[],
-            &by_listener,
-            &Default::default(),
-        )
-        .unwrap();
+        let config =
+            assemble_config_with_listener_filters(vec![listener], &[], &[], &by_listener, &Default::default()).unwrap();
         let names: Vec<_> = config.filter_chains[0]
             .filters
             .iter()

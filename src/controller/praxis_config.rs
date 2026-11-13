@@ -25,7 +25,7 @@ use crate::{
     config::{
         cluster::{PraxisCluster, build_cluster},
         filter_conversion::{RouteFilters, ServedRule, convert_filters},
-        generate::{assemble_config_with_listener_filters},
+        generate::assemble_config_with_listener_filters,
         listener::{PraxisCertificate, PraxisListener, PraxisTls, convert_listener},
         routing::{BackendRef, PraxisRoute, convert_routes, rule_has_authorized_backend},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},

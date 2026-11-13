@@ -254,7 +254,11 @@ mod tests {
 
     #[test]
     fn test_distribute_weights_skips_zero_weight_services() {
-        let data = [(70, endpoints(&["10.0.0.1:80"])), (30, endpoints(&["10.0.1.1:80"])), (0, endpoints(&["10.0.2.1:80"]))];
+        let data = [
+            (70, endpoints(&["10.0.0.1:80"])),
+            (30, endpoints(&["10.0.1.1:80"])),
+            (0, endpoints(&["10.0.2.1:80"])),
+        ];
         let (eps, weights) = distribute_service_weights(&data);
 
         assert_eq!(
