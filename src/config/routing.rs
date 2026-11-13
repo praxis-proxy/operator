@@ -253,11 +253,11 @@ fn process_rule(
 
     let authorized: Vec<_> = raw_backends
         .iter()
-        .filter(|backend| check_backend_authorized(backend, route_ns, grants))
+        .filter(|backend| check_backend_servable(backend, route_ns, grants))
         .collect();
 
     if authorized.is_empty() {
-        tracing::debug!("rule has no authorized backends; emitting no route");
+        tracing::debug!("rule has no servable backends; emitting no route");
         return;
     }
 
@@ -295,17 +295,33 @@ pub fn rule_has_serving_backend(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter(|backend| is_backend_authorized(backend, route_ns, grants))
+        .filter(|backend| backend_is_servable(backend, route_ns, grants))
         .collect();
     !authorized.is_empty() && !pending.contains(&merged_cluster_name_from_refs(&authorized, route_ns))
 }
 
-/// Returns `true` if authorized; logs and returns `false` otherwise.
-fn check_backend_authorized(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
-    if is_backend_authorized(backend, route_ns, grants) {
+/// Whether a backend ref can receive traffic.
+///
+/// Unknown backend kinds and unauthorized cross-namespace references
+/// are both unresolvable: the Gateway API prescribes 500 for them, so
+/// the rule must not emit a route to a cluster that will never resolve.
+fn backend_is_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    backend_kind_is_supported(backend) && is_backend_authorized(backend, route_ns, grants)
+}
+
+/// Whether the ref names a Service in the core API group.
+fn backend_kind_is_supported(backend: &HttpRouteRulesBackendRefs) -> bool {
+    let group = backend.group.as_deref().unwrap_or("");
+    let kind = backend.kind.as_deref().unwrap_or("Service");
+    group.is_empty() && kind == "Service"
+}
+
+/// Returns `true` if servable; logs and returns `false` otherwise.
+fn check_backend_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    if backend_is_servable(backend, route_ns, grants) {
         return true;
     }
-    tracing::debug!(backend = backend.name, "skipping unauthorized cross-namespace backend");
+    tracing::debug!(backend = backend.name, "skipping unauthorized or unsupported backend");
     false
 }
 
@@ -363,9 +379,9 @@ fn process_backend_ref(
     cluster_name: &str,
     seen: &mut HashSet<String>,
 ) -> Option<BackendRef> {
-    let group = backend.group.as_deref().unwrap_or("");
-    let kind = backend.kind.as_deref().unwrap_or("Service");
-    if !group.is_empty() || kind != "Service" {
+    if !backend_kind_is_supported(backend) {
+        let group = backend.group.as_deref().unwrap_or("");
+        let kind = backend.kind.as_deref().unwrap_or("Service");
         tracing::debug!(group, kind, "skipping unsupported backend ref kind");
         return None;
     }
@@ -1409,6 +1425,19 @@ mod tests {
             backend_refs.len(),
             1,
             "only the authorized backend contributes endpoints"
+        );
+    }
+
+    #[test]
+    fn test_rule_with_unknown_kind_backend_has_no_backend() {
+        let mut rule = rule_with_backend();
+        if let Some(refs) = rule.backend_refs.as_mut() {
+            refs[0].kind = Some("NotAService".to_owned());
+        }
+
+        assert!(
+            !rule_has_serving_backend(&rule, "default", &[], &HashSet::new()),
+            "an unknown backend kind must answer 500 instead of routing to an empty cluster"
         );
     }
 
