@@ -134,6 +134,10 @@ pub fn assemble_config_with_listener_filters(
 /// # Errors
 ///
 /// Returns an error if filter config serialization fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "chain assembly covers the routeless fallback and the routed path"
+)]
 fn build_filter_chain(
     listener: &PraxisListener,
     routes: &[PraxisRoute],
@@ -152,7 +156,12 @@ fn build_filter_chain(
     if scoped_refs.is_empty() {
         // A listener with no routes still serves its terminating filters
         // (for example a redirect-only rule); the 404 answers everything else.
-        filters.extend_from_slice(&route_filters.terminating);
+        if extend_terminating(&mut filters, &route_filters.terminating) {
+            return Ok(PraxisFilterChain {
+                name: format!("{name}-chain"),
+                filters,
+            });
+        }
         filters.push(PraxisFilterEntry {
             filter: "static_response".to_owned(),
             config: yaml_serde::to_value(serde_json::json!({"status": 404}))?,
@@ -162,7 +171,14 @@ fn build_filter_chain(
             filters,
         });
     }
-    filters.extend_from_slice(&route_filters.terminating);
+    if extend_terminating(&mut filters, &route_filters.terminating) {
+        // An unconditional response answers every request, so the router and
+        // load balancer after it would be unreachable and Praxis rejects them.
+        return Ok(PraxisFilterChain {
+            name: format!("{name}-chain"),
+            filters,
+        });
+    }
     filters.push(build_router_filter(&scoped_refs)?);
     filters.extend_from_slice(&route_filters.transforming);
     filters.push(build_lb_filter(clusters)?);
@@ -277,6 +293,35 @@ fn route_sort_key(route: &PraxisRoute) -> (u8, std::cmp::Reverse<usize>, bool, s
 /// identical unconstrained one.
 fn extra_constraints(route: &PraxisRoute) -> usize {
     route.headers.as_ref().map_or(0, BTreeMap::len)
+}
+
+/// Appends terminating filters, stopping at an unconditional response.
+///
+/// Returns `true` when the chain now ends in an unconditional
+/// `static_response`, so no router, load balancer, or 404 fallback may
+/// follow it.
+fn extend_terminating(filters: &mut Vec<PraxisFilterEntry>, terminating: &[PraxisFilterEntry]) -> bool {
+    filters.extend_from_slice(terminating);
+    match filters.iter().position(terminates_unconditionally) {
+        Some(index) => {
+            filters.truncate(index.saturating_add(1));
+            true
+        },
+        None => false,
+    }
+}
+
+/// Whether a `static_response` filter answers the request unconditionally.
+///
+/// Without `conditions`, the response terminates the chain for every
+/// request, so no later filter can run and Praxis rejects a chain that
+/// continues past it.
+fn terminates_unconditionally(entry: &PraxisFilterEntry) -> bool {
+    entry.filter == "static_response"
+        && entry
+            .config
+            .as_mapping()
+            .is_none_or(|mapping| !mapping.contains_key("conditions"))
 }
 
 /// Builds the `router` filter entry from matched routes.
@@ -399,6 +444,49 @@ mod tests {
         let clusters_value = lb_config.get("clusters").expect("lb config should have clusters");
         let clusters_seq = clusters_value.as_sequence().expect("clusters should be a sequence");
         assert_eq!(clusters_seq.len(), 1, "should have one cluster in lb config");
+    }
+
+    #[test]
+    fn test_routeless_unconditional_response_replaces_the_404() {
+        let listener = PraxisListener {
+            name: "routeless".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: vec!["routeless-chain".to_owned()],
+            protocol: None,
+            hostname: None,
+            merged_section_names: vec!["routeless".to_owned()],
+            tls: None,
+        };
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert(
+            "routeless".to_owned(),
+            RouteFilters {
+                terminating: vec![PraxisFilterEntry {
+                    filter: "static_response".to_owned(),
+                    config: yaml_serde::to_value(serde_json::json!({"status": 500})).unwrap(),
+                }],
+                transforming: Vec::new(),
+            },
+        );
+
+        let config =
+            assemble_config_with_listener_filters(vec![listener], &[], &[], &by_listener, &Default::default()).unwrap();
+        let names: Vec<_> = config.filter_chains[0]
+            .filters
+            .iter()
+            .map(|filter| filter.filter.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["request_id", "static_response"],
+            "an unconditional response already terminates the chain, so appending the 404 would \
+             leave an unreachable filter that Praxis rejects"
+        );
+        let status = config.filter_chains[0].filters[1]
+            .config
+            .get("status")
+            .and_then(yaml_serde::Value::as_u64);
+        assert_eq!(status, Some(500), "the rule's own response must be kept");
     }
 
     #[test]

@@ -33,7 +33,9 @@ use crate::{
     context::ADMIN_PORT,
     endpoints,
     error::Result,
-    gateway_api::{attachment::AttachedRoute, listener_conflict, protocol::ListenerProtocol},
+    gateway_api::{
+        attachment::AttachedRoute, listener_conflict, protocol::ListenerProtocol, route_validation::validate_route,
+    },
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
@@ -203,6 +205,10 @@ fn convert_attached_routes(
 /// Each rule is paired with whether any of its backends survived the
 /// reference checks, which is what decides between a rule the router
 /// will serve and one that has to answer 500 on its own.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-listener rule collection plus rejection filtering"
+)]
 fn collect_filters_by_listener(
     attached: &[AttachedRoute<'_>],
     grants: &[ReferenceGrant],
@@ -217,7 +223,19 @@ fn collect_filters_by_listener(
                 .filter(|attached_route| route_serves_listener(attached_route, listener))
             {
                 let namespace = attached_route.route.namespace().unwrap_or_default();
-                for rule in attached_route.route.spec.rules.as_deref().unwrap_or(&[]) {
+                let validation = validate_route(attached_route.route);
+                for (index, rule) in attached_route
+                    .route
+                    .spec
+                    .rules
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                {
+                    if validation.is_rejected(index) {
+                        continue;
+                    }
                     rules.push(ServedRule {
                         rule,
                         resolvable: rule_has_authorized_backend(rule, &namespace, grants),
@@ -882,6 +900,54 @@ mod tests {
             "another listener's filters must not leak into a routeless listener"
         );
         assert!(filters["routeless"].transforming.is_empty());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builds a rejected redirect rule and asserts the result"
+    )]
+    fn rejected_rule_does_not_contribute_terminating_filters() {
+        use gateway_api::httproutes::{
+            HttpRouteRulesFilters, HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersType,
+            HttpRouteRulesMatches, HttpRouteRulesMatchesMethod,
+        };
+
+        let mut rejected = route();
+        if let Some(rules) = rejected.spec.rules.as_mut() {
+            rules[0].matches = Some(vec![HttpRouteRulesMatches {
+                method: Some(HttpRouteRulesMatchesMethod::Post),
+                ..Default::default()
+            }]);
+            rules[0].filters = Some(vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::RequestRedirect,
+                request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                    status_code: Some(302),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]);
+        }
+        let attached = vec![AttachedRoute {
+            route: &rejected,
+            section_names: vec![None],
+        }];
+        let listener = PraxisListener {
+            name: "http".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: Vec::new(),
+            protocol: None,
+            hostname: None,
+            merged_section_names: vec!["http".to_owned()],
+            tls: None,
+        };
+
+        let filters = collect_filters_by_listener(&attached, &[], &[listener]);
+
+        assert!(
+            filters["http"].terminating.is_empty(),
+            "a POST-only rule this operator rejects must not redirect GET traffic"
+        );
     }
 
     /// Builds a plain HTTP listener on port 80.
