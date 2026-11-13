@@ -253,11 +253,11 @@ fn process_rule(
 
     let authorized: Vec<_> = raw_backends
         .iter()
-        .filter(|backend| check_backend_authorized(backend, route_ns, grants))
+        .filter(|backend| check_backend_servable(backend, route_ns, grants))
         .collect();
 
     if authorized.is_empty() {
-        tracing::debug!("rule has no authorized backends; emitting no route");
+        tracing::debug!("rule has no servable backends; emitting no route");
         return;
     }
 
@@ -286,15 +286,38 @@ pub fn rule_has_authorized_backend(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .any(|backend| is_backend_authorized(backend, route_ns, grants))
+        .any(|backend| backend_is_servable(backend, route_ns, grants))
 }
 
-/// Returns `true` if authorized; logs and returns `false` otherwise.
-fn check_backend_authorized(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
-    if is_backend_authorized(backend, route_ns, grants) {
+/// Whether a backend ref can receive traffic.
+///
+/// A ref is servable when its group and kind are supported, a
+/// `ReferenceGrant` authorizes it, and its weight is positive. Gateway
+/// API `weight: 0` means "send no traffic", so such a ref contributes
+/// no endpoints; a rule whose every ref is zero-weighted has no backend
+/// to serve and answers 500 like any other unresolvable rule.
+fn backend_is_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    backend.weight.unwrap_or(1) > 0
+        && backend_kind_is_supported(backend)
+        && is_backend_authorized(backend, route_ns, grants)
+}
+
+/// Whether the ref names a Service in the core API group.
+fn backend_kind_is_supported(backend: &HttpRouteRulesBackendRefs) -> bool {
+    let group = backend.group.as_deref().unwrap_or("");
+    let kind = backend.kind.as_deref().unwrap_or("Service");
+    group.is_empty() && kind == "Service"
+}
+
+/// Returns `true` if servable; logs and returns `false` otherwise.
+fn check_backend_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    if backend_is_servable(backend, route_ns, grants) {
         return true;
     }
-    tracing::debug!(backend = backend.name, "skipping unauthorized cross-namespace backend");
+    tracing::debug!(
+        backend = backend.name,
+        "skipping unauthorized, unsupported, or zero-weight backend"
+    );
     false
 }
 
@@ -352,9 +375,9 @@ fn process_backend_ref(
     cluster_name: &str,
     seen: &mut HashSet<String>,
 ) -> Option<BackendRef> {
-    let group = backend.group.as_deref().unwrap_or("");
-    let kind = backend.kind.as_deref().unwrap_or("Service");
-    if !group.is_empty() || kind != "Service" {
+    if !backend_kind_is_supported(backend) {
+        let group = backend.group.as_deref().unwrap_or("");
+        let kind = backend.kind.as_deref().unwrap_or("Service");
         tracing::debug!(group, kind, "skipping unsupported backend ref kind");
         return None;
     }
@@ -1431,6 +1454,65 @@ mod tests {
             backend_refs.len(),
             1,
             "only the authorized backend contributes endpoints"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_omits_zero_weight_backends() {
+        let route = route_with_rules(vec![HttpRouteRules {
+            backend_refs: Some(vec![
+                HttpRouteRulesBackendRefs {
+                    name: "kept".to_owned(),
+                    port: Some(80),
+                    weight: Some(70),
+                    ..Default::default()
+                },
+                HttpRouteRulesBackendRefs {
+                    name: "zero".to_owned(),
+                    port: Some(80),
+                    weight: Some(0),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }]);
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert_eq!(
+            praxis_routes[0].cluster, "default_kept_80",
+            "only the servable backend should shape the cluster name"
+        );
+        assert_eq!(backend_refs.len(), 1, "a zero-weight backend contributes no endpoints");
+    }
+
+    #[test]
+    fn test_rule_with_only_zero_weight_backends_has_no_backend() {
+        let mut rule = rule_with_backend();
+        if let Some(refs) = rule.backend_refs.as_mut() {
+            refs[0].weight = Some(0);
+        }
+
+        assert!(
+            !rule_has_authorized_backend(&rule, "default", &[]),
+            "a rule whose only backend has weight zero cannot serve traffic"
+        );
+    }
+
+    #[test]
+    fn test_rule_with_unknown_kind_backend_has_no_backend() {
+        let mut rule = rule_with_backend();
+        if let Some(refs) = rule.backend_refs.as_mut() {
+            refs[0].kind = Some("NotAService".to_owned());
+        }
+
+        assert!(
+            !rule_has_authorized_backend(&rule, "default", &[]),
+            "an unknown backend kind must answer 500 instead of routing to an empty cluster"
         );
     }
 

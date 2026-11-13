@@ -62,7 +62,7 @@ pub fn distribute_service_weights(service_data: &[ResolvedBackend]) -> (Vec<Stri
     let mut all_weights = Vec::new();
 
     for (service_weight, endpoints) in service_data {
-        if endpoints.is_empty() {
+        if *service_weight <= 0 || endpoints.is_empty() {
             continue;
         }
 
@@ -83,7 +83,7 @@ pub fn distribute_service_weights(service_data: &[ResolvedBackend]) -> (Vec<Stri
 fn endpoint_count_lcm(service_data: &[ResolvedBackend]) -> i64 {
     service_data
         .iter()
-        .filter(|(_, eps)| !eps.is_empty())
+        .filter(|(weight, eps)| *weight > 0 && !eps.is_empty())
         .map(|(_, eps)| endpoint_count(eps))
         .fold(1, lcm)
 }
@@ -250,6 +250,19 @@ mod tests {
             "an empty service contributes nothing"
         );
         assert_eq!(weights, vec![1], "only the resolved service is weighted");
+    }
+
+    #[test]
+    fn test_distribute_weights_skips_zero_weight_services() {
+        let data = [(70, endpoints(&["10.0.0.1:80"])), (30, endpoints(&["10.0.1.1:80"])), (0, endpoints(&["10.0.2.1:80"]))];
+        let (eps, weights) = distribute_service_weights(&data);
+
+        assert_eq!(
+            eps,
+            vec!["10.0.0.1:80".to_owned(), "10.0.1.1:80".to_owned()],
+            "a zero-weight backend must receive no traffic"
+        );
+        assert_eq!(weights, vec![7, 3], "positive weights keep their ratio");
     }
 
     #[test]
