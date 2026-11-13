@@ -120,10 +120,22 @@ fn build_filter_chain(
         // A rule can answer without producing a route: a redirect, or the
         // 500 for a reference that cannot resolve. Those terminating
         // filters still have to run, ahead of the routeless fallback.
-        filters.extend(terminating);
+        if extend_terminating(&mut filters, &terminating) {
+            return Ok(PraxisFilterChain {
+                name: format!("{name}-chain"),
+                filters,
+            });
+        }
         return routeless_chain(name, filters);
     }
-    filters.extend(terminating);
+    if extend_terminating(&mut filters, &terminating) {
+        // An unconditional response answers every request, so the router and
+        // load balancer after it would be unreachable and Praxis rejects them.
+        return Ok(PraxisFilterChain {
+            name: format!("{name}-chain"),
+            filters,
+        });
+    }
     filters.push(build_router_filter(&scoped_refs)?);
     filters.extend_from_slice(&route_filters.transforming);
     filters.push(build_lb_filter(clusters)?);
@@ -132,6 +144,35 @@ fn build_filter_chain(
         name: format!("{name}-chain"),
         filters,
     })
+}
+
+/// Appends terminating filters, stopping at an unconditional response.
+///
+/// Returns `true` when the chain now ends in an unconditional
+/// `static_response`, so no router, load balancer, or 404 fallback may
+/// follow it.
+fn extend_terminating(filters: &mut Vec<PraxisFilterEntry>, terminating: &[PraxisFilterEntry]) -> bool {
+    filters.extend_from_slice(terminating);
+    match filters.iter().position(terminates_unconditionally) {
+        Some(index) => {
+            filters.truncate(index.saturating_add(1));
+            true
+        },
+        None => false,
+    }
+}
+
+/// Whether a `static_response` filter answers the request unconditionally.
+///
+/// Without `conditions`, the response terminates the chain for every
+/// request, so no later filter can run and Praxis rejects a chain that
+/// continues past it.
+fn terminates_unconditionally(entry: &PraxisFilterEntry) -> bool {
+    entry.filter == "static_response"
+        && entry
+            .config
+            .as_mapping()
+            .is_none_or(|mapping| !mapping.contains_key("conditions"))
 }
 
 /// Selects and orders the routes that target one listener.
@@ -509,6 +550,47 @@ mod tests {
             api_chain.filters[1].filter, "static_response",
             "unrelated routeless listeners keep their 404 behavior"
         );
+    }
+
+    #[test]
+    fn test_routeless_unconditional_response_replaces_the_404() {
+        let listener = PraxisListener {
+            name: "routeless".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: vec!["routeless-chain".to_owned()],
+            protocol: None,
+            hostname: None,
+            merged_section_names: vec!["routeless".to_owned()],
+            tls: None,
+        };
+        let route_filters = RouteFilters {
+            terminating: vec![ScopedFilter {
+                entry: PraxisFilterEntry {
+                    filter: "static_response".to_owned(),
+                    config: yaml_serde::to_value(serde_json::json!({"status": 500})).unwrap(),
+                },
+                section_names: vec![None],
+            }],
+            transforming: Vec::new(),
+        };
+
+        let config = assemble_config(vec![listener], &[], &[], &route_filters, &Default::default()).unwrap();
+        let names: Vec<_> = config.filter_chains[0]
+            .filters
+            .iter()
+            .map(|filter| filter.filter.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["request_id", "static_response"],
+            "an unconditional response already terminates the chain, so appending the 404 would \
+             leave an unreachable filter that Praxis rejects"
+        );
+        let status = config.filter_chains[0].filters[1]
+            .config
+            .get("status")
+            .and_then(yaml_serde::Value::as_u64);
+        assert_eq!(status, Some(500), "the rule's own response must be kept");
     }
 
     #[test]

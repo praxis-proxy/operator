@@ -32,7 +32,9 @@ use crate::{
     context::ADMIN_PORT,
     endpoints,
     error::Result,
-    gateway_api::{attachment::AttachedRoute, listener_conflict, protocol::ListenerProtocol},
+    gateway_api::{
+        attachment::AttachedRoute, listener_conflict, protocol::ListenerProtocol, route_validation::validate_route,
+    },
     resources::{
         configmap::build_configmap,
         deployment::{DeploymentParams, build_deployment},
@@ -205,6 +207,7 @@ fn collect_filters(
         .flat_map(|attached| {
             let namespace = attached.route.namespace().unwrap_or_default();
             let section_names = attached.section_names.as_slice();
+            let validation = validate_route(attached.route);
             attached
                 .route
                 .spec
@@ -212,7 +215,9 @@ fn collect_filters(
                 .as_deref()
                 .unwrap_or(&[])
                 .iter()
-                .map(move |rule| ServedRule {
+                .enumerate()
+                .filter(move |(index, _)| !validation.is_rejected(*index))
+                .map(move |(_, rule)| ServedRule {
                     rule,
                     section_names,
                     resolvable: rule_has_serving_backend(rule, &namespace, grants, pending),
@@ -776,6 +781,41 @@ mod tests {
             listener_ports,
             tls_secret_names,
         }
+    }
+
+    #[test]
+    fn rejected_rule_does_not_contribute_terminating_filters() {
+        use gateway_api::httproutes::{
+            HttpRouteRulesFilters, HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersType,
+            HttpRouteRulesMatches, HttpRouteRulesMatchesMethod,
+        };
+
+        let mut rejected = route();
+        if let Some(rules) = rejected.spec.rules.as_mut() {
+            rules[0].matches = Some(vec![HttpRouteRulesMatches {
+                method: Some(HttpRouteRulesMatchesMethod::Post),
+                ..Default::default()
+            }]);
+            rules[0].filters = Some(vec![HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::RequestRedirect,
+                request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                    status_code: Some(302),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]);
+        }
+        let attached = vec![AttachedRoute {
+            route: &rejected,
+            section_names: vec![None],
+        }];
+
+        let filters = collect_filters(&attached, &[], &HashSet::new());
+
+        assert!(
+            filters.terminating.is_empty(),
+            "a POST-only rule this operator rejects must not redirect GET traffic"
+        );
     }
 
     fn http_listener() -> GatewayListeners {
