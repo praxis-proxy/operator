@@ -15,8 +15,8 @@ The format follows [Keep a Changelog], and this project adheres to
 - Opt-in PodMonitor generation and metrics ingress policy with ownership-checked
   cleanup when monitoring is disabled or no usable listeners remain.
 
-- Health, readiness and metrics endpoints on port 8080, with matching
-  probes on the operator Deployment.
+- Health, readiness and metrics endpoints on the reserved admin port 9902,
+  with matching probes on the operator Deployment.
 - Leader election over a coordination `Lease`, so the operator can run
   more than one replica safely.
 - Kubernetes events explaining why a Gateway was rejected.
@@ -38,6 +38,9 @@ The format follows [Keep a Changelog], and this project adheres to
   routes produce no router entries: their terminating filters run ahead of
   the routeless 404 fallback, so a redirect still redirects and an
   unresolvable reference still answers 500 instead of 404.
+- Terminating filters now run only on the listeners their routes target, so
+  a redirect or invalid-reference rule on one listener no longer answers
+  another listener's traffic or overrides its routeless 404 fallback.
 - Backend references with weight 0 contribute no endpoints, duplicate
   endpoint addresses are merged with summed weights, and per-endpoint
   weights scale into the data plane's 1..=1000 range, matching the proxy's

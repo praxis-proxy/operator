@@ -93,7 +93,9 @@ pub fn assemble_config(
 /// (with embedded clusters). [`RouteFilters`] explains why the router
 /// splits the two groups. A listener with no routable routes keeps the
 /// answer-without-upstream filters and falls back to a 404 instead of
-/// running a router.
+/// running a router. Terminating filters only run on the listeners
+/// their routes target, so a filter from one listener never answers
+/// another listener's traffic.
 ///
 /// # Errors
 ///
@@ -108,6 +110,7 @@ fn build_filter_chain(
     let name = &listener.name;
     let scoped = scoped_routes(routes, &listener.merged_section_names, listener_hostnames);
     let scoped_refs: Vec<_> = scoped.iter().collect();
+    let terminating = route_filters.terminating_for_listener(&listener.merged_section_names);
 
     let mut filters = vec![PraxisFilterEntry {
         filter: "request_id".to_owned(),
@@ -117,10 +120,10 @@ fn build_filter_chain(
         // A rule can answer without producing a route: a redirect, or the
         // 500 for a reference that cannot resolve. Those terminating
         // filters still have to run, ahead of the routeless fallback.
-        filters.extend_from_slice(&route_filters.terminating);
+        filters.extend(terminating);
         return routeless_chain(name, filters);
     }
-    filters.extend_from_slice(&route_filters.terminating);
+    filters.extend(terminating);
     filters.push(build_router_filter(&scoped_refs)?);
     filters.extend_from_slice(&route_filters.transforming);
     filters.push(build_lb_filter(clusters)?);
@@ -329,7 +332,10 @@ fn build_lb_filter(clusters: &[PraxisCluster]) -> yaml_serde::Result<PraxisFilte
 #[expect(clippy::too_many_lines, clippy::default_trait_access, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::config::cluster::{PraxisEndpoint, build_cluster};
+    use crate::config::{
+        cluster::{PraxisEndpoint, build_cluster},
+        filter_conversion::ScopedFilter,
+    };
 
     #[test]
     fn test_assemble_config_single_http_listener() {
@@ -402,13 +408,16 @@ mod tests {
             tls: None,
         };
 
-        let redirect = PraxisFilterEntry {
-            filter: "redirect".to_owned(),
-            config: yaml_serde::to_value(serde_json::json!({
-                "status": 307,
-                "location": "https://example.com${path}${query}",
-            }))
-            .unwrap(),
+        let redirect = ScopedFilter {
+            entry: PraxisFilterEntry {
+                filter: "redirect".to_owned(),
+                config: yaml_serde::to_value(serde_json::json!({
+                    "status": 307,
+                    "location": "https://example.com${path}${query}",
+                }))
+                .unwrap(),
+            },
+            section_names: vec![None],
         };
         let route_filters = RouteFilters {
             terminating: vec![redirect],
@@ -433,6 +442,73 @@ mod tests {
             .get("status")
             .and_then(yaml_serde::Value::as_u64);
         assert_eq!(status, Some(404), "the fallback answers 404");
+    }
+
+    #[test]
+    fn test_routeless_listener_excludes_foreign_terminating_filters() {
+        let web = PraxisListener {
+            name: "web".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            protocol: None,
+            filter_chains: vec!["web-chain".to_owned()],
+            hostname: None,
+            merged_section_names: vec!["web".to_owned()],
+            tls: None,
+        };
+        let api = PraxisListener {
+            name: "api".to_owned(),
+            address: "0.0.0.0:8080".to_owned(),
+            protocol: None,
+            filter_chains: vec!["api-chain".to_owned()],
+            hostname: None,
+            merged_section_names: vec!["api".to_owned()],
+            tls: None,
+        };
+
+        let redirect = ScopedFilter {
+            entry: PraxisFilterEntry {
+                filter: "redirect".to_owned(),
+                config: yaml_serde::to_value(serde_json::json!({
+                    "status": 307,
+                    "location": "https://example.com${path}${query}",
+                }))
+                .unwrap(),
+            },
+            section_names: vec![Some("web".to_owned())],
+        };
+        let route_filters = RouteFilters {
+            terminating: vec![redirect],
+            transforming: vec![],
+        };
+
+        let config = assemble_config(vec![web, api], &[], &[], &route_filters, &Default::default()).unwrap();
+
+        let web_chain = config
+            .filter_chains
+            .iter()
+            .find(|chain| chain.name == "web-chain")
+            .expect("web listener keeps its chain");
+        assert!(
+            web_chain.filters.iter().any(|filter| filter.filter == "redirect"),
+            "the listener the redirect's route targets still answers with it"
+        );
+
+        let api_chain = config
+            .filter_chains
+            .iter()
+            .find(|chain| chain.name == "api-chain")
+            .expect("api listener keeps its chain");
+        assert_eq!(
+            api_chain.filters.len(),
+            2,
+            "request_id and the fallback alone: a redirect scoped to the web listener must not \
+             answer the api listener's traffic"
+        );
+        assert_eq!(api_chain.filters[0].filter, "request_id");
+        assert_eq!(
+            api_chain.filters[1].filter, "static_response",
+            "unrelated routeless listeners keep their 404 behavior"
+        );
     }
 
     #[test]
@@ -762,9 +838,12 @@ mod tests {
             tls: None,
         };
 
-        let redirect = PraxisFilterEntry {
-            filter: "redirect".to_owned(),
-            config: yaml_serde::Value::Null,
+        let redirect = ScopedFilter {
+            entry: PraxisFilterEntry {
+                filter: "redirect".to_owned(),
+                config: yaml_serde::Value::Null,
+            },
+            section_names: vec![None],
         };
 
         let headers = PraxisFilterEntry {

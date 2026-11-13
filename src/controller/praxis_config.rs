@@ -204,6 +204,7 @@ fn collect_filters(
         .iter()
         .flat_map(|attached| {
             let namespace = attached.route.namespace().unwrap_or_default();
+            let section_names = attached.section_names.as_slice();
             attached
                 .route
                 .spec
@@ -213,6 +214,7 @@ fn collect_filters(
                 .iter()
                 .map(move |rule| ServedRule {
                     rule,
+                    section_names,
                     resolvable: rule_has_serving_backend(rule, &namespace, grants, pending),
                 })
         })

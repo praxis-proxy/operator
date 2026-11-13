@@ -116,14 +116,61 @@ pub struct RouteFilters {
     /// Filters that answer the request without an upstream.
     ///
     /// Run before the router, which would otherwise 404 the traffic
-    /// they exist to serve.
-    pub terminating: Vec<PraxisFilterEntry>,
+    /// they exist to serve. Each carries the listeners its route
+    /// targets, so it lands on the same listeners as the route.
+    pub terminating: Vec<ScopedFilter>,
 
     /// Filters that reshape a request the router has already placed.
     ///
     /// Run after the router, so route selection sees the request the
     /// client sent.
     pub transforming: Vec<PraxisFilterEntry>,
+}
+
+/// A terminating filter paired with the listeners its route targets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedFilter {
+    /// The filter entry itself.
+    pub entry: PraxisFilterEntry,
+
+    /// Listener section names of the route that produced the entry.
+    ///
+    /// Carries the same shape as
+    /// [`AttachedRoute::section_names`](crate::gateway_api::attachment::AttachedRoute):
+    /// a `None` entry targets every listener, and an empty list is
+    /// treated the same way.
+    pub section_names: Vec<Option<String>>,
+}
+
+impl RouteFilters {
+    /// Returns the terminating filters whose route targets a listener
+    /// merged from `merged_section_names`.
+    ///
+    /// A terminating filter answers traffic its own route matched, so it
+    /// must not run on a listener that route never attached to: a
+    /// catch-all redirect or invalid-reference 500 on one listener would
+    /// otherwise answer traffic meant for another listener's routes or
+    /// its routeless 404 fallback.
+    pub fn terminating_for_listener(&self, merged_section_names: &[String]) -> Vec<PraxisFilterEntry> {
+        self.terminating
+            .iter()
+            .filter(|scoped| scoped.targets_listener(merged_section_names))
+            .map(|scoped| scoped.entry.clone())
+            .collect()
+    }
+}
+
+impl ScopedFilter {
+    /// Returns whether the source route targets a listener merged from
+    /// the given section names.
+    fn targets_listener(&self, merged_section_names: &[String]) -> bool {
+        self.section_names.is_empty()
+            || self.section_names.iter().any(|section| {
+                section
+                    .as_deref()
+                    .is_none_or(|name| merged_section_names.iter().any(|merged| merged == name))
+            })
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -135,6 +182,12 @@ pub struct RouteFilters {
 pub struct ServedRule<'rule> {
     /// The rule contributing filters.
     pub rule: &'rule HttpRouteRules,
+
+    /// Listener section names of the route carrying the rule.
+    ///
+    /// Terminating filters follow their route onto exactly the
+    /// listeners it targets.
+    pub section_names: &'rule [Option<String>],
 
     /// Whether the rule has a backend the gateway can forward to.
     ///
@@ -166,11 +219,11 @@ pub fn convert_filters(rules: &[ServedRule<'_>]) -> RouteFilters {
     for (index, served) in rules.iter().enumerate() {
         let condition = rule_conditions(index, &scoped);
         if !served.resolvable && !rule_has_redirect(served.rule) {
-            emit_no_backend_response(condition.as_ref(), &mut filters.terminating);
+            emit_no_backend_response(condition.as_ref(), served.section_names, &mut filters.terminating);
         }
         emit_conditional_timeout(served.rule, condition.as_ref(), &mut filters.transforming);
         if served.rule.filters.is_some() {
-            convert_rule_filters(served.rule, condition.as_ref(), &mut filters);
+            convert_rule_filters(served.rule, condition.as_ref(), served.section_names, &mut filters);
         }
     }
     filters
@@ -194,10 +247,20 @@ struct RuleContext<'cond> {
     /// `ReplacePrefixMatch` replaces exactly this much of the request
     /// path, so the rewrite cannot be built without it.
     prefix: Option<&'cond str>,
+
+    /// Listener section names of the route carrying the rule.
+    ///
+    /// Terminating filters follow their route's listeners.
+    section_names: &'cond [Option<String>],
 }
 
 /// Converts filters from a single rule into conditional filter entries.
-fn convert_rule_filters(rule: &HttpRouteRules, condition: Option<&yaml_serde::Value>, filters: &mut RouteFilters) {
+fn convert_rule_filters(
+    rule: &HttpRouteRules,
+    condition: Option<&yaml_serde::Value>,
+    section_names: &[Option<String>],
+    filters: &mut RouteFilters,
+) {
     let Some(rule_filters) = &rule.filters else {
         return;
     };
@@ -205,6 +268,7 @@ fn convert_rule_filters(rule: &HttpRouteRules, condition: Option<&yaml_serde::Va
     let ctx = RuleContext {
         condition,
         prefix: matched_prefix(rule),
+        section_names,
     };
     let mut header_config = HeaderFilterConfig::default();
     let mut has_header_mods = false;
@@ -241,7 +305,7 @@ fn dispatch_filter(
         HttpRouteRulesFiltersType::ResponseHeaderModifier => dispatch_response_header(filter, header_config),
         HttpRouteRulesFiltersType::RequestRedirect => {
             if let Some(redirect) = &filter.request_redirect {
-                emit_conditional_redirect(redirect, ctx.condition, &mut filters.terminating);
+                emit_conditional_redirect(redirect, ctx.condition, ctx.section_names, &mut filters.terminating);
             }
             false
         },
@@ -587,7 +651,8 @@ fn to_header_entries<'iter>(pairs: impl Iterator<Item = (&'iter String, &'iter S
 fn emit_conditional_redirect(
     redirect: &gateway_api::httproutes::HttpRouteRulesFiltersRequestRedirect,
     condition: Option<&yaml_serde::Value>,
-    filters: &mut Vec<PraxisFilterEntry>,
+    section_names: &[Option<String>],
+    filters: &mut Vec<ScopedFilter>,
 ) {
     let location = build_redirect_location(redirect);
     let status = redirect_status(redirect.status_code);
@@ -597,9 +662,12 @@ fn emit_conditional_redirect(
     match yaml_serde::to_value(&redirect_config) {
         Ok(config) => {
             let config = inject_conditions(config, condition);
-            filters.push(PraxisFilterEntry {
-                filter: "redirect".to_owned(),
-                config,
+            filters.push(ScopedFilter {
+                entry: PraxisFilterEntry {
+                    filter: "redirect".to_owned(),
+                    config,
+                },
+                section_names: section_names.to_vec(),
             });
         },
         Err(err) => warn!(%err, "failed to serialize redirect filter config"),
@@ -896,7 +964,11 @@ fn emit_conditional_header_filter(
 }
 
 /// Emits a `static_response` filter returning 500 for rules with no backends.
-fn emit_no_backend_response(condition: Option<&yaml_serde::Value>, filters: &mut Vec<PraxisFilterEntry>) {
+fn emit_no_backend_response(
+    condition: Option<&yaml_serde::Value>,
+    section_names: &[Option<String>],
+    filters: &mut Vec<ScopedFilter>,
+) {
     let mut config = yaml_serde::Mapping::new();
     config.insert(
         yaml_serde::Value::String("status".to_owned()),
@@ -907,9 +979,12 @@ fn emit_no_backend_response(condition: Option<&yaml_serde::Value>, filters: &mut
         yaml_serde::Value::String("no backends available".to_owned()),
     );
     let config = inject_conditions(yaml_serde::Value::Mapping(config), condition);
-    filters.push(PraxisFilterEntry {
-        filter: "static_response".to_owned(),
-        config,
+    filters.push(ScopedFilter {
+        entry: PraxisFilterEntry {
+            filter: "static_response".to_owned(),
+            config,
+        },
+        section_names: section_names.to_vec(),
     });
 }
 
@@ -1054,13 +1129,16 @@ mod tests {
 
         let terminating = &filters.terminating;
         assert_eq!(terminating.len(), 1, "should produce one redirect filter");
-        assert_eq!(terminating[0].filter, "redirect", "filter name should be redirect");
+        assert_eq!(
+            terminating[0].entry.filter, "redirect",
+            "filter name should be redirect"
+        );
         assert!(
             filters.transforming.is_empty(),
             "a redirect answers the request itself and never reaches an upstream"
         );
 
-        let config_str = yaml_serde::to_string(&terminating[0].config).unwrap();
+        let config_str = yaml_serde::to_string(&terminating[0].entry.config).unwrap();
         assert!(config_str.contains("302"), "should contain status code");
         assert!(
             config_str.contains("https://example.com:443"),
@@ -1106,7 +1184,7 @@ mod tests {
         let filters = convert_filters(&served(&rules));
 
         assert!(
-            filters.terminating.iter().any(|f| f.filter == "redirect"),
+            filters.terminating.iter().any(|f| f.entry.filter == "redirect"),
             "the redirect answers the request, so it runs before the router"
         );
         assert!(
@@ -1278,13 +1356,14 @@ mod tests {
         rule.backend_refs = Some(dummy_backend_refs());
         let rules = [ServedRule {
             rule: &rule,
+            section_names: &[],
             resolvable: false,
         }];
 
         let filters = convert_filters(&rules);
 
         assert_eq!(
-            filters.terminating.first().map(|f| f.filter.as_str()),
+            filters.terminating.first().map(|f| f.entry.filter.as_str()),
             Some("static_response"),
             "a backendRef refused for want of a ReferenceGrant leaves no route, and the router \
              would answer 404 where the Gateway API prescribes 500"
@@ -1297,6 +1376,7 @@ mod tests {
         rule.backend_refs = Some(dummy_backend_refs());
         let rules = [ServedRule {
             rule: &rule,
+            section_names: &[],
             resolvable: true,
         }];
 
@@ -1304,6 +1384,39 @@ mod tests {
             convert_filters(&rules).terminating.is_empty(),
             "the router serves this rule, so nothing may answer ahead of it"
         );
+    }
+
+    #[test]
+    fn test_terminating_filters_follow_their_routes_listeners() {
+        let scoped_to_web = ScopedFilter {
+            entry: PraxisFilterEntry {
+                filter: "redirect".to_owned(),
+                config: yaml_serde::Value::Null,
+            },
+            section_names: vec![Some("web".to_owned())],
+        };
+        let scoped_to_all = ScopedFilter {
+            entry: PraxisFilterEntry {
+                filter: "static_response".to_owned(),
+                config: yaml_serde::Value::Null,
+            },
+            section_names: vec![None],
+        };
+        let route_filters = RouteFilters {
+            terminating: vec![scoped_to_web, scoped_to_all],
+            transforming: vec![],
+        };
+
+        let web = route_filters.terminating_for_listener(&["web".to_owned()]);
+        assert_eq!(web.len(), 2, "both filters serve the listener their routes target");
+
+        let api = route_filters.terminating_for_listener(&["api".to_owned()]);
+        assert_eq!(
+            api.len(),
+            1,
+            "a filter from a route on another listener must not run here"
+        );
+        assert_eq!(api[0].filter, "static_response", "only the all-listener filter remains");
     }
 
     // -----------------------------------------------------------------------
@@ -1656,6 +1769,7 @@ mod tests {
             .iter()
             .map(|rule| ServedRule {
                 rule,
+                section_names: &[],
                 resolvable: rule.backend_refs.as_ref().is_some_and(|refs| !refs.is_empty()),
             })
             .collect()
