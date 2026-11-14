@@ -283,7 +283,8 @@ fn process_rule(
 ///
 /// A rule mixing a ready backend with an endpointless one serves: its
 /// backends merge into one cluster, and the ready service's endpoints
-/// keep it populated.
+/// keep it populated. A rule whose every backend has `weight: 0` has no
+/// upstream to send traffic to, so it does not serve either.
 pub fn rule_has_serving_backend(
     rule: &gateway_api::httproutes::HttpRouteRules,
     route_ns: &str,
@@ -305,8 +306,13 @@ pub fn rule_has_serving_backend(
 /// Unknown backend kinds and unauthorized cross-namespace references
 /// are both unresolvable: the Gateway API prescribes 500 for them, so
 /// the rule must not emit a route to a cluster that will never resolve.
+/// A `weight: 0` ref is resolvable but must receive no traffic; leaving
+/// it out here keeps it from claiming a cluster identity in the dedup
+/// set and suppressing a positive-weight ref for the same Service.
 fn backend_is_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
-    backend_kind_is_supported(backend) && is_backend_authorized(backend, route_ns, grants)
+    backend.weight.unwrap_or(1) > 0
+        && backend_kind_is_supported(backend)
+        && is_backend_authorized(backend, route_ns, grants)
 }
 
 /// Whether the ref names a Service in the core API group.
@@ -1438,6 +1444,47 @@ mod tests {
         assert!(
             !rule_has_serving_backend(&rule, "default", &[], &HashSet::new()),
             "an unknown backend kind must answer 500 instead of routing to an empty cluster"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_weight_zero_does_not_claim_cluster_identity() {
+        let mut zero = rule_with_backend();
+        if let Some(refs) = zero.backend_refs.as_mut() {
+            refs[0].weight = Some(0);
+        }
+        let mut positive = rule_with_backend();
+        if let Some(refs) = positive.backend_refs.as_mut() {
+            refs[0].weight = Some(1);
+        }
+        let route = route_with_rules(vec![zero, positive]);
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert_eq!(praxis_routes.len(), 1, "the weight-0 rule produces no route");
+        assert_eq!(
+            backend_refs.len(),
+            1,
+            "the weight-0 ref must not deduplicate the positive-weight ref out"
+        );
+        assert_eq!(backend_refs[0].weight, Some(1));
+        assert_eq!(praxis_routes[0].cluster, backend_refs[0].cluster_name);
+    }
+
+    #[test]
+    fn test_rule_with_only_zero_weight_backends_has_no_backend() {
+        let mut rule = rule_with_backend();
+        if let Some(refs) = rule.backend_refs.as_mut() {
+            refs[0].weight = Some(0);
+        }
+
+        assert!(
+            !rule_has_serving_backend(&rule, "default", &[], &HashSet::new()),
+            "a rule whose only backend has weight zero cannot serve traffic"
         );
     }
 
