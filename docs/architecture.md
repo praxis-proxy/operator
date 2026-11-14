@@ -91,8 +91,9 @@ and filters.
 
 ### Deployment
 
-A single-replica Deployment running the Praxis proxy
-container. Key properties:
+A Deployment running one Praxis container per pod. It has one replica by
+default. The `praxis.sh/replicas` Gateway annotation sets another positive
+replica count. Key properties:
 
 - **Image:** controlled by the `PRAXIS_IMAGE`
   environment variable on the operator
@@ -100,14 +101,16 @@ container. Key properties:
   `/etc/praxis/config.yaml`
 - **TLS volumes:** mounts each referenced TLS Secret
   as a read-only volume
+- **Shutdown:** a five-second native preStop sleep lets Service endpoint
+  removal propagate before SIGTERM, within the 15-second grace period.
 - **Health probes:** liveness (`/healthy`) and
-  readiness (`/ready`) on admin port 9901
+  readiness (`/ready`) on metrics port 9902
 - **Security:** runs as UID 100, read-only filesystem,
   drops all capabilities except `NET_BIND_SERVICE`,
   RuntimeDefault seccomp profile
 - **Config hash:** a `praxis.sh/config-hash` annotation
-  on the pod template triggers a rolling update
-  whenever the configuration changes
+  on the pod template covers listener and TLS topology. Topology changes
+  trigger a rolling update; route and filter changes hot-reload.
 
 ### Service
 
@@ -133,9 +136,9 @@ Praxis's native YAML configuration:
 | Request redirect      | `redirect` filter                              |
 
 The config always includes a `request_id` filter
-(generates trace IDs) and a `router` filter (handles
-routing decisions). Backend load balancing defaults to
-round-robin.
+(generates trace IDs). Routed listeners also include a
+`router` filter for routing decisions; routeless listeners
+omit it and terminate with a 404 static response. Backend load balancing defaults to round-robin.
 
 ## Labeling
 

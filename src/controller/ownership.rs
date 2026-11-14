@@ -16,7 +16,7 @@ use tracing::debug;
 
 use super::namespace_filter;
 use crate::{
-    context::CONTROLLER_NAME,
+    context::{ADMIN_PORT, CONTROLLER_NAME},
     error::{OperatorError, Result},
     gateway_api::attachment::{self, AttachedRoute},
     stores::Stores,
@@ -83,8 +83,15 @@ pub(super) fn collect_routes<'route>(
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
-    let attached = attachment::attached_routes(&name, &ns, &gw.spec.listeners, all_routes);
-    namespace_filter::filter_routes_by_allowed_namespaces(&attached, &gw.spec.listeners, &ns, stores)
+    let listeners: Vec<_> = gw
+        .spec
+        .listeners
+        .iter()
+        .filter(|listener| listener.port != ADMIN_PORT)
+        .cloned()
+        .collect();
+    let attached = attachment::attached_routes(&name, &ns, &listeners, all_routes);
+    namespace_filter::filter_routes_by_allowed_namespaces(&attached, &listeners, &ns, stores)
 }
 
 // -----------------------------------------------------------------------------
