@@ -71,9 +71,37 @@ pub fn assemble_config(
     route_filters: &RouteFilters,
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisConfig> {
+    let by_listener: BTreeMap<String, RouteFilters> = listeners
+        .iter()
+        .map(|listener| (listener.name.clone(), route_filters.clone()))
+        .collect();
+    assemble_config_with_listener_filters(listeners, routes, clusters, &by_listener, listener_hostnames)
+}
+
+/// Assembles a Praxis configuration with filters scoped to each listener.
+///
+/// Filter conditions include `unless` clauses for the sibling rules that
+/// outrank them. Those siblings must come from the same listener, so each
+/// listener gets its own [`RouteFilters`]; sharing one across listeners
+/// would let a route on one listener suppress a response on another.
+///
+/// # Errors
+///
+/// Returns an error if filter config serialization fails.
+pub fn assemble_config_with_listener_filters(
+    listeners: Vec<PraxisListener>,
+    routes: &[PraxisRoute],
+    clusters: &[PraxisCluster],
+    route_filters: &BTreeMap<String, RouteFilters>,
+    listener_hostnames: &std::collections::HashMap<String, Option<String>>,
+) -> yaml_serde::Result<PraxisConfig> {
+    let empty = RouteFilters::default();
     let filter_chains: Vec<_> = listeners
         .iter()
-        .map(|listener| build_filter_chain(listener, routes, clusters, route_filters, listener_hostnames))
+        .map(|listener| {
+            let filters = route_filters.get(&listener.name).unwrap_or(&empty);
+            build_filter_chain(listener, routes, clusters, filters, listener_hostnames)
+        })
         .collect::<yaml_serde::Result<Vec<_>>>()?;
 
     Ok(PraxisConfig {
@@ -110,7 +138,6 @@ fn build_filter_chain(
     let name = &listener.name;
     let scoped = scoped_routes(routes, &listener.merged_section_names, listener_hostnames);
     let scoped_refs: Vec<_> = scoped.iter().collect();
-    let terminating = route_filters.terminating_for_listener(&listener.merged_section_names);
 
     let mut filters = vec![PraxisFilterEntry {
         filter: "request_id".to_owned(),
@@ -120,7 +147,7 @@ fn build_filter_chain(
         // A rule can answer without producing a route: a redirect, or the
         // 500 for a reference that cannot resolve. Those terminating
         // filters still have to run, ahead of the routeless fallback.
-        if extend_terminating(&mut filters, &terminating) {
+        if extend_terminating(&mut filters, &route_filters.terminating) {
             return Ok(PraxisFilterChain {
                 name: format!("{name}-chain"),
                 filters,
@@ -128,7 +155,7 @@ fn build_filter_chain(
         }
         return routeless_chain(name, filters);
     }
-    if extend_terminating(&mut filters, &terminating) {
+    if extend_terminating(&mut filters, &route_filters.terminating) {
         // An unconditional response answers every request, so the router and
         // load balancer after it would be unreachable and Praxis rejects them.
         return Ok(PraxisFilterChain {
@@ -373,10 +400,7 @@ fn build_lb_filter(clusters: &[PraxisCluster]) -> yaml_serde::Result<PraxisFilte
 #[expect(clippy::too_many_lines, clippy::default_trait_access, reason = "tests")]
 mod tests {
     use super::*;
-    use crate::config::{
-        cluster::{PraxisEndpoint, build_cluster},
-        filter_conversion::ScopedFilter,
-    };
+    use crate::config::cluster::{PraxisEndpoint, build_cluster};
 
     #[test]
     fn test_assemble_config_single_http_listener() {
@@ -449,16 +473,13 @@ mod tests {
             tls: None,
         };
 
-        let redirect = ScopedFilter {
-            entry: PraxisFilterEntry {
-                filter: "redirect".to_owned(),
-                config: yaml_serde::to_value(serde_json::json!({
-                    "status": 307,
-                    "location": "https://example.com${path}${query}",
-                }))
-                .unwrap(),
-            },
-            section_names: vec![None],
+        let redirect = PraxisFilterEntry {
+            filter: "redirect".to_owned(),
+            config: yaml_serde::to_value(serde_json::json!({
+                "status": 307,
+                "location": "https://example.com${path}${query}",
+            }))
+            .unwrap(),
         };
         let route_filters = RouteFilters {
             terminating: vec![redirect],
@@ -506,23 +527,25 @@ mod tests {
             tls: None,
         };
 
-        let redirect = ScopedFilter {
-            entry: PraxisFilterEntry {
-                filter: "redirect".to_owned(),
-                config: yaml_serde::to_value(serde_json::json!({
-                    "status": 307,
-                    "location": "https://example.com${path}${query}",
-                }))
-                .unwrap(),
+        let redirect = PraxisFilterEntry {
+            filter: "redirect".to_owned(),
+            config: yaml_serde::to_value(serde_json::json!({
+                "status": 307,
+                "location": "https://example.com${path}${query}",
+            }))
+            .unwrap(),
+        };
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert(
+            "web".to_owned(),
+            RouteFilters {
+                terminating: vec![redirect],
+                transforming: vec![],
             },
-            section_names: vec![Some("web".to_owned())],
-        };
-        let route_filters = RouteFilters {
-            terminating: vec![redirect],
-            transforming: vec![],
-        };
+        );
 
-        let config = assemble_config(vec![web, api], &[], &[], &route_filters, &Default::default()).unwrap();
+        let config =
+            assemble_config_with_listener_filters(vec![web, api], &[], &[], &by_listener, &Default::default()).unwrap();
 
         let web_chain = config
             .filter_chains
@@ -564,12 +587,9 @@ mod tests {
             tls: None,
         };
         let route_filters = RouteFilters {
-            terminating: vec![ScopedFilter {
-                entry: PraxisFilterEntry {
-                    filter: "static_response".to_owned(),
-                    config: yaml_serde::to_value(serde_json::json!({"status": 500})).unwrap(),
-                },
-                section_names: vec![None],
+            terminating: vec![PraxisFilterEntry {
+                filter: "static_response".to_owned(),
+                config: yaml_serde::to_value(serde_json::json!({"status": 500})).unwrap(),
             }],
             transforming: Vec::new(),
         };
@@ -920,12 +940,9 @@ mod tests {
             tls: None,
         };
 
-        let redirect = ScopedFilter {
-            entry: PraxisFilterEntry {
-                filter: "redirect".to_owned(),
-                config: yaml_serde::Value::Null,
-            },
-            section_names: vec![None],
+        let redirect = PraxisFilterEntry {
+            filter: "redirect".to_owned(),
+            config: yaml_serde::Value::Null,
         };
 
         let headers = PraxisFilterEntry {

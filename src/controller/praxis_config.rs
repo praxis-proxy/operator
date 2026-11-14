@@ -24,7 +24,7 @@ use crate::{
     config::{
         cluster::{PraxisCluster, build_cluster},
         filter_conversion::{RouteFilters, ServedRule, convert_filters},
-        generate::assemble_config,
+        generate::assemble_config_with_listener_filters,
         listener::{PraxisCertificate, PraxisListener, PraxisTls, convert_listener},
         routing::{BackendRef, PraxisRoute, convert_routes, rule_has_serving_backend},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},
@@ -87,8 +87,8 @@ pub(super) async fn build_praxis_config(
     let clusters = resolve_clusters(client, &backend_refs).await?;
     let (clusters, pending) = split_pending_clusters(clusters);
     let praxis_routes = without_pending_routes(praxis_routes, &pending);
-    let route_filters = collect_filters(attached, grants, &pending);
-    let config = assemble_config(
+    let route_filters = collect_filters_by_listener(attached, grants, &pending, &praxis_listeners);
+    let config = assemble_config_with_listener_filters(
         praxis_listeners,
         &praxis_routes,
         &clusters,
@@ -192,39 +192,64 @@ fn convert_attached_routes(
     convert_routes(attached, listener_hostnames, grants)
 }
 
-/// Extracts and converts filters from all attached route rules.
+/// Extracts and converts filters for each listener from the routes it targets.
 ///
 /// Each rule is paired with whether any of its backends survived the
 /// reference checks, which is what decides between a rule the router
-/// will serve and one that has to answer 500 on its own.
-fn collect_filters(
+/// will serve and one that has to answer 500 on its own. Conversion runs
+/// per listener because the `unless` clauses in a filter's conditions name
+/// the sibling rules that outrank it, and only rules on the same listener
+/// can compete for a request.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-listener rule collection plus rejection and pending checks"
+)]
+fn collect_filters_by_listener(
     attached: &[AttachedRoute<'_>],
     grants: &[ReferenceGrant],
     pending: &HashSet<String>,
-) -> RouteFilters {
-    let all_rules: Vec<_> = attached
+    listeners: &[PraxisListener],
+) -> BTreeMap<String, RouteFilters> {
+    listeners
         .iter()
-        .flat_map(|attached| {
-            let namespace = attached.route.namespace().unwrap_or_default();
-            let section_names = attached.section_names.as_slice();
-            let validation = validate_route(attached.route);
-            attached
-                .route
-                .spec
-                .rules
-                .as_deref()
-                .unwrap_or(&[])
+        .map(|listener| {
+            let mut rules = Vec::new();
+            for attached_route in attached
                 .iter()
-                .enumerate()
-                .filter(move |(index, _)| !validation.is_rejected(*index))
-                .map(move |(_, rule)| ServedRule {
-                    rule,
-                    section_names,
-                    resolvable: rule_has_serving_backend(rule, &namespace, grants, pending),
-                })
+                .filter(|attached_route| route_serves_listener(attached_route, listener))
+            {
+                let namespace = attached_route.route.namespace().unwrap_or_default();
+                let validation = validate_route(attached_route.route);
+                for (index, rule) in attached_route
+                    .route
+                    .spec
+                    .rules
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                {
+                    if validation.is_rejected(index) {
+                        continue;
+                    }
+                    rules.push(ServedRule {
+                        rule,
+                        resolvable: rule_has_serving_backend(rule, &namespace, grants, pending),
+                    });
+                }
+            }
+            (listener.name.clone(), convert_filters(&rules))
         })
-        .collect();
-    convert_filters(&all_rules)
+        .collect()
+}
+
+/// Whether a route attaches to any Gateway listener merged into `listener`.
+fn route_serves_listener(attached: &AttachedRoute<'_>, listener: &PraxisListener) -> bool {
+    attached.section_names.is_empty()
+        || attached.section_names.iter().any(|section| match section {
+            None => true,
+            Some(name) => listener.merged_section_names.iter().any(|merged| merged == name),
+        })
 }
 
 /// Splits resolved clusters into those with ready endpoints and the
@@ -810,11 +835,85 @@ mod tests {
             section_names: vec![None],
         }];
 
-        let filters = collect_filters(&attached, &[], &HashSet::new());
+        let listener = praxis_listener("http", &["http"]);
+        let filters = collect_filters_by_listener(&attached, &[], &HashSet::new(), &[listener]);
 
         assert!(
-            filters.terminating.is_empty(),
+            filters["http"].terminating.is_empty(),
             "a POST-only rule this operator rejects must not redirect GET traffic"
+        );
+    }
+
+    /// Builds a Praxis listener with the given merged Gateway section names.
+    fn praxis_listener(name: &str, sections: &[&str]) -> PraxisListener {
+        PraxisListener {
+            name: name.to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: Vec::new(),
+            protocol: None,
+            hostname: None,
+            merged_section_names: sections.iter().map(|section| (*section).to_owned()).collect(),
+            tls: None,
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builds two listeners with competing rules and asserts the scoped conditions"
+    )]
+    fn terminating_conditions_only_consider_same_listener_rules() {
+        use gateway_api::httproutes::{
+            HttpRouteRulesMatches, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
+        };
+
+        // A higher-priority /api rule on the api listener.
+        let mut api_route = route();
+        if let Some(rules) = api_route.spec.rules.as_mut() {
+            rules[0].matches = Some(vec![HttpRouteRulesMatches {
+                path: Some(HttpRouteRulesMatchesPath {
+                    r#type: Some(HttpRouteRulesMatchesPathType::PathPrefix),
+                    value: Some("/api".to_owned()),
+                }),
+                ..Default::default()
+            }]);
+        }
+
+        // A catch-all rule on web whose only backend is unauthorized, so it
+        // answers 500 itself.
+        let mut web_route = route();
+        if let Some(rules) = web_route.spec.rules.as_mut() {
+            rules[0].matches = None;
+            if let Some(refs) = rules[0].backend_refs.as_mut() {
+                refs[0].namespace = Some("other".to_owned());
+            }
+        }
+
+        let attached = vec![
+            AttachedRoute {
+                route: &api_route,
+                section_names: vec![Some("api".to_owned())],
+            },
+            AttachedRoute {
+                route: &web_route,
+                section_names: vec![Some("web".to_owned())],
+            },
+        ];
+        let listeners = [praxis_listener("api", &["api"]), praxis_listener("web", &["web"])];
+
+        let filters = collect_filters_by_listener(&attached, &[], &HashSet::new(), &listeners);
+
+        let web = &filters["web"].terminating;
+        assert_eq!(web.len(), 1, "the catch-all web rule answers with its own 500");
+        assert_eq!(web[0].filter, "static_response");
+        assert!(
+            web[0].config.get("conditions").is_none(),
+            "the /api rule on the api listener must not add an unless clause to the web \
+             listener's 500"
+        );
+        assert!(
+            filters["api"].terminating.is_empty(),
+            "the api listener's rule resolves to a route and needs no terminating response"
         );
     }
 
