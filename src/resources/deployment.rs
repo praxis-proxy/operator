@@ -24,7 +24,7 @@ use k8s_openapi::{
 use kube::ResourceExt as _;
 
 use super::labels::{descriptive_labels, infrastructure_annotations, owner_reference, standard_labels};
-use crate::context::{ADMIN_PORT, praxis_image};
+use crate::context::{ADMIN_PORT, ADMIN_PORT_NAME, praxis_image};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -239,7 +239,7 @@ fn build_container_ports(listener_ports: &[(String, i32)]) -> Vec<ContainerPort>
         );
     } else {
         ports.push(ContainerPort {
-            name: Some("admin".to_owned()),
+            name: Some(ADMIN_PORT_NAME.to_owned()),
             container_port: ADMIN_PORT,
             protocol: Some("TCP".to_owned()),
             ..Default::default()
@@ -715,7 +715,7 @@ mod tests {
             Some("admin".to_owned()),
             "last port name should be admin"
         );
-        assert_eq!(ports[2].container_port, 9901, "admin port should be 9901");
+        assert_eq!(ports[2].container_port, 9902, "admin port should be 9902");
     }
 
     #[test]
@@ -853,8 +853,8 @@ mod tests {
         );
         assert_eq!(
             liveness_http.port,
-            IntOrString::Int(9901),
-            "liveness port should be 9901"
+            IntOrString::Int(9902),
+            "liveness port should be 9902"
         );
 
         let readiness = container
@@ -869,8 +869,8 @@ mod tests {
         );
         assert_eq!(
             readiness_http.port,
-            IntOrString::Int(9901),
-            "readiness port should be 9901"
+            IntOrString::Int(9902),
+            "readiness port should be 9902"
         );
     }
 

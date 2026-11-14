@@ -101,7 +101,7 @@ container. Key properties:
 - **TLS volumes:** mounts each referenced TLS Secret
   as a read-only volume
 - **Health probes:** liveness (`/healthy`) and
-  readiness (`/ready`) on admin port 9901
+  readiness (`/ready`) on metrics port 9902
 - **Security:** runs as UID 100, read-only filesystem,
   drops all capabilities except `NET_BIND_SERVICE`,
   RuntimeDefault seccomp profile

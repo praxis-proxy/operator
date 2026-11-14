@@ -101,7 +101,7 @@ make kind-down
 | Variable            | Default                         |
 |---------------------|---------------------------------|
 | `KIND_CLUSTER_NAME` | `praxis-conformance`            |
-| `PRAXIS_IMAGE`      | `ghcr.io/praxis-proxy/praxis:0.3.0` |
+| `PRAXIS_IMAGE`      | `praxis:dev`                    |
 | `OPERATOR_IMAGE`    | `praxis-operator:dev`           |
 
 ## Testing

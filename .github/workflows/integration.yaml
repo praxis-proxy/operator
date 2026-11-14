@@ -29,7 +29,7 @@ env:
   KIND_CLUSTER_NAME: ci
   V: ${{ inputs.debug && '1' || '' }}
   OPERATOR_IMAGE: praxis-operator:dev
-  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.5.2
+  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.7.5
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -78,6 +78,33 @@ jobs:
 
       - name: Integration tests
         run: make dev-integration
+
+      # The monitoring test's disabled phase ran above without the CRD. The
+      # phases below cover enabled mode with the CRD installed, then disabled
+      # mode again to prove stale owned resources are removed.
+      - name: Install PodMonitor CRD
+        run: |
+          bash hack/retry.sh curl --fail --location --show-error --silent \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            --output /tmp/monitoring.coreos.com_podmonitors.yaml \
+            https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.1/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
+          kubectl apply --server-side -f /tmp/monitoring.coreos.com_podmonitors.yaml
+
+      - name: Monitoring enabled phase
+        env:
+          PRAXIS_MONITORING_ENABLED: "true"
+        run: |
+          kubectl -n praxis-system set env deployment/praxis-operator PRAXIS_MONITORING_ENABLED=true
+          kubectl -n praxis-system rollout status deployment/praxis-operator --timeout=120s
+          cargo test --features integration -- --ignored monitoring_reconciliation
+
+      - name: Monitoring disabled cleanup phase
+        env:
+          PRAXIS_MONITORING_ENABLED: "false"
+        run: |
+          kubectl -n praxis-system set env deployment/praxis-operator PRAXIS_MONITORING_ENABLED=false
+          kubectl -n praxis-system rollout status deployment/praxis-operator --timeout=120s
+          cargo test --features integration -- --ignored monitoring_reconciliation
 
       - name: Debug cluster state
         if: failure()

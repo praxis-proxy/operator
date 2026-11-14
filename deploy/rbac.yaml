@@ -59,6 +59,15 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Required even when PRAXIS_MONITORING_ENABLED=false: reconciliation
+  # checks for stale owned NetworkPolicy and PodMonitor resources. A missing
+  # Prometheus Operator CRD is treated as already deleted.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["podmonitors"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]

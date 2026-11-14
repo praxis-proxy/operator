@@ -8,7 +8,7 @@
 //! Kubernetes label selector, so the evaluation is large enough to
 //! separate from the status writing that consumes its answer.
 
-use std::collections::BTreeMap;
+use std::{borrow::Borrow, collections::BTreeMap};
 
 use gateway_api::{
     gateways::{
@@ -33,12 +33,15 @@ use crate::{
 ///
 /// A route is retained if at least one listener it targets allows its
 /// namespace. The default policy (when unspecified) is `Same`.
-pub(super) fn filter_routes_by_allowed_namespaces<'route>(
+pub(super) fn filter_routes_by_allowed_namespaces<'route, L>(
     attached: &[AttachedRoute<'route>],
-    listeners: &[GatewayListeners],
+    listeners: &[L],
     gateway_ns: &str,
     stores: &Stores,
-) -> Vec<AttachedRoute<'route>> {
+) -> Vec<AttachedRoute<'route>>
+where
+    L: Borrow<GatewayListeners>,
+{
     let all_namespaces = Some(stores.namespaces());
 
     attached
@@ -57,18 +60,25 @@ pub(super) fn filter_routes_by_allowed_namespaces<'route>(
 }
 
 /// Checks whether a route is allowed by at least one targeted listener.
-fn route_allowed_by_any_listener(
+fn route_allowed_by_any_listener<L>(
     route: &HTTPRoute,
     section_names: &[Option<String>],
-    listeners: &[GatewayListeners],
+    listeners: &[L],
     gateway_ns: &str,
     all_namespaces: Option<&[Namespace]>,
-) -> bool {
+) -> bool
+where
+    L: Borrow<GatewayListeners>,
+{
     let route_ns = route_status::route_namespace(route);
     section_names.iter().any(|section| {
         let matching: Vec<&GatewayListeners> = match section {
-            Some(name) => listeners.iter().filter(|ls| ls.name == *name).collect(),
-            None => listeners.iter().collect(),
+            Some(name) => listeners
+                .iter()
+                .map(Borrow::borrow)
+                .filter(|ls| ls.name == *name)
+                .collect(),
+            None => listeners.iter().map(Borrow::borrow).collect(),
         };
         matching
             .iter()

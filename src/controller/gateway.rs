@@ -8,7 +8,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 use gateway_api::{gateways::Gateway, httproutes::HTTPRoute, referencegrants::ReferenceGrant};
 use kube::{
     Api, Resource, ResourceExt as _,
-    api::{Patch, PatchParams},
+    api::{ApiResource, DynamicObject, Patch, PatchParams},
     runtime::{
         controller::Action,
         events::{Event, EventType},
@@ -19,11 +19,11 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, error, info};
 
-use super::{gateway_status, ownership, praxis_config, rollout, route_parent_status};
+use super::{child_cleanup, gateway_status, ownership, praxis_config, rollout, route_parent_status};
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
-    gateway_api::{attachment::AttachedRoute, conditions, protocol::ListenerProtocol, route_status},
+    gateway_api::{attachment::AttachedRoute, conditions, route_status},
 };
 
 // -----------------------------------------------------------------------------
@@ -82,7 +82,8 @@ pub fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>
         | OperatorError::LeadershipLost
         | OperatorError::CacheSync(_)
         | OperatorError::Serialization(_)
-        | OperatorError::YamlSerialization(_) => Duration::from_secs(30),
+        | OperatorError::YamlSerialization(_)
+        | OperatorError::InvalidMonitoringSelector => Duration::from_secs(30),
     };
     error!(
         %error, "Gateway reconciliation failed, retrying in {delay:?}"
@@ -119,7 +120,13 @@ async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
         route_parent_status::update_route_parent_statuses(&ctx.client, &gw, &attached, &grants).await?;
     }
 
-    let requeue_secs = if can_accept { 15 } else { 2 };
+    let requeue_secs = if can_accept {
+        15
+    } else if praxis_config::usable_listeners(&gw.spec.listeners).is_empty() {
+        60
+    } else {
+        2
+    };
     Ok(Action::requeue(Duration::from_secs(requeue_secs)))
 }
 
@@ -134,12 +141,8 @@ async fn apply_config_if_supported(
     ns: &str,
     grants: &[ReferenceGrant],
 ) -> Result<bool> {
-    let has_supported = gw
-        .spec
-        .listeners
-        .iter()
-        .any(|listener| ListenerProtocol::is_supported(&listener.protocol));
-    if !has_supported {
+    if praxis_config::usable_listeners(&gw.spec.listeners).is_empty() {
+        child_cleanup::delete_children(client, gw).await?;
         return Ok(false);
     }
 
@@ -312,6 +315,29 @@ where
     )
     .await?;
     debug!("applied {name}");
+    Ok(())
+}
+
+/// Applies a namespaced dynamic resource via server-side apply.
+pub(super) async fn apply_dynamic_resource(
+    client: &kube::Client,
+    ns: &str,
+    resource: &DynamicObject,
+    api_resource: &ApiResource,
+) -> Result<()> {
+    let api = Api::<DynamicObject>::namespaced_with(client.clone(), ns, api_resource);
+    let name = resource
+        .meta()
+        .name
+        .as_deref()
+        .ok_or(OperatorError::MissingObjectKey(".metadata.name"))?;
+    api.patch(
+        name,
+        &PatchParams::apply("praxis-operator").force(),
+        &Patch::Apply(resource),
+    )
+    .await?;
+    debug!(%name, kind = %api_resource.kind, "applied dynamic resource");
     Ok(())
 }
 
