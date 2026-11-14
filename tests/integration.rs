@@ -999,6 +999,159 @@ async fn httproute_invalid_backend_kind_unresolved() {
 
 #[tokio::test]
 #[ignore]
+async fn httproute_catchall_zero_weight_backend_starts_proxy() {
+    let ctx = TestContext::new().await;
+    let gc = ctx.create_gateway_class("hr-zero-gc").await;
+    ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+
+    let ns = ctx.create_test_namespace("hr-zero").await;
+    let gw = ctx.create_gateway("hr-zero-gw", &ns, &gc, 8105).await;
+    ctx.await_gateway_condition(&gw, &ns, "Programmed", "True", RECONCILE_TIMEOUT_SECS)
+        .await;
+
+    let backend = ctx.create_backend_service("hr-zero-svc", &ns, 80).await;
+    let route_name = unique_name("hr-zero");
+    let route_api: Api<HTTPRoute> = Api::namespaced(ctx.client.clone(), &ns);
+    let route = HTTPRoute {
+        metadata: ObjectMeta {
+            name: Some(route_name.clone()),
+            namespace: Some(ns.clone()),
+            ..Default::default()
+        },
+        spec: HttpRouteSpec {
+            parent_refs: Some(vec![HttpRouteParentRefs {
+                name: gw.clone(),
+                namespace: Some(ns.clone()),
+                ..Default::default()
+            }]),
+            rules: Some(vec![HttpRouteRules {
+                // An omitted match list is defaulted to `/`, which would make the
+                // 500 conditional. An explicit empty list is a catch-all with no
+                // conditions, matching the chain Praxis rejects if a 404 follows.
+                matches: Some(Vec::new()),
+                backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                    name: backend.clone(),
+                    port: Some(80),
+                    weight: Some(0),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        status: None,
+    };
+    route_api
+        .create(&PostParams::default(), &route)
+        .await
+        .expect("failed to create catch-all HTTPRoute with a zero-weight backend");
+
+    let child = format!("praxis-{gw}");
+    let config_maps: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);
+    let config_deadline = tokio::time::Instant::now()
+        .checked_add(tokio::time::Duration::from_secs(RECONCILE_TIMEOUT_SECS))
+        .expect("test timeout fits the clock");
+    let yaml = loop {
+        if let Ok(config_map) = config_maps.get(&child).await
+            && let Some(yaml) = config_map.data.as_ref().and_then(|data| data.get("config.yaml"))
+            && yaml.contains("no backends available")
+        {
+            break yaml.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < config_deadline,
+            "the zero-weight catch-all rule must reach the generated configuration"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+    };
+
+    let config: yaml_serde::Value = yaml_serde::from_str(&yaml).expect("generated YAML parses");
+    let filters = config
+        .get("filter_chains")
+        .and_then(yaml_serde::Value::as_sequence)
+        .and_then(|chains| chains.first())
+        .and_then(|chain| chain.get("filters"))
+        .and_then(yaml_serde::Value::as_sequence)
+        .expect("generated filter chain");
+    let names: Vec<_> = filters
+        .iter()
+        .filter_map(|filter| filter.get("filter").and_then(yaml_serde::Value::as_str))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["request_id", "static_response"],
+        "an unconditional 500 must terminate the chain before the 404 fallback and routing filters"
+    );
+    assert_eq!(
+        filters
+            .last()
+            .and_then(|filter| filter.get("status"))
+            .and_then(yaml_serde::Value::as_u64),
+        Some(500),
+        "the zero-weight catch-all rule must answer 500"
+    );
+
+    // Route changes hot-reload, so restarting the proxy is what proves the
+    // published Praxis image accepts the generated chain at startup.
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+    let selector = format!("app.kubernetes.io/instance={gw}");
+    let old_pods = pods
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .expect("list proxy pods");
+    let old_names: Vec<_> = old_pods
+        .items
+        .iter()
+        .filter_map(|pod| pod.metadata.name.clone())
+        .collect();
+    assert!(!old_names.is_empty(), "the proxy pod must exist before restart");
+    for name in &old_names {
+        pods.delete(name, &DeleteParams::default())
+            .await
+            .expect("delete proxy pod");
+    }
+
+    let pod_deadline = tokio::time::Instant::now()
+        .checked_add(tokio::time::Duration::from_secs(DATA_PLANE_TIMEOUT_SECS))
+        .expect("test timeout fits the clock");
+    loop {
+        let current = pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .expect("list restarted proxy pods");
+        let ready = current.items.iter().any(|pod| {
+            let restarted = pod.metadata.name.as_ref().is_none_or(|name| !old_names.contains(name));
+            let ready = pod
+                .status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .is_some_and(|conditions| {
+                    conditions
+                        .iter()
+                        .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+                });
+            restarted && ready
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < pod_deadline,
+            "Praxis must start with the generated zero-weight catch-all chain"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    ctx.cleanup_httproute(&route_name, &ns).await;
+    ctx.cleanup_service(&backend, &ns).await;
+    ctx.cleanup_gateway(&gw, &ns).await;
+    ctx.cleanup_gateway_class(&gc).await;
+    ctx.cleanup_namespace(&ns).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn httproute_hostname_mismatch_not_accepted() {
     let ctx = TestContext::new().await;
     let gc = ctx.create_gateway_class("hr-hostmis-gc").await;
