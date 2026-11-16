@@ -22,7 +22,7 @@ use tracing::{debug, info};
 
 use super::listener_validation;
 use crate::{
-    context::{Context, FIELD_MANAGER},
+    context::{ADMIN_PORT, Context, FIELD_MANAGER},
     error::Result,
     gateway_api::{
         attachment::AttachedRoute,
@@ -162,10 +162,9 @@ async fn build_listener_statuses(
             continue;
         }
 
-        let protocol_supported = ListenerProtocol::is_supported(&listener.protocol);
-        if !protocol_supported {
+        if let Some(status) = rejected_listener_status(listener, generation) {
             any_rejected = true;
-            statuses.push(unsupported_listener_status(listener, generation));
+            statuses.push(status);
             continue;
         }
 
@@ -176,6 +175,26 @@ async fn build_listener_statuses(
     }
 
     (statuses, any_accepted, any_rejected)
+}
+
+/// Reports unsupported protocols and ports reserved by the data plane.
+fn rejected_listener_status(listener: &GatewayListeners, generation: i64) -> Option<ListenerStatus> {
+    if !ListenerProtocol::is_supported(&listener.protocol) {
+        return Some(unsupported_listener_status(listener, generation));
+    }
+    (listener.port == ADMIN_PORT).then(|| ListenerStatus {
+        name: listener.name.clone(),
+        attached_routes: 0,
+        supported_kinds: vec![],
+        conditions: vec![
+            conditions::not_accepted(
+                generation,
+                "PortUnavailable",
+                "port 9902 is reserved for health and metrics",
+            ),
+            conditions::not_programmed(generation, "Invalid", "port 9902 is reserved for health and metrics"),
+        ],
+    })
 }
 
 /// Builds a status entry for a listener conflicting with another.
@@ -504,6 +523,38 @@ mod tests {
             condition_status(&status, "Programmed"),
             Some("False"),
             "pods with no address in front of them are unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_port_is_rejected_while_other_listeners_remain_accepted() {
+        let (ctx, journal) = testing::fake_context(vec![gateway_response()], testing::Cached::default());
+        let valid = http_listener();
+        let mut reserved = valid.clone();
+        reserved.name = "reserved".to_owned();
+        reserved.port = ADMIN_PORT;
+        build_and_apply_gateway_status(&ctx, &gateway(), &[valid, reserved], &[])
+            .await
+            .expect("status must describe the reserved listener");
+        let status = patched_status(&journal);
+        assert_eq!(
+            status
+                .pointer("/listeners/1/conditions/0/reason")
+                .and_then(Value::as_str),
+            Some("PortUnavailable"),
+            "the conflicting listener must explain the reservation"
+        );
+        assert_eq!(
+            status
+                .pointer("/listeners/0/conditions/0/status")
+                .and_then(Value::as_str),
+            Some("True"),
+            "other listeners must remain accepted"
+        );
+        assert_eq!(
+            condition_status(&status, "Accepted"),
+            Some("True"),
+            "one valid listener keeps the Gateway accepted"
         );
     }
 

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: praxis-rollout-test
+  namespace: praxis
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/instance: rollout
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+    - name: https
+      port: 8443
+      targetPort: 8443
+      nodePort: 30443

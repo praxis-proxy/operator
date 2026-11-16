@@ -19,11 +19,11 @@ use kube::{
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, error, info};
 
-use super::{gateway_status, ownership, praxis_config, rollout, route_parent_status};
+use super::{child_cleanup, gateway_status, ownership, praxis_config, rollout, route_parent_status};
 use crate::{
     context::{Context, GATEWAY_FINALIZER},
     error::{OperatorError, Result},
-    gateway_api::{attachment::AttachedRoute, conditions, protocol::ListenerProtocol, route_status},
+    gateway_api::{attachment::AttachedRoute, conditions, route_status},
 };
 
 // -----------------------------------------------------------------------------
@@ -98,9 +98,8 @@ pub fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>
 /// update Gateway and route statuses.
 ///
 /// Route parent statuses are set **after** child resources are applied
-/// and the Deployment rollout is verified, preventing the conformance
-/// test from sending traffic before the data plane has the latest
-/// configuration.
+/// and the initial Deployment rollout is verified. Accepted means the
+/// configuration is valid; `ConfigMap` projection and hot reload are asynchronous.
 async fn apply(gw: Arc<Gateway>, ctx: &Context) -> Result<Action> {
     if !ownership::validate_gateway_class(&ctx.client, &gw).await? || reject_unsupported_spec(ctx, &gw).await? {
         return Ok(Action::await_change());
@@ -134,12 +133,8 @@ async fn apply_config_if_supported(
     ns: &str,
     grants: &[ReferenceGrant],
 ) -> Result<bool> {
-    let has_supported = gw
-        .spec
-        .listeners
-        .iter()
-        .any(|listener| ListenerProtocol::is_supported(&listener.protocol));
-    if !has_supported {
+    if praxis_config::usable_listeners(&gw.spec.listeners).is_empty() {
+        child_cleanup::delete_children(client, gw).await?;
         return Ok(false);
     }
 

@@ -16,12 +16,15 @@ use gateway_api::{
     httproutes::{HTTPRoute, HttpRouteParentRefs},
 };
 use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::Condition};
-use kube::{Api, ResourceExt as _, runtime::controller::Action};
+use kube::{
+    Api, ResourceExt as _,
+    runtime::{controller::Action, reflector::ObjectRef},
+};
 use tracing::{debug, error, info};
 
 use super::namespace_filter;
 use crate::{
-    context::{CONTROLLER_NAME, Context},
+    context::{ADMIN_PORT, CONTROLLER_NAME, Context},
     error::{OperatorError, Result},
     gateway_api::{
         attachment::listener_matches_parent_ref, conditions, hostname, route_status, status_types::RouteParentStatus,
@@ -155,6 +158,29 @@ async fn lookup_parent_gateway(gw_name: &str, gw_ns: &str, route_ns: &str, ctx: 
     None
 }
 
+/// Enqueues routes referencing a Gateway when its listener configuration changes.
+#[must_use]
+pub(crate) fn map_gateway_to_routes(gateway: &Gateway, routes: &[Arc<HTTPRoute>]) -> Vec<ObjectRef<HTTPRoute>> {
+    let namespace = gateway.namespace().unwrap_or_default();
+    let name = gateway.name_any();
+    routes
+        .iter()
+        .filter(|route| {
+            route.spec.parent_refs.as_ref().is_some_and(|parents| {
+                parents.iter().any(|parent| {
+                    route_status::is_ref_targeting_gateway(
+                        parent,
+                        &name,
+                        &namespace,
+                        route_status::route_namespace(route),
+                    )
+                })
+            })
+        })
+        .map(|route| ObjectRef::from_obj(route.as_ref()))
+        .collect()
+}
+
 // -----------------------------------------------------------------------------
 // Validation
 // -----------------------------------------------------------------------------
@@ -199,11 +225,11 @@ fn validate_listener_attachment(
 /// same listener. A ref naming a listener and a port that listener
 /// does not serve selects nothing, exactly as one naming a listener
 /// that does not exist does.
-fn parent_ref_selects_a_listener(gw: &Gateway, parent_ref: &HttpRouteParentRefs) -> bool {
+pub(super) fn parent_ref_selects_a_listener(gw: &Gateway, parent_ref: &HttpRouteParentRefs) -> bool {
     gw.spec
         .listeners
         .iter()
-        .any(|listener| listener_matches_parent_ref(listener, parent_ref))
+        .any(|listener| listener.port != ADMIN_PORT && listener_matches_parent_ref(listener, parent_ref))
 }
 
 /// Returns `true` when the route's namespace is allowed by listeners.
@@ -238,10 +264,11 @@ fn targeted_listeners<'listen>(
     listeners: &'listen [GatewayListeners],
     section_name: Option<&str>,
 ) -> Vec<&'listen GatewayListeners> {
-    match section_name {
-        Some(name) => listeners.iter().filter(|ls| ls.name == name).collect(),
-        None => listeners.iter().collect(),
-    }
+    listeners
+        .iter()
+        .filter(|listener| listener.port != ADMIN_PORT)
+        .filter(|listener| section_name.is_none_or(|name| listener.name == name))
+        .collect()
 }
 
 /// Checks if any route hostname intersects with a matching listener.
@@ -292,6 +319,54 @@ mod tests {
 
     use super::*;
     use crate::testing;
+
+    #[test]
+    fn reserved_listeners_cannot_match_route_parents() {
+        let mut reserved = listener("reserved", Some("reserved.example.com"));
+        reserved.port = ADMIN_PORT;
+        let gw = gateway(vec![reserved, listener("valid", Some("valid.example.com"))]);
+        assert!(
+            !parent_ref_selects_a_listener(&gw, &parent_ref(Some("reserved"))),
+            "reserved section must be rejected"
+        );
+        let mut parent = parent_ref(None);
+        parent.port = Some(ADMIN_PORT);
+        assert!(
+            !parent_ref_selects_a_listener(&gw, &parent),
+            "reserved port must be rejected"
+        );
+        assert!(
+            parent_ref_selects_a_listener(&gw, &parent_ref(None)),
+            "unqualified parents retain usable siblings"
+        );
+        assert!(
+            !hostnames_intersect(&route(&["reserved.example.com"]), &gw, None),
+            "reserved listeners cannot supply hostname matches"
+        );
+        assert_eq!(
+            targeted_listeners(&gw.spec.listeners, None).len(),
+            1,
+            "namespace validation must also exclude reserved listeners"
+        );
+    }
+
+    #[test]
+    fn gateway_changes_enqueue_only_referencing_routes() {
+        let gw = gateway(vec![listener("http", None)]);
+        let mut parent = parent_ref(None);
+        parent.namespace = Some("infra".to_owned());
+        let matching = Arc::new(parented_route(parent.clone()));
+        parent.namespace = Some("elsewhere".to_owned());
+        let foreign = Arc::new(parented_route(parent));
+        let refs = map_gateway_to_routes(&gw, &[matching, foreign]);
+        assert_eq!(refs.len(), 1, "only routes naming this exact Gateway are reconciled");
+        assert_eq!(refs[0].name, "route", "enqueue the route");
+        assert_eq!(
+            refs[0].namespace.as_deref(),
+            Some("apps"),
+            "retain cross-namespace route identity"
+        );
+    }
 
     #[test]
     fn test_a_parent_ref_naming_nothing_selects_every_listener() {

@@ -30,18 +30,18 @@ pub struct PraxisConfig {
     /// Filter chains with routing and processing filters.
     pub filter_chains: Vec<PraxisFilterChain>,
 
-    /// Insecure options for container deployments.
-    pub insecure_options: PraxisInsecureOptions,
-
     /// Listeners (proxy entry points).
     pub listeners: Vec<PraxisListener>,
+
+    /// Runtime configuration.
+    pub runtime: PraxisRuntime,
 }
 
 /// Admin endpoint configuration.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PraxisAdmin {
-    /// Admin bind address.
-    pub address: String,
+    /// Health and metrics bind address.
+    pub metrics_address: String,
 }
 
 /// Named filter chain.
@@ -54,11 +54,11 @@ pub struct PraxisFilterChain {
     pub filters: Vec<PraxisFilterEntry>,
 }
 
-/// Insecure options (for container deployments).
+/// Runtime configuration.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct PraxisInsecureOptions {
-    /// Allow admin endpoint on public interface.
-    pub allow_public_admin: bool,
+pub struct PraxisRuntime {
+    /// Worker threads per service.
+    pub threads: usize,
 }
 
 // -----------------------------------------------------------------------------
@@ -81,20 +81,44 @@ pub fn assemble_config(
     route_filters: &RouteFilters,
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisConfig> {
+    let by_listener: BTreeMap<String, RouteFilters> = listeners
+        .iter()
+        .map(|listener| (listener.name.clone(), route_filters.clone()))
+        .collect();
+    assemble_config_with_listener_filters(listeners, routes, clusters, &by_listener, listener_hostnames)
+}
+
+/// Assembles a Praxis configuration with filters scoped to each listener.
+///
+/// Route filters belong to the listener whose routes contributed them; a
+/// listener with no routes must not inherit filters from another listener.
+///
+/// # Errors
+///
+/// Returns an error if filter config serialization fails.
+pub fn assemble_config_with_listener_filters(
+    listeners: Vec<PraxisListener>,
+    routes: &[PraxisRoute],
+    clusters: &[PraxisCluster],
+    route_filters: &BTreeMap<String, RouteFilters>,
+    listener_hostnames: &std::collections::HashMap<String, Option<String>>,
+) -> yaml_serde::Result<PraxisConfig> {
+    let empty = RouteFilters::default();
     let filter_chains: Vec<_> = listeners
         .iter()
-        .map(|listener| build_filter_chain(listener, routes, clusters, route_filters, listener_hostnames))
+        .map(|listener| {
+            let filters = route_filters.get(&listener.name).unwrap_or(&empty);
+            build_filter_chain(listener, routes, clusters, filters, listener_hostnames)
+        })
         .collect::<yaml_serde::Result<Vec<_>>>()?;
 
     Ok(PraxisConfig {
         admin: PraxisAdmin {
-            address: "0.0.0.0:9901".to_owned(),
+            metrics_address: "0.0.0.0:9902".to_owned(),
         },
         filter_chains,
-        insecure_options: PraxisInsecureOptions {
-            allow_public_admin: true,
-        },
         listeners,
+        runtime: PraxisRuntime { threads: 1 },
     })
 }
 
@@ -103,12 +127,17 @@ pub fn assemble_config(
 /// The chain runs `request_id`, the route filters that answer a request
 /// without an upstream, `router` (with matching routes), the route
 /// filters that reshape a routed request, and finally `load_balancer`
-/// (with embedded clusters). [`RouteFilters`] explains why the router
-/// splits the two groups.
+/// (with embedded clusters). Routeless listeners terminate with a
+/// 404 response because Praxis rejects an empty router route list. [`RouteFilters`] explains why the router splits the
+/// two groups.
 ///
 /// # Errors
 ///
 /// Returns an error if filter config serialization fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "chain assembly covers the routeless fallback and the routed path"
+)]
 fn build_filter_chain(
     listener: &PraxisListener,
     routes: &[PraxisRoute],
@@ -117,28 +146,39 @@ fn build_filter_chain(
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisFilterChain> {
     let name = &listener.name;
-
-    let section_names = &listener.merged_section_names;
-    let filtered: Vec<_> = routes
-        .iter()
-        .filter(|route| {
-            route.listener_names.is_empty()
-                || route
-                    .listener_names
-                    .iter()
-                    .any(|ln| ln.is_none() || ln.as_deref().is_some_and(|sn| section_names.contains(&sn.to_owned())))
-        })
-        .cloned()
-        .collect();
-    let mut scoped = inject_listener_hostnames(&filtered, listener_hostnames);
-    sort_routes_by_specificity_owned(&mut scoped);
+    let scoped = scoped_routes(listener, routes, listener_hostnames);
     let scoped_refs: Vec<_> = scoped.iter().collect();
 
     let mut filters = vec![PraxisFilterEntry {
         filter: "request_id".to_owned(),
         config: yaml_serde::Value::Null,
     }];
-    filters.extend_from_slice(&route_filters.terminating);
+    if scoped_refs.is_empty() {
+        // A listener with no routes still serves its terminating filters
+        // (for example a redirect-only rule); the 404 answers everything else.
+        if extend_terminating(&mut filters, &route_filters.terminating) {
+            return Ok(PraxisFilterChain {
+                name: format!("{name}-chain"),
+                filters,
+            });
+        }
+        filters.push(PraxisFilterEntry {
+            filter: "static_response".to_owned(),
+            config: yaml_serde::to_value(serde_json::json!({"status": 404}))?,
+        });
+        return Ok(PraxisFilterChain {
+            name: format!("{name}-chain"),
+            filters,
+        });
+    }
+    if extend_terminating(&mut filters, &route_filters.terminating) {
+        // An unconditional response answers every request, so the router and
+        // load balancer after it would be unreachable and Praxis rejects them.
+        return Ok(PraxisFilterChain {
+            name: format!("{name}-chain"),
+            filters,
+        });
+    }
     filters.push(build_router_filter(&scoped_refs)?);
     filters.extend_from_slice(&route_filters.transforming);
     filters.push(build_lb_filter(clusters)?);
@@ -149,19 +189,26 @@ fn build_filter_chain(
     })
 }
 
-/// Injects listener hostnames into routes that lack one.
-///
-/// Each route's `listener_names` determines which Gateway listener it
-/// targets. If that listener has a hostname constraint, routes without
-/// an HTTPRoute-level hostname inherit it.
-fn inject_listener_hostnames(
+/// Returns the routes scoped to one listener, ordered by specificity.
+fn scoped_routes(
+    listener: &PraxisListener,
     routes: &[PraxisRoute],
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> Vec<PraxisRoute> {
-    routes
+    let section_names = &listener.merged_section_names;
+    let mut scoped: Vec<_> = routes
         .iter()
+        .filter(|route| {
+            route.listener_names.is_empty()
+                || route.listener_names.iter().any(|name| {
+                    name.as_deref()
+                        .is_none_or(|section| section_names.iter().any(|candidate| candidate == section))
+                })
+        })
         .flat_map(|route| expand_route_hostnames(route, listener_hostnames))
-        .collect()
+        .collect();
+    sort_routes_by_specificity_owned(&mut scoped);
+    scoped
 }
 
 /// Expands a route into one copy per targeted listener hostname.
@@ -248,6 +295,35 @@ fn extra_constraints(route: &PraxisRoute) -> usize {
     route.headers.as_ref().map_or(0, BTreeMap::len)
 }
 
+/// Appends terminating filters, stopping at an unconditional response.
+///
+/// Returns `true` when the chain now ends in an unconditional
+/// `static_response`, so no router, load balancer, or 404 fallback may
+/// follow it.
+fn extend_terminating(filters: &mut Vec<PraxisFilterEntry>, terminating: &[PraxisFilterEntry]) -> bool {
+    filters.extend_from_slice(terminating);
+    match filters.iter().position(terminates_unconditionally) {
+        Some(index) => {
+            filters.truncate(index.saturating_add(1));
+            true
+        },
+        None => false,
+    }
+}
+
+/// Whether a `static_response` filter answers the request unconditionally.
+///
+/// Without `conditions`, the response terminates the chain for every
+/// request, so no later filter can run and Praxis rejects a chain that
+/// continues past it.
+fn terminates_unconditionally(entry: &PraxisFilterEntry) -> bool {
+    entry.filter == "static_response"
+        && entry
+            .config
+            .as_mapping()
+            .is_none_or(|mapping| !mapping.contains_key("conditions"))
+}
+
 /// Builds the `router` filter entry from matched routes.
 ///
 /// Serializes the routes into a YAML mapping under the `routes` key,
@@ -327,11 +403,11 @@ mod tests {
             path_prefix: "/api/".to_owned(),
             host: None,
             headers: None,
-            cluster: "default~my-svc~8080".to_owned(),
+            cluster: "default-my-svc-8080".to_owned(),
             listener_names: vec![],
         };
 
-        let cluster = build_cluster("default~my-svc~8080", vec!["10.0.0.1:8080".to_owned()], None);
+        let cluster = build_cluster("default-my-svc-8080", vec!["10.0.0.1:8080".to_owned()], None);
 
         let config = assemble_config(
             vec![listener],
@@ -342,12 +418,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.admin.address, "0.0.0.0:9901", "admin address should be set");
-        assert_eq!(config.listeners.len(), 1, "should have one listener");
-        assert!(
-            config.insecure_options.allow_public_admin,
-            "allow_public_admin should be true"
+        assert_eq!(
+            config.admin.metrics_address, "0.0.0.0:9902",
+            "health and metrics should bind to the dedicated metrics address"
         );
+        assert_eq!(config.listeners.len(), 1, "should have one listener");
+        assert_eq!(config.runtime.threads, 1, "runtime should use one worker thread");
 
         assert_eq!(config.filter_chains.len(), 1, "should have one filter chain");
         let chain = &config.filter_chains[0];
@@ -371,6 +447,49 @@ mod tests {
     }
 
     #[test]
+    fn test_routeless_unconditional_response_replaces_the_404() {
+        let listener = PraxisListener {
+            name: "routeless".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: vec!["routeless-chain".to_owned()],
+            protocol: None,
+            hostname: None,
+            merged_section_names: vec!["routeless".to_owned()],
+            tls: None,
+        };
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert(
+            "routeless".to_owned(),
+            RouteFilters {
+                terminating: vec![PraxisFilterEntry {
+                    filter: "static_response".to_owned(),
+                    config: yaml_serde::to_value(serde_json::json!({"status": 500})).unwrap(),
+                }],
+                transforming: Vec::new(),
+            },
+        );
+
+        let config =
+            assemble_config_with_listener_filters(vec![listener], &[], &[], &by_listener, &Default::default()).unwrap();
+        let names: Vec<_> = config.filter_chains[0]
+            .filters
+            .iter()
+            .map(|filter| filter.filter.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["request_id", "static_response"],
+            "an unconditional response already terminates the chain, so appending the 404 would \
+             leave an unreachable filter that Praxis rejects"
+        );
+        let status = config.filter_chains[0].filters[1]
+            .config
+            .get("status")
+            .and_then(yaml_serde::Value::as_u64);
+        assert_eq!(status, Some(500), "the rule's own response must be kept");
+    }
+
+    #[test]
     fn test_assemble_config_yaml_serialization() {
         let listener = PraxisListener {
             name: "http".to_owned(),
@@ -387,11 +506,11 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: None,
             headers: None,
-            cluster: "default~svc~80".to_owned(),
+            cluster: "default-svc-80".to_owned(),
             listener_names: vec![],
         };
 
-        let cluster = build_cluster("default~svc~80", vec!["10.0.0.1:80".to_owned()], None);
+        let cluster = build_cluster("default-svc-80", vec!["10.0.0.1:80".to_owned()], None);
 
         let config = assemble_config(
             vec![listener],
@@ -405,16 +524,20 @@ mod tests {
         let yaml = yaml_serde::to_string(&config).expect("config should serialize to YAML");
 
         assert!(yaml.contains("admin:"), "YAML should contain admin section");
-        assert!(yaml.contains("0.0.0.0:9901"), "YAML should contain admin address");
+        assert!(
+            yaml.contains("metrics_address: 0.0.0.0:9902"),
+            "YAML should contain metrics address"
+        );
         assert!(yaml.contains("listeners:"), "YAML should contain listeners section");
         assert!(
             yaml.contains("filter_chains:"),
             "YAML should contain filter_chains section"
         );
         assert!(
-            yaml.contains("insecure_options:"),
-            "YAML should contain insecure_options section"
+            !yaml.contains("insecure_options"),
+            "public metrics must not require an insecure option"
         );
+        assert!(yaml.contains("threads: 1"), "YAML should contain runtime thread count");
         assert!(yaml.contains("request_id"), "YAML should contain request_id filter");
         assert!(yaml.contains("router"), "YAML should contain router filter");
         assert!(
@@ -454,11 +577,11 @@ mod tests {
             path_prefix: "/".to_owned(),
             host: None,
             headers: None,
-            cluster: "default~svc~80".to_owned(),
+            cluster: "default-svc-80".to_owned(),
             listener_names: vec![],
         };
 
-        let cluster = build_cluster("default~svc~80", vec!["10.0.0.1:80".to_owned()], None);
+        let cluster = build_cluster("default-svc-80", vec!["10.0.0.1:80".to_owned()], None);
 
         let config = assemble_config(
             vec![http_listener, https_listener],
@@ -557,10 +680,24 @@ mod tests {
         let config = assemble_config(vec![listener], &[], &[], &RouteFilters::default(), &Default::default()).unwrap();
 
         let chain = &config.filter_chains[0];
-        let lb_config = &chain.filters[2].config;
-        let clusters_value = lb_config.get("clusters").expect("lb config should have clusters key");
-        let clusters_seq = clusters_value.as_sequence().expect("clusters should be a sequence");
-        assert!(clusters_seq.is_empty(), "clusters should be empty");
+        assert_eq!(
+            chain.filters.len(),
+            2,
+            "a routeless listener should omit the router and load balancer"
+        );
+        assert_eq!(
+            chain.filters[0].filter, "request_id",
+            "the routeless chain should retain request IDs"
+        );
+        assert_eq!(
+            chain.filters[1].filter, "static_response",
+            "unmatched traffic must terminate"
+        );
+        assert_eq!(
+            chain.filters[1].config["status"].as_u64(),
+            Some(404),
+            "routeless listeners return 404"
+        );
     }
 
     #[test]
@@ -633,19 +770,16 @@ mod tests {
 
     #[test]
     fn test_router_matches_wildcards_at_any_depth() {
-        let listener = PraxisListener {
-            name: "http".to_owned(),
-            address: "0.0.0.0:80".to_owned(),
-            protocol: None,
-            filter_chains: vec!["http-chain".to_owned()],
-            hostname: None,
-            merged_section_names: vec![],
-            tls: None,
+        let route = PraxisRoute {
+            path: None,
+            path_prefix: "/".to_owned(),
+            host: Some("*.example.com".to_owned()),
+            headers: None,
+            cluster: "cluster".to_owned(),
+            listener_names: vec![],
         };
+        let router = build_router_filter(&[&route]).unwrap();
 
-        let config = assemble_config(vec![listener], &[], &[], &RouteFilters::default(), &Default::default()).unwrap();
-
-        let router = &config.filter_chains[0].filters[1];
         assert_eq!(
             router.config.get("multi_level_subdomain_matching"),
             Some(&yaml_serde::Value::Bool(true)),
@@ -680,8 +814,24 @@ mod tests {
             terminating: vec![redirect],
             transforming: vec![headers],
         };
+        let route = PraxisRoute {
+            path: None,
+            path_prefix: "/".to_owned(),
+            host: None,
+            headers: None,
+            cluster: "cluster".to_owned(),
+            listener_names: vec![],
+        };
+        let cluster = build_cluster("cluster", vec!["10.0.0.1:80".to_owned()], None);
 
-        let config = assemble_config(vec![listener], &[], &[], &route_filters, &Default::default()).unwrap();
+        let config = assemble_config(
+            vec![listener],
+            std::slice::from_ref(&route),
+            std::slice::from_ref(&cluster),
+            &route_filters,
+            &Default::default(),
+        )
+        .unwrap();
 
         let chain = &config.filter_chains[0];
         let names: Vec<_> = chain.filters.iter().map(|f| f.filter.as_str()).collect();
@@ -691,6 +841,103 @@ mod tests {
             vec!["request_id", "redirect", "router", "headers", "load_balancer"],
             "a redirect answers the request its rule has no backend for, so it has to precede the \
              router's 404; a header modifier changes what the router reads and so has to follow it"
+        );
+    }
+
+    #[test]
+    fn routeless_listener_keeps_its_own_terminating_filters() {
+        let listener = PraxisListener {
+            name: "routeless".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            filter_chains: vec!["routeless-chain".to_owned()],
+            protocol: None,
+            hostname: None,
+            merged_section_names: vec!["routeless".to_owned()],
+            tls: None,
+        };
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert(
+            "routeless".to_owned(),
+            RouteFilters {
+                terminating: vec![PraxisFilterEntry {
+                    filter: "redirect".to_owned(),
+                    config: yaml_serde::Value::Null,
+                }],
+                transforming: Vec::new(),
+            },
+        );
+        let config =
+            assemble_config_with_listener_filters(vec![listener], &[], &[], &by_listener, &Default::default()).unwrap();
+        let names: Vec<_> = config.filter_chains[0]
+            .filters
+            .iter()
+            .map(|filter| filter.filter.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["request_id", "redirect", "static_response"],
+            "a routeless listener must keep its own terminating filters before the 404"
+        );
+    }
+
+    #[test]
+    fn routeless_listeners_do_not_inherit_terminating_filters() {
+        let routed = PraxisListener {
+            name: "routed".to_owned(),
+            address: "0.0.0.0:80".to_owned(),
+            protocol: None,
+            filter_chains: vec!["routed-chain".to_owned()],
+            hostname: None,
+            merged_section_names: vec!["routed".to_owned()],
+            tls: None,
+        };
+        let routeless = PraxisListener {
+            name: "routeless".to_owned(),
+            address: "0.0.0.0:8081".to_owned(),
+            protocol: None,
+            filter_chains: vec!["routeless-chain".to_owned()],
+            hostname: None,
+            merged_section_names: vec!["routeless".to_owned()],
+            tls: None,
+        };
+        let route = PraxisRoute {
+            path: None,
+            path_prefix: "/".to_owned(),
+            host: None,
+            headers: None,
+            cluster: "cluster".to_owned(),
+            listener_names: vec![Some("routed".to_owned())],
+        };
+        let cluster = build_cluster("cluster", vec!["10.0.0.1:80".to_owned()], None);
+        let route_filters = RouteFilters {
+            terminating: vec![PraxisFilterEntry {
+                filter: "redirect".to_owned(),
+                config: yaml_serde::Value::Null,
+            }],
+            transforming: Vec::new(),
+        };
+
+        let mut by_listener = BTreeMap::new();
+        by_listener.insert("routed".to_owned(), route_filters);
+        let config = assemble_config_with_listener_filters(
+            vec![routed, routeless],
+            std::slice::from_ref(&route),
+            std::slice::from_ref(&cluster),
+            &by_listener,
+            &Default::default(),
+        )
+        .unwrap();
+        let routeless = config
+            .filter_chains
+            .iter()
+            .find(|chain| chain.name == "routeless-chain")
+            .expect("routeless chain");
+        let names: Vec<_> = routeless.filters.iter().map(|filter| filter.filter.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["request_id", "static_response"],
+            "terminating filters from another listener's route must not answer routeless traffic"
         );
     }
 

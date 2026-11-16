@@ -48,24 +48,18 @@ pub enum PraxisEndpoint {
 
 /// Generates a cluster name from namespace, service, and port.
 ///
-/// Returns a cluster name in the format `{namespace}~{service}~{port}`.
+/// Returns a cluster name in the format `{namespace}_{service}_{port}`.
 ///
-/// Uses `~` as separator because it cannot appear in Kubernetes namespace
-/// or service names (DNS subdomain charset), preventing ambiguity.
+/// Underscores are accepted by Praxis but cannot occur in Kubernetes
+/// namespace or Service names, so different backends cannot collide.
 ///
 /// ```
 /// use praxis_operator::config::cluster::cluster_name;
 ///
-/// assert_eq!(cluster_name("default", "echo", 8080), "default~echo~8080");
-///
-/// // The format is only injective because `~` is outside the DNS
-/// // subdomain charset. Feed it a name containing the separator and
-/// // two distinct backends do collide — which is why the API server's
-/// // own validation is what makes this key safe:
-/// assert_eq!(cluster_name("a", "b~c", 80), cluster_name("a~b", "c", 80));
+/// assert_eq!(cluster_name("default", "echo", 8080), "default_echo_8080");
 /// ```
 pub fn cluster_name(namespace: &str, service: &str, port: i32) -> String {
-    format!("{namespace}~{service}~{port}")
+    format!("{namespace}_{service}_{port}")
 }
 
 /// Builds a Praxis cluster configuration.
@@ -102,13 +96,22 @@ mod tests {
     #[test]
     fn test_cluster_name() {
         let name = cluster_name("default", "my-svc", 8080);
-        assert_eq!(name, "default~my-svc~8080", "cluster name format should match");
+        assert_eq!(name, "default_my-svc_8080", "cluster name format should match");
     }
 
     #[test]
     fn test_cluster_name_different_namespace() {
         let name = cluster_name("kube-system", "dns", 53);
-        assert_eq!(name, "kube-system~dns~53", "cluster name should include namespace");
+        assert_eq!(name, "kube-system_dns_53", "cluster name should include namespace");
+    }
+
+    #[test]
+    fn cluster_names_distinguish_hyphenated_namespaces_and_services() {
+        assert_ne!(
+            cluster_name("a-b", "c", 80),
+            cluster_name("a", "b-c", 80),
+            "backends in different namespaces must not share traffic through a name collision"
+        );
     }
 
     #[test]

@@ -235,9 +235,15 @@ fn managed_children() -> watcher::Config {
 
 /// Wires the `HTTPRoute` controller.
 ///
-/// Watches all `HTTPRoute` resources and reconciles parent status entries.
+/// Watches routes and their parent Gateways to reconcile attachment status changes.
 fn build_route_controller(client: &Client, ctx: Arc<context::Context>) -> impl Future<Output = ()> {
+    let stores = ctx.stores.clone();
     Controller::new(Api::<HTTPRoute>::all(client.clone()), watcher::Config::default())
+        .watches(
+            Api::<Gateway>::all(client.clone()),
+            watcher::Config::default(),
+            move |gateway| controller::httproute::map_gateway_to_routes(&gateway, &stores.routes()),
+        )
         .shutdown_on_signal()
         .run(
             controller::httproute::reconcile,

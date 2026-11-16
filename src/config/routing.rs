@@ -12,6 +12,7 @@ use gateway_api::{
 use serde::Serialize;
 use tracing::warn;
 
+use super::cluster::cluster_name as backend_cluster_name;
 use crate::gateway_api::{
     attachment::AttachedRoute, hostname::intersect_hostnames, reference_grant::is_reference_allowed,
     route_validation::validate_route,
@@ -81,7 +82,7 @@ pub struct PraxisFilterEntry {
 /// `Service` endpoints into cluster `IP:port` pairs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendRef {
-    /// Cluster name (format: `namespace~service~port`).
+    /// Cluster name (format: `namespace_service_port`).
     pub cluster_name: String,
 
     /// Kubernetes namespace of the backend Service.
@@ -252,11 +253,11 @@ fn process_rule(
 
     let authorized: Vec<_> = raw_backends
         .iter()
-        .filter(|backend| check_backend_authorized(backend, route_ns, grants))
+        .filter(|backend| check_backend_servable(backend, route_ns, grants))
         .collect();
 
     if authorized.is_empty() {
-        tracing::debug!("rule has no authorized backends; emitting no route");
+        tracing::debug!("rule has no servable backends; emitting no route");
         return;
     }
 
@@ -285,15 +286,38 @@ pub fn rule_has_authorized_backend(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .any(|backend| is_backend_authorized(backend, route_ns, grants))
+        .any(|backend| backend_is_servable(backend, route_ns, grants))
 }
 
-/// Returns `true` if authorized; logs and returns `false` otherwise.
-fn check_backend_authorized(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
-    if is_backend_authorized(backend, route_ns, grants) {
+/// Whether a backend ref can receive traffic.
+///
+/// A ref is servable when its group and kind are supported, a
+/// `ReferenceGrant` authorizes it, and its weight is positive. Gateway
+/// API `weight: 0` means "send no traffic", so such a ref contributes
+/// no endpoints; a rule whose every ref is zero-weighted has no backend
+/// to serve and answers 500 like any other unresolvable rule.
+fn backend_is_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    backend.weight.unwrap_or(1) > 0
+        && backend_kind_is_supported(backend)
+        && is_backend_authorized(backend, route_ns, grants)
+}
+
+/// Whether the ref names a Service in the core API group.
+fn backend_kind_is_supported(backend: &HttpRouteRulesBackendRefs) -> bool {
+    let group = backend.group.as_deref().unwrap_or("");
+    let kind = backend.kind.as_deref().unwrap_or("Service");
+    group.is_empty() && kind == "Service"
+}
+
+/// Returns `true` if servable; logs and returns `false` otherwise.
+fn check_backend_servable(backend: &HttpRouteRulesBackendRefs, route_ns: &str, grants: &[ReferenceGrant]) -> bool {
+    if backend_is_servable(backend, route_ns, grants) {
         return true;
     }
-    tracing::debug!(backend = backend.name, "skipping unauthorized cross-namespace backend");
+    tracing::debug!(
+        backend = backend.name,
+        "skipping unauthorized, unsupported, or zero-weight backend"
+    );
     false
 }
 
@@ -321,9 +345,15 @@ fn merged_cluster_name_from_refs(backends: &[&HttpRouteRulesBackendRefs], route_
     }
     backends
         .iter()
-        .map(|backend| single_cluster_name(backend, route_ns))
+        .map(|backend| {
+            format!(
+                "{}_w{}",
+                single_cluster_name(backend, route_ns),
+                backend.weight.unwrap_or(1)
+            )
+        })
         .collect::<Vec<_>>()
-        .join("+")
+        .join("__")
 }
 
 /// Builds a cluster name for a single backend ref.
@@ -331,7 +361,7 @@ fn single_cluster_name(backend: &HttpRouteRulesBackendRefs, route_ns: &str) -> S
     let namespace = backend.namespace.as_deref().unwrap_or(route_ns);
     let service = backend.name.as_str();
     let port = backend.port.unwrap_or(80);
-    format!("{namespace}~{service}~{port}")
+    backend_cluster_name(namespace, service, port)
 }
 
 /// Resolves a single backend ref into a [`BackendRef`].
@@ -345,9 +375,9 @@ fn process_backend_ref(
     cluster_name: &str,
     seen: &mut HashSet<String>,
 ) -> Option<BackendRef> {
-    let group = backend.group.as_deref().unwrap_or("");
-    let kind = backend.kind.as_deref().unwrap_or("Service");
-    if !group.is_empty() || kind != "Service" {
+    if !backend_kind_is_supported(backend) {
+        let group = backend.group.as_deref().unwrap_or("");
+        let kind = backend.kind.as_deref().unwrap_or("Service");
         tracing::debug!(group, kind, "skipping unsupported backend ref kind");
         return None;
     }
@@ -355,7 +385,7 @@ fn process_backend_ref(
     let namespace = backend.namespace.as_deref().unwrap_or(route_ns);
     let service = backend.name.as_str();
     let port = backend.port.unwrap_or(80);
-    let dedup_key = format!("{cluster_name}:{namespace}~{service}~{port}");
+    let dedup_key = format!("{cluster_name}:{}", backend_cluster_name(namespace, service, port));
 
     if !seen.insert(dedup_key) {
         return None;
@@ -539,6 +569,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merged_cluster_names_are_valid_and_distinguish_weights() {
+        let first = HttpRouteRulesBackendRefs {
+            name: "api".to_owned(),
+            port: Some(80),
+            weight: Some(1),
+            ..Default::default()
+        };
+        let mut second = HttpRouteRulesBackendRefs {
+            name: "canary".to_owned(),
+            ..first.clone()
+        };
+        let equal_split = merged_cluster_name_from_refs(&[&first, &second], "default");
+        second.weight = Some(3);
+        let unequal_split = merged_cluster_name_from_refs(&[&first, &second], "default");
+
+        assert!(
+            equal_split
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')),
+            "multi-backend names must pass Praxis name validation: {equal_split}"
+        );
+        assert_ne!(
+            equal_split, unequal_split,
+            "rules with different traffic splits must not merge their endpoints"
+        );
+        assert_ne!(
+            equal_split,
+            single_cluster_name(&first, "default"),
+            "merged and single clusters must be distinct"
+        );
+    }
+
+    #[test]
     fn test_convert_routes_path_prefix() {
         let route = HTTPRoute {
             metadata: ObjectMeta {
@@ -594,14 +657,14 @@ mod tests {
 
         for r in &praxis_routes {
             assert_eq!(
-                r.cluster, "default~my-svc~8080",
+                r.cluster, "default_my-svc_8080",
                 "cluster should match namespace-service-port"
             );
         }
 
         assert_eq!(backend_refs.len(), 1, "should have one backend ref");
         assert_eq!(
-            backend_refs[0].cluster_name, "default~my-svc~8080",
+            backend_refs[0].cluster_name, "default_my-svc_8080",
             "backend ref cluster name should match"
         );
         assert_eq!(backend_refs[0].service, "my-svc", "backend ref service should match");
@@ -714,11 +777,11 @@ mod tests {
         );
 
         assert!(
-            backend_refs.iter().any(|b| b.cluster_name == "default~api-svc~8080"),
+            backend_refs.iter().any(|b| b.cluster_name == "default_api-svc_8080"),
             "should have api-svc backend ref"
         );
         assert!(
-            backend_refs.iter().any(|b| b.cluster_name == "default~web-svc~80"),
+            backend_refs.iter().any(|b| b.cluster_name == "default_web-svc_80"),
             "should have web-svc backend ref"
         );
     }
@@ -806,12 +869,12 @@ mod tests {
 
         assert_eq!(praxis_routes.len(), 1, "should produce one route");
         assert_eq!(
-            praxis_routes[0].cluster, "other-ns~svc~80",
+            praxis_routes[0].cluster, "other-ns_svc_80",
             "cluster should use backend namespace"
         );
 
         assert!(
-            backend_refs.iter().any(|b| b.cluster_name == "other-ns~svc~80"),
+            backend_refs.iter().any(|b| b.cluster_name == "other-ns_svc_80"),
             "backend refs should use backend namespace"
         );
         assert_eq!(
@@ -1383,7 +1446,7 @@ mod tests {
         let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
 
         assert_eq!(
-            praxis_routes[0].cluster, "infra~local~80",
+            praxis_routes[0].cluster, "infra_local_80",
             "the cluster name must describe only the backends that actually resolve, or the \
              generated name promises endpoints the cluster will never contain"
         );
@@ -1391,6 +1454,65 @@ mod tests {
             backend_refs.len(),
             1,
             "only the authorized backend contributes endpoints"
+        );
+    }
+
+    #[test]
+    fn test_convert_routes_omits_zero_weight_backends() {
+        let route = route_with_rules(vec![HttpRouteRules {
+            backend_refs: Some(vec![
+                HttpRouteRulesBackendRefs {
+                    name: "kept".to_owned(),
+                    port: Some(80),
+                    weight: Some(70),
+                    ..Default::default()
+                },
+                HttpRouteRulesBackendRefs {
+                    name: "zero".to_owned(),
+                    port: Some(80),
+                    weight: Some(0),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }]);
+        let routes = vec![AttachedRoute {
+            route: &route,
+            section_names: vec![None],
+        }];
+
+        let (praxis_routes, backend_refs) = convert_routes(&routes, &HashMap::new(), &[]);
+
+        assert_eq!(
+            praxis_routes[0].cluster, "default_kept_80",
+            "only the servable backend should shape the cluster name"
+        );
+        assert_eq!(backend_refs.len(), 1, "a zero-weight backend contributes no endpoints");
+    }
+
+    #[test]
+    fn test_rule_with_only_zero_weight_backends_has_no_backend() {
+        let mut rule = rule_with_backend();
+        if let Some(refs) = rule.backend_refs.as_mut() {
+            refs[0].weight = Some(0);
+        }
+
+        assert!(
+            !rule_has_authorized_backend(&rule, "default", &[]),
+            "a rule whose only backend has weight zero cannot serve traffic"
+        );
+    }
+
+    #[test]
+    fn test_rule_with_unknown_kind_backend_has_no_backend() {
+        let mut rule = rule_with_backend();
+        if let Some(refs) = rule.backend_refs.as_mut() {
+            refs[0].kind = Some("NotAService".to_owned());
+        }
+
+        assert!(
+            !rule_has_authorized_backend(&rule, "default", &[]),
+            "an unknown backend kind must answer 500 instead of routing to an empty cluster"
         );
     }
 

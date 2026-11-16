@@ -3,10 +3,9 @@
 
 //! Writing `Accepted` and `ResolvedRefs` onto attached routes.
 //!
-//! The Gateway controller owns route acceptance, but only once the data
-//! plane is actually serving the matching configuration — otherwise a
-//! client following the status would send traffic to a proxy that has
-//! not caught up yet.
+//! The Gateway controller owns route acceptance after applying valid configuration.
+//! Acceptance does not acknowledge completion of asynchronous `ConfigMap` projection
+//! or data-plane hot reload.
 
 use gateway_api::{
     gateways::Gateway,
@@ -31,9 +30,8 @@ use crate::{
 ///
 /// Sets `Accepted = True` and evaluates `ResolvedRefs` for each route
 /// that targets this Gateway. Called by the Gateway controller **after**
-/// child resources are applied and the Deployment rollout is verified,
-/// so the conformance test cannot send traffic before the data plane
-/// is serving the matching configuration.
+/// child resources are applied and the initial Deployment rollout is verified.
+/// This does not acknowledge that a hot-reloaded configuration is already serving.
 pub(super) async fn update_route_parent_statuses(
     client: &kube::Client,
     gw: &Gateway,
@@ -41,7 +39,6 @@ pub(super) async fn update_route_parent_statuses(
     grants: &[ReferenceGrant],
 ) -> Result<()> {
     let gw_ns = gw.namespace().unwrap_or_default();
-    let gw_name = gw.name_any();
 
     for AttachedRoute { route, .. } in attached {
         let route_ns = route_status::route_namespace(route);
@@ -50,17 +47,7 @@ pub(super) async fn update_route_parent_statuses(
             continue;
         };
 
-        let statuses = build_route_statuses(
-            route,
-            parent_refs,
-            route_ns,
-            &gw_name,
-            &gw_ns,
-            generation,
-            client,
-            grants,
-        )
-        .await;
+        let statuses = build_route_statuses(route, parent_refs, route_ns, gw, &gw_ns, generation, client, grants).await;
 
         if !statuses.is_empty() {
             route_status::apply_parent_statuses(client, route, &statuses).await?;
@@ -75,7 +62,7 @@ async fn build_route_statuses(
     route: &HTTPRoute,
     parent_refs: &[HttpRouteParentRefs],
     route_ns: &str,
-    gw_name: &str,
+    gateway: &Gateway,
     gw_ns: &str,
     generation: i64,
     client: &kube::Client,
@@ -85,7 +72,9 @@ async fn build_route_statuses(
 
     let mut statuses = Vec::new();
     for parent_ref in parent_refs {
-        if !route_status::is_ref_targeting_gateway(parent_ref, gw_name, gw_ns, route_ns) {
+        if !route_status::is_ref_targeting_gateway(parent_ref, &gateway.name_any(), gw_ns, route_ns)
+            || !super::httproute::parent_ref_selects_a_listener(gateway, parent_ref)
+        {
             continue;
         }
 
@@ -131,6 +120,75 @@ mod tests {
 
     use super::*;
     use crate::{controller::fixtures::regex_route, testing};
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "explicit listener fixtures verify mixed-parent status isolation"
+    )]
+    async fn acceptance_skips_a_reserved_parent_when_the_route_also_has_a_usable_parent() {
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_owned()),
+                namespace: Some("default".to_owned()),
+                ..Default::default()
+            },
+            spec: gateway_api::gateways::GatewaySpec {
+                gateway_class_name: "praxis".to_owned(),
+                listeners: vec![
+                    gateway_api::gateways::GatewayListeners {
+                        name: "reserved".to_owned(),
+                        port: 9902,
+                        protocol: "HTTP".to_owned(),
+                        ..Default::default()
+                    },
+                    gateway_api::gateways::GatewayListeners {
+                        name: "valid".to_owned(),
+                        port: 8080,
+                        protocol: "HTTP".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            status: None,
+        };
+        let route = HTTPRoute {
+            metadata: ObjectMeta::default(),
+            spec: gateway_api::httproutes::HttpRouteSpec::default(),
+            status: None,
+        };
+        let parents: Vec<_> = ["reserved", "valid"]
+            .into_iter()
+            .map(|section| HttpRouteParentRefs {
+                name: "gw".to_owned(),
+                section_name: Some(section.to_owned()),
+                ..Default::default()
+            })
+            .collect();
+        let (context, _) = testing::fake_context(vec![], testing::Cached::default());
+        let statuses = build_route_statuses(
+            &route,
+            &parents,
+            "default",
+            &gateway,
+            "default",
+            1,
+            &context.client,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            statuses.len(),
+            1,
+            "Gateway acceptance must not overwrite reserved-parent rejection"
+        );
+        assert_eq!(
+            statuses[0].parent_ref.section_name.as_deref(),
+            Some("valid"),
+            "only the usable parent is accepted"
+        );
+    }
 
     #[test]
     fn test_validation_conditions_accepts_a_supported_route() {
@@ -313,7 +371,12 @@ mod tests {
             },
             spec: GatewaySpec {
                 gateway_class_name: "praxis".to_owned(),
-                listeners: vec![],
+                listeners: vec![gateway_api::gateways::GatewayListeners {
+                    name: "http".to_owned(),
+                    port: 80,
+                    protocol: "HTTP".to_owned(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             status: None,
